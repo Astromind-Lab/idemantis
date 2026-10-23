@@ -18,6 +18,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "proof": "node dist/cli.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
