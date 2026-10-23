@@ -11,6 +11,7 @@ import { AdapterKitError } from "./errors.js"
 import { AdapterRegistry } from "./manifest.js"
 import type {
   AdapterExecutorOptions,
+  AdapterExecutionBinding,
   AdapterInvocationContext,
   FenceActivationContext,
   IssueResultEnvelope,
@@ -54,6 +55,16 @@ export class AdapterExecutor {
 
   async reconcile(command: CommandRecord, attempt: AttemptRecord): Promise<ReconciliationResult> {
     return (await this.invokeReconciliation(command, attempt)).result
+  }
+
+  binding(operationKey: string): AdapterExecutionBinding {
+    const registration = this.#registry.resolve(operationKey)
+    return {
+      operation_key: operationKey,
+      adapter_instance_id: registration.adapter_instance_id,
+      effect_class: registration.operation.descriptor.effect_class,
+      execution_location: registration.operation.descriptor.capabilities.execution_location,
+    }
   }
 
   async invokeIssue(

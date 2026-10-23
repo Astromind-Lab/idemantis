@@ -162,6 +162,13 @@ export interface AdapterExecutorOptions {
   clock?: RuntimeClock
 }
 
+export interface AdapterExecutionBinding {
+  operation_key: string
+  adapter_instance_id: AdapterInstanceId
+  effect_class: AdapterOperationDescriptor["effect_class"]
+  execution_location: AdapterOperationDescriptor["capabilities"]["execution_location"]
+}
+
 export type UncertainRecoveryDecision = "retry_same_effect" | "reconcile" | "stop_uncertain"
 export type ActiveHandoffDecision = "transfer" | "settle" | "cancel" | "block"
 
