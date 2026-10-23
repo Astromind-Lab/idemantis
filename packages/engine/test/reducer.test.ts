@@ -130,6 +130,8 @@ const subjectRuntime: MissionRuntimeDefinition = {
 }
 
 const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
+const attemptId = "att_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
+const commandId = "cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
 const eventSuffixes = "VWXYZ0123456789ABCDEFGHJKMNPQRST"
 
 function acceptedEvent(
@@ -169,6 +171,8 @@ function issueResult(
   result: "not_sent" | "accepted" | "completed" | "rejected" | "failed" | "uncertain",
 ): AcceptedEvent {
   return acceptedEvent(sequence, "effect.issue_result_recorded", {
+    attempt_id: attemptId,
+    command_id: commandId,
     effect_id: effectId,
     result,
   })
@@ -346,6 +350,8 @@ describe("deterministic reducer", () => {
       runtime,
       uncertain.state,
       acceptedEvent(3, "effect.reconciliation_result_recorded", {
+        attempt_id: attemptId,
+        command_id: commandId,
         effect_id: effectId,
         result: "confirmed_not_applied",
       }),
@@ -423,6 +429,8 @@ describe("deterministic reducer", () => {
         2,
         "effect.dispatch_started",
         {
+          attempt_id: attemptId,
+          command_id: commandId,
           effect_id: first.state.active_effect_id,
         },
         0,
@@ -441,7 +449,11 @@ describe("deterministic reducer", () => {
     const lateDispatch = reduceMission(
       runtime,
       acknowledged.state,
-      acceptedEvent(3, "effect.dispatch_started", { effect_id: effectId }),
+      acceptedEvent(3, "effect.dispatch_started", {
+        attempt_id: attemptId,
+        command_id: commandId,
+        effect_id: effectId,
+      }),
     )
 
     expect(lateDispatch.state.effects[effectId]?.status).toBe("acknowledged")
@@ -456,6 +468,8 @@ describe("deterministic reducer", () => {
         runtime,
         first.state,
         acceptedEvent(4, "effect.dispatch_started", {
+          attempt_id: attemptId,
+          command_id: commandId,
           effect_id: first.state.active_effect_id,
         }),
       ),

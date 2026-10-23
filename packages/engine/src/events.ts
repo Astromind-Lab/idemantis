@@ -1,4 +1,6 @@
 import {
+  AttemptIdSchema,
+  CommandIdSchema,
   DigestSchema,
   EffectIdSchema,
   IssueResultSchema,
@@ -25,12 +27,18 @@ export const MissionAdmittedPayloadSchema = Type.Object(
 )
 
 export const EffectDispatchStartedPayloadSchema = Type.Object(
-  { effect_id: EffectIdSchema },
+  {
+    attempt_id: AttemptIdSchema,
+    command_id: CommandIdSchema,
+    effect_id: EffectIdSchema,
+  },
   { additionalProperties: false },
 )
 
 export const EffectIssueResultPayloadSchema = Type.Object(
   {
+    attempt_id: AttemptIdSchema,
+    command_id: CommandIdSchema,
     effect_id: EffectIdSchema,
     result: IssueResultSchema,
   },
@@ -39,6 +47,8 @@ export const EffectIssueResultPayloadSchema = Type.Object(
 
 export const EffectReconciliationResultPayloadSchema = Type.Object(
   {
+    attempt_id: AttemptIdSchema,
+    command_id: CommandIdSchema,
     effect_id: EffectIdSchema,
     result: ReconciliationResultSchema,
   },

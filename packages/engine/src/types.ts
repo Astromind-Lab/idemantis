@@ -1,4 +1,5 @@
 import type {
+  AttemptId,
   CommandId,
   CommandRecord,
   Digest,
@@ -100,6 +101,8 @@ export interface MissionAdmittedPayload {
 }
 
 export interface EffectDispatchStartedPayload {
+  attempt_id: AttemptId
+  command_id: CommandId
   effect_id: EffectId
 }
 
@@ -112,6 +115,8 @@ export type EffectIssueResult =
   | "uncertain"
 
 export interface EffectIssueResultPayload {
+  attempt_id: AttemptId
+  command_id: CommandId
   effect_id: EffectId
   result: EffectIssueResult
 }
@@ -124,6 +129,8 @@ export type EffectReconciliationResult =
   | "unknown"
 
 export interface EffectReconciliationResultPayload {
+  attempt_id: AttemptId
+  command_id: CommandId
   effect_id: EffectId
   result: EffectReconciliationResult
 }
