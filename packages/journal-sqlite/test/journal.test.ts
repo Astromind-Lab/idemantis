@@ -18,6 +18,7 @@ import { DatabaseSync } from "node:sqlite"
 import Type from "typebox"
 import { afterEach, describe, expect, it } from "vitest"
 import { JournalError, SqliteJournal } from "../src/index.js"
+import { migrations } from "../src/migrations.js"
 
 const capabilities = {
   duplicate_safety: "native_idempotency",
@@ -104,6 +105,8 @@ const runtime: MissionRuntimeDefinition = {
 }
 
 const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
+const attemptId = "att_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
+const secondAttemptId = "att_01ARZ3NDEKTSV4RRFFQ69G5FAW" as const
 const eventSuffixes = "VWXYZ0123456789ABCDEFGHJKMNPQRST"
 const temporaryDirectories: string[] = []
 const journals: SqliteJournal[] = []
@@ -132,13 +135,17 @@ function proposal(
   sequence: number,
   type: string,
   payload: ProposedEvent["payload"],
+  sourceId = "journal-test",
+  sourceKind: ProposedEvent["source"]["kind"] = "system",
+  causationId?: ProposedEvent["causation_id"],
 ): ProposedEvent {
   return {
     event_id: `evt_01ARZ3NDEKTSV4RRFFQ69G5FA${eventSuffixes[sequence - 1]}`,
     run_id: runId,
     type,
     schema_version: 1,
-    source: { kind: "system", source_id: "journal-test" },
+    source: { kind: sourceKind, source_id: sourceId },
+    ...(causationId ? { causation_id: causationId } : {}),
     ownership_epoch: 1,
     payload,
   }
@@ -161,6 +168,76 @@ function admitted(journal: SqliteJournal) {
   return { result, effect }
 }
 
+function claimFirstCommand(
+  journal: SqliteJournal,
+  selectedAttemptId = attemptId,
+  claimedAt = "2026-01-01T00:00:02Z",
+  leaseDurationMs = 60_000,
+) {
+  const command = journal.listCommands(runId)[0]
+  if (!command) {
+    throw new Error("Expected a pending command")
+  }
+  return journal.claimCommand(command.command_id, {
+    attempt_id: selectedAttemptId,
+    claimed_by: "journal-worker",
+    claimed_at: claimedAt,
+    lease_duration_ms: leaseDurationMs,
+  })
+}
+
+function startDispatch(journal: SqliteJournal, sequence: number, effectId: string) {
+  const command = journal.listCommands(runId)[0]
+  if (!command) {
+    throw new Error("Expected a claimed command")
+  }
+  return journal.recordDispatchStarted(
+    proposal(
+      sequence,
+      "effect.dispatch_started",
+      {
+        attempt_id: attemptId,
+        command_id: command.command_id,
+        effect_id: effectId,
+      },
+      "journal-worker",
+      "runner",
+      command.causing_event_id,
+    ),
+  )
+}
+
+function recordIssueResult(
+  journal: SqliteJournal,
+  sequence: number,
+  effectId: string,
+  result: "not_sent" | "accepted" | "completed" | "rejected" | "failed" | "uncertain",
+) {
+  const command = journal.listCommands(runId)[0]
+  if (!command) {
+    throw new Error("Expected a claimed command")
+  }
+  const attempt = journal.listAttempts(runId)[0]
+  if (!attempt?.started_event_id) {
+    throw new Error("Expected a started attempt")
+  }
+  return journal.recordDispatchResult(
+    proposal(
+      sequence,
+      "effect.issue_result_recorded",
+      {
+        attempt_id: attemptId,
+        command_id: command.command_id,
+        effect_id: effectId,
+        result,
+      },
+      "journal-worker",
+      "runner",
+      attempt.started_event_id,
+    ),
+  )
+}
+
 afterEach(() => {
   for (const journal of journals.splice(0)) {
     journal.close()
@@ -177,11 +254,43 @@ describe("SQLite journal", () => {
     const journal = open(path)
 
     expect(journal.storageInfo()).toEqual({
-      schema_version: 1,
+      schema_version: 2,
       journal_mode: "wal",
       foreign_keys: true,
     })
     expect(statSync(path).mode & 0o777).toBe(0o600)
+  })
+
+  it("upgrades an existing version 1 journal", () => {
+    const path = journalPath()
+    const database = new DatabaseSync(path)
+    const firstMigration = migrations[0]
+    database.exec(`
+      CREATE TABLE journal_migrations (
+        version INTEGER PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        checksum TEXT NOT NULL,
+        applied_at TEXT NOT NULL
+      ) STRICT;
+    `)
+    database.exec(firstMigration.sql)
+    database
+      .prepare(
+        "INSERT INTO journal_migrations(version, name, checksum, applied_at) VALUES (?, ?, ?, ?)",
+      )
+      .run(
+        firstMigration.version,
+        firstMigration.name,
+        firstMigration.checksum,
+        "2026-01-01T00:00:00Z",
+      )
+    database.exec("PRAGMA user_version = 1")
+    database.close()
+
+    const journal = open(path)
+
+    expect(journal.storageInfo().schema_version).toBe(2)
+    expect(() => admitted(journal)).not.toThrow()
   })
 
   it("commits admission, projection, effect, and outbox atomically", () => {
@@ -225,29 +334,231 @@ describe("SQLite journal", () => {
     expect(journal.listCommands(runId)).toHaveLength(1)
   })
 
-  it("rolls back the event and outbox when reduction fails", () => {
+  it("claims a command and records its dispatch lifecycle atomically", () => {
     const journal = open(journalPath())
     const { effect } = admitted(journal)
+    const claimed = claimFirstCommand(journal)
+
+    expect(claimed.command).toMatchObject({
+      status: "claimed",
+      claimed_by: "journal-worker",
+      claim_deadline: "2026-01-01T00:01:02.000Z",
+    })
+    expect(claimed.attempt).toMatchObject({
+      attempt_id: attemptId,
+      command_id: claimed.command.command_id,
+      effect_id: effect.effect_id,
+      status: "claimed",
+    })
+
+    const started = startDispatch(journal, 2, effect.effect_id)
+    const duplicateStart = startDispatch(journal, 2, effect.effect_id)
+    expect(started.acceptance.sequence).toBe(2)
+    expect(duplicateStart).toEqual({ ...started, duplicate: true })
+    expect(journal.listAttempts(runId)[0]).toMatchObject({
+      status: "dispatch_started",
+      started_event_id: started.acceptance.event_id,
+    })
+    expect(journal.listEffects(runId)[0]?.status).toBe("dispatching")
+
+    const result = recordIssueResult(journal, 3, effect.effect_id, "accepted")
+    const duplicateResult = recordIssueResult(journal, 3, effect.effect_id, "accepted")
+    expect(result.acceptance.sequence).toBe(3)
+    expect(duplicateResult).toEqual({ ...result, duplicate: true })
+    expect(journal.listAttempts(runId)[0]).toMatchObject({
+      status: "result_recorded",
+      result_event_id: result.acceptance.event_id,
+    })
+    expect(journal.listCommands(runId)[0]?.status).toBe("completed")
+    expect(
+      journal.claimNext(runId, {
+        attempt_id: secondAttemptId,
+        claimed_by: "other-worker",
+        claimed_at: "2026-01-01T01:00:00Z",
+        lease_duration_ms: 60_000,
+      }),
+    ).toBeUndefined()
+  })
+
+  it("reclaims an expired claim without changing the effect identity", () => {
+    const journal = open(journalPath())
+    const { effect } = admitted(journal)
+    const first = claimFirstCommand(journal, attemptId, "2026-01-01T00:00:02Z", 1_000)
+    const second = journal.claimCommand(first.command.command_id, {
+      attempt_id: secondAttemptId,
+      claimed_by: "other-worker",
+      claimed_at: "2026-01-01T00:00:03Z",
+      lease_duration_ms: 60_000,
+    })
+
+    expect(second.attempt.effect_id).toBe(first.attempt.effect_id)
+    expect(second.attempt.effect_id).toBe(effect.effect_id)
+    expect(journal.listAttempts(runId)).toHaveLength(2)
+    expect(() =>
+      journal.recordDispatchStarted(
+        proposal(
+          2,
+          "effect.dispatch_started",
+          {
+            attempt_id: attemptId,
+            command_id: first.command.command_id,
+            effect_id: effect.effect_id,
+          },
+          "journal-worker",
+          "runner",
+          first.command.causing_event_id,
+        ),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "ATTEMPT_NOT_ACTIVE" }))
+
+    journal.recordDispatchStarted(
+      proposal(
+        2,
+        "effect.dispatch_started",
+        {
+          attempt_id: secondAttemptId,
+          command_id: second.command.command_id,
+          effect_id: effect.effect_id,
+        },
+        "other-worker",
+        "runner",
+        second.command.causing_event_id,
+      ),
+    )
+    expect(journal.listAttempts(runId)[1]?.status).toBe("dispatch_started")
+  })
+
+  it("does not redispatch an expired attempt after dispatch starts", () => {
+    const journal = open(journalPath())
+    const { effect } = admitted(journal)
+    claimFirstCommand(journal, attemptId, "2026-01-01T00:00:02Z", 2_000)
+    startDispatch(journal, 2, effect.effect_id)
+
+    expect(
+      journal.claimNext(runId, {
+        attempt_id: secondAttemptId,
+        claimed_by: "other-worker",
+        claimed_at: "2026-01-01T01:00:00Z",
+        lease_duration_ms: 60_000,
+      }),
+    ).toBeUndefined()
+    expect(journal.listAttempts(runId)).toHaveLength(1)
+    expect(journal.listCommands(runId)[0]?.status).toBe("claimed")
+  })
+
+  it("materializes, fires, and deduplicates a durable timer", () => {
+    const journal = open(journalPath())
+    const { effect } = admitted(journal)
+    claimFirstCommand(journal)
+    startDispatch(journal, 2, effect.effect_id)
+    recordIssueResult(journal, 3, effect.effect_id, "accepted")
+
+    const timer = journal.listTimers(runId)[0]
+    if (!timer) {
+      throw new Error("Expected a durable timer")
+    }
+    expect(journal.listCommands(runId)[1]?.status).toBe("completed")
+    expect(journal.listDueTimers("2026-01-01T00:00:04.999Z")).toEqual([])
+    expect(journal.listDueTimers(timer.due_at)).toEqual([timer])
+
+    const fireOptions = {
+      timer_id: timer.timer_id,
+      event_id: proposal(4, "timer.fired", {}).event_id,
+      source_id: "journal-timer",
+      fired_at: timer.due_at,
+    } as const
+    const fired = journal.fireTimer(fireOptions)
+    const duplicate = journal.fireTimer(fireOptions)
+
+    expect(fired.status).toBe("fired")
+    expect(fired.status === "fired" && fired.append.duplicate).toBe(false)
+    expect(duplicate.status).toBe("fired")
+    expect(duplicate.status === "fired" && duplicate.append.duplicate).toBe(true)
+    expect(journal.listTimers(runId)[0]?.status).toBe("fired")
+    expect(journal.listCommands(runId)[2]?.kind).toBe("effect.reconcile")
+    expect(journal.listDueTimers(timer.due_at)).toEqual([])
+  })
+
+  it("supersedes an obsolete timer without adding a mission event", () => {
+    const journal = open(journalPath())
+    const { effect } = admitted(journal)
+    claimFirstCommand(journal)
+    startDispatch(journal, 2, effect.effect_id)
+    recordIssueResult(journal, 3, effect.effect_id, "accepted")
+    const timer = journal.listTimers(runId)[0]
+    if (!timer) {
+      throw new Error("Expected a durable timer")
+    }
+    journal.append(
+      proposal(4, "observation.recorded", {
+        observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        effect_id: effect.effect_id,
+        observation_type: "vehicle.arrived",
+        payload: { position: "dock" },
+      }),
+    )
+
+    const result = journal.fireTimer({
+      timer_id: timer.timer_id,
+      event_id: proposal(5, "timer.fired", {}).event_id,
+      source_id: "journal-timer",
+      fired_at: timer.due_at,
+    })
+
+    expect(result.status).toBe("superseded")
+    expect(journal.listEvents(runId)).toHaveLength(4)
+    expect(journal.listTimers(runId)[0]?.status).toBe("superseded")
+  })
+
+  it("rejects lifecycle events through the generic append path", () => {
+    const journal = open(journalPath())
+    const { effect } = admitted(journal)
+    const command = journal.listCommands(runId)[0]
+    if (!command) {
+      throw new Error("Expected a pending command")
+    }
 
     expect(() =>
       journal.append(
-        proposal(2, "effect.issue_result_recorded", {
+        proposal(2, "effect.dispatch_started", {
+          attempt_id: attemptId,
+          command_id: command.command_id,
           effect_id: effect.effect_id,
-          result: "unsupported",
         }),
       ),
-    ).toThrow()
+    ).toThrowError(expect.objectContaining({ code: "DISPATCH_EVENT_INVALID" }))
     expect(journal.listEvents(runId)).toHaveLength(1)
+  })
+
+  it("rolls back the event and outbox when reduction fails", () => {
+    const journal = open(journalPath())
+    const { effect } = admitted(journal)
+    const claimed = claimFirstCommand(journal)
+    const started = startDispatch(journal, 2, effect.effect_id)
+
+    expect(() =>
+      journal.recordDispatchResult(
+        proposal(
+          3,
+          "effect.issue_result_recorded",
+          {
+            attempt_id: attemptId,
+            command_id: claimed.command.command_id,
+            effect_id: effect.effect_id,
+            result: "unsupported",
+          },
+          "journal-worker",
+          "runner",
+          started.acceptance.event_id,
+        ),
+      ),
+    ).toThrow()
+    expect(journal.listEvents(runId)).toHaveLength(2)
     expect(journal.listCommands(runId)).toHaveLength(1)
 
-    const accepted = journal.append(
-      proposal(2, "effect.issue_result_recorded", {
-        effect_id: effect.effect_id,
-        result: "accepted",
-      }),
-    )
-    expect(accepted.acceptance.sequence).toBe(2)
-    expect(journal.listEvents(runId)).toHaveLength(2)
+    const accepted = recordIssueResult(journal, 3, effect.effect_id, "accepted")
+    expect(accepted.acceptance.sequence).toBe(3)
+    expect(journal.listEvents(runId)).toHaveLength(3)
     expect(journal.listCommands(runId)).toHaveLength(2)
   })
 
@@ -255,6 +566,8 @@ describe("SQLite journal", () => {
     const path = journalPath()
     const journal = open(path)
     const { effect } = admitted(journal)
+    claimFirstCommand(journal)
+    startDispatch(journal, 2, effect.effect_id)
     const database = new DatabaseSync(path)
     database.exec(`
       CREATE TRIGGER reject_command_insert
@@ -265,32 +578,23 @@ describe("SQLite journal", () => {
     `)
     database.close()
 
-    expect(() =>
-      journal.append(
-        proposal(2, "effect.issue_result_recorded", {
-          effect_id: effect.effect_id,
-          result: "accepted",
-        }),
-      ),
-    ).toThrow()
-    expect(journal.listEvents(runId)).toHaveLength(1)
+    expect(() => recordIssueResult(journal, 3, effect.effect_id, "accepted")).toThrow()
+    expect(journal.listEvents(runId)).toHaveLength(2)
     expect(journal.listCommands(runId)).toHaveLength(1)
-    expect(journal.getMission(runId).state.current_sequence).toBe(1)
+    expect(journal.getMission(runId).state.current_sequence).toBe(2)
+    expect(journal.listAttempts(runId)[0]?.status).toBe("dispatch_started")
   })
 
   it("rebuilds after restart using only the database and latest snapshot", () => {
     const path = journalPath()
     const firstJournal = open(path)
     const { effect } = admitted(firstJournal)
-    firstJournal.append(
-      proposal(2, "effect.issue_result_recorded", {
-        effect_id: effect.effect_id,
-        result: "accepted",
-      }),
-    )
+    claimFirstCommand(firstJournal)
+    startDispatch(firstJournal, 2, effect.effect_id)
+    recordIssueResult(firstJournal, 3, effect.effect_id, "accepted")
     const snapshotRecord = firstJournal.createSnapshot(runId)
     firstJournal.append(
-      proposal(3, "observation.recorded", {
+      proposal(4, "observation.recorded", {
         observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         effect_id: effect.effect_id,
         observation_type: "vehicle.arrived",
@@ -303,13 +607,13 @@ describe("SQLite journal", () => {
     const rebuilt = restarted.rebuildProjection(runId)
     const verification = restarted.verifyRun(runId)
 
-    expect(snapshotRecord.sequence).toBe(2)
+    expect(snapshotRecord.sequence).toBe(3)
     expect(rebuilt.state.status).toBe("completed")
-    expect(rebuilt.state.current_sequence).toBe(3)
+    expect(rebuilt.state.current_sequence).toBe(4)
     expect(rebuilt.runtime).toEqual(runtime)
     expect(verification).toEqual({
       run_id: runId,
-      event_count: 3,
+      event_count: 4,
       command_count: 2,
       snapshots_verified: 1,
       state_digest: rebuilt.state_digest,
