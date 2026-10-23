@@ -298,9 +298,15 @@ importers:
 
   packages/fault-suite:
     dependencies:
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
       "@idemantis/contracts":
         specifier: workspace:*
         version: link:../contracts
+      "@idemantis/edge-agent":
+        specifier: workspace:*
+        version: link:../edge-agent
       "@idemantis/simulator":
         specifier: workspace:*
         version: link:../simulator
