@@ -5,7 +5,7 @@ import type {
   ReconciliationResult,
   RunId,
 } from "@idemantis/contracts"
-import type { ClaimedCommand, SqliteJournal } from "@idemantis/journal-sqlite"
+import { JournalError, type ClaimedCommand, type SqliteJournal } from "@idemantis/journal-sqlite"
 import { SecureIdentityFactory } from "./identity.js"
 import { SystemClock } from "./clock.js"
 import type {
@@ -61,7 +61,16 @@ export class CommandDispatcher {
         claim.command.causing_event_id,
       ),
     )
-    const result = await this.execute(claim)
+    let result: IssueResult | ReconciliationResult
+    try {
+      this.#journal.assertDispatchable(claim.attempt.attempt_id, this.#clock.now().toISOString())
+      result = await this.execute(claim)
+    } catch (error) {
+      if (!(error instanceof JournalError) || error.code !== "COMMAND_OWNERSHIP_STALE") {
+        throw error
+      }
+      result = claim.command.kind === "effect.issue" ? "not_sent" : "unknown"
+    }
     const resultType =
       claim.command.kind === "effect.issue"
         ? "effect.issue_result_recorded"

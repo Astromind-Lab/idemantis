@@ -1,12 +1,21 @@
 import type {
   AttemptId,
   AttemptRecord,
+  CancellationResult,
   CommandRecord,
   EventId,
+  FenceProof,
+  HandoffId,
   IssueResult,
   ReconciliationResult,
   RunId,
   SourceId,
+  OwnershipHandoffBlockReason,
+  OwnershipHandoffRecord,
+  OwnershipLease,
+  OperationCapabilities,
+  EffectId,
+  EffectStatus,
 } from "@idemantis/contracts"
 import type { AppendResult, SqliteJournal, TimerFireResult } from "@idemantis/journal-sqlite"
 
@@ -23,6 +32,50 @@ export interface EffectExecutor {
   issue(command: CommandRecord, attempt: AttemptRecord): Promise<IssueResult>
   reconcile(command: CommandRecord, attempt: AttemptRecord): Promise<ReconciliationResult>
 }
+
+export interface HandoffEffect {
+  effect_id: EffectId
+  operation: string
+  status: EffectStatus
+}
+
+export interface HandoffFenceRequest {
+  run_id: RunId
+  effect_id: EffectId
+  ownership_epoch: number
+  requested_at: string
+}
+
+export interface OwnershipHandoffBinding {
+  capabilities: OperationCapabilities
+  activate_fence?: (request: HandoffFenceRequest) => Promise<FenceProof>
+  cancel?: (effect: HandoffEffect) => Promise<CancellationResult>
+}
+
+export interface OwnershipBindingResolver {
+  resolve(effect: HandoffEffect): OwnershipHandoffBinding
+}
+
+export interface OwnershipCoordinatorOptions {
+  journal: SqliteJournal
+  source_id: SourceId
+  bindings: OwnershipBindingResolver
+  clock?: Clock
+  identities?: Pick<IdentityFactory, "eventId">
+}
+
+export interface OwnershipHandoffRequest {
+  handoff_id: HandoffId
+  target_lease: OwnershipLease
+}
+
+export type OwnershipHandoffOutcome =
+  | { status: "active"; handoff: OwnershipHandoffRecord; fence_proofs: FenceProof[] }
+  | {
+      status: "blocked"
+      handoff: OwnershipHandoffRecord
+      reason: OwnershipHandoffBlockReason
+    }
 
 export interface CommandDispatcherOptions {
   journal: SqliteJournal

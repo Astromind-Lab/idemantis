@@ -22,6 +22,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@idemantis/adapter-kit": "workspace:*",
     "@idemantis/contracts": "workspace:*",
     "@idemantis/journal-sqlite": "workspace:*"
   },

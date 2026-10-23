@@ -248,6 +248,9 @@ importers:
 
   packages/dispatcher:
     dependencies:
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
       "@idemantis/contracts":
         specifier: workspace:*
         version: link:../contracts
@@ -255,9 +258,6 @@ importers:
         specifier: workspace:*
         version: link:../journal-sqlite
     devDependencies:
-      "@idemantis/adapter-kit":
-        specifier: workspace:*
-        version: link:../adapter-kit
       "@idemantis/engine":
         specifier: workspace:*
         version: link:../engine
