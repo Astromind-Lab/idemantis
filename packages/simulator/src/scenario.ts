@@ -341,12 +341,6 @@ export async function runReferenceScenario(
   let vehicleTransitions = 0
   while (vehicleState !== "open_destination") {
     vehicleTransitions += 1
-    if (vehicleTransitions > 12) {
-      throw new SimulationError(
-        "SCENARIO_INVARIANT_FAILED",
-        "Vehicle recovery exceeded its bounded transition count",
-      )
-    }
     if (vehicleState === "dispatch_vehicle") {
       const dispatchEnvelope = await vehicle.dispatch.issue(
         context(kernel, 2, 3, dispatchAttempt, 2),

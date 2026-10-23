@@ -122,6 +122,35 @@ describe("reference scenario regressions", () => {
     expect(states).toContain("reconcile_vehicle")
   })
 
+  it("continues declared recovery loops for a long-running vehicle", async () => {
+    const report = await runReferenceScenario({
+      scenario: "happy_path",
+      seed: 12,
+      input: { reservation_expires_at: "2026-01-01T02:00:00.000Z" },
+      fault_schedule: [
+        {
+          id: "long-arrival-delay",
+          target: "vehicle",
+          operation: "vehicle.dispatch",
+          stage: "arrival_observation",
+          occurrence: 1,
+          action: "delay",
+          delay_ms: 6_000_000,
+        },
+      ],
+    })
+    const reconciliations = report.simulation.trace.filter(
+      (entry) =>
+        entry.target === "vehicle" &&
+        entry.operation === "vehicle.dispatch" &&
+        entry.stage === "reconciliation.received",
+    )
+
+    expect(report.outcome).toBe("completed")
+    expect(report.terminal_state).toBe("complete")
+    expect(reconciliations.length).toBeGreaterThan(5)
+  })
+
   it("returns failure evidence for an ordinarily rejected effect", async () => {
     const report = await runReferenceScenario({
       scenario: "happy_path",
