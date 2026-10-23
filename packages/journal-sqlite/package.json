@@ -26,5 +26,8 @@
     "@idemantis/engine": "workspace:*",
     "@idemantis/sdk": "workspace:*",
     "typebox": "1.4.3"
+  },
+  "devDependencies": {
+    "@idemantis/edge-agent": "workspace:*"
   }
 }

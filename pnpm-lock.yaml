@@ -310,6 +310,10 @@ importers:
       typebox:
         specifier: 1.4.3
         version: 1.4.3
+    devDependencies:
+      "@idemantis/edge-agent":
+        specifier: workspace:*
+        version: link:../edge-agent
 
   packages/sdk:
     dependencies:
