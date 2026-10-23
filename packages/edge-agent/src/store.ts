@@ -24,7 +24,7 @@ import { closeSync, constants, fchmodSync, mkdirSync, openSync } from "node:fs"
 import { dirname, resolve } from "node:path"
 import { DatabaseSync } from "node:sqlite"
 import Schema from "typebox/schema"
-import { edgeDelegationDigest } from "./digest.js"
+import { edgeBranchAnchorDigest, edgeBranchDigest, edgeDelegationDigest } from "./digest.js"
 import { EdgeAgentError } from "./errors.js"
 import type { EdgeAppendInput, EdgeAppendResult, StoredEdgeSession } from "./types.js"
 
@@ -467,20 +467,21 @@ export class EdgeStore {
       }
       const previousBranchDigest = optionalText(row, "last_branch_digest")
       const edgeLocalSequence = lastSequence + 1
-      const branchDigest = sha256Digest({
-        edge_local_sequence: edgeLocalSequence,
-        previous_branch_digest: previousBranchDigest ?? delegationValue.lease.delegation_digest,
-        proposal_digest: proposalDigest,
-      })
-      const event: EdgeBranchEvent = {
+      const unsignedEvent: Omit<EdgeBranchEvent, "branch_digest"> = {
+        branch_digest_version: 2,
         edge_local_sequence: edgeLocalSequence,
         proposal: structuredClone(input.proposal),
         proposal_digest: proposalDigest,
         ...(previousBranchDigest ? { previous_branch_digest: previousBranchDigest } : {}),
-        branch_digest: branchDigest,
         recorded_at: input.recorded_at,
         ...(input.execution ? { execution: structuredClone(input.execution) } : {}),
       }
+      const branchDigest = edgeBranchDigest(
+        edgeBranchAnchorDigest(delegationValue.lease.delegation_digest, activation(row)),
+        unsignedEvent,
+        delegationValue.lease.delegation_digest,
+      )
+      const event: EdgeBranchEvent = { ...unsignedEvent, branch_digest: branchDigest }
       if (!Schema.Check(EdgeBranchEventSchema, event)) {
         throw new EdgeAgentError("EDGE_STORE_CORRUPT", "Derived edge event is invalid")
       }
@@ -557,14 +558,45 @@ export class EdgeStore {
     if (!state) {
       throw new EdgeAgentError("EDGE_NOT_ACTIVATED", "Edge store has no delegation")
     }
+    const events = this.reconnectEvents(state)
     return {
       delegation: state.delegation,
       activation: state.activation,
-      events: this.events(),
-      final_branch_digest: state.last_branch_digest ?? state.delegation.lease.delegation_digest,
+      events,
+      final_branch_digest:
+        events.at(-1)?.branch_digest ??
+        edgeBranchAnchorDigest(state.delegation.lease.delegation_digest, state.activation),
       ...(state.stopped_reason ? { stopped_reason: state.stopped_reason } : {}),
       created_at: createdAt,
     }
+  }
+
+  private reconnectEvents(state: StoredEdgeSession): EdgeBranchEvent[] {
+    const branchAnchorDigest = edgeBranchAnchorDigest(
+      state.delegation.lease.delegation_digest,
+      state.activation,
+    )
+    let previousBranchDigest: EdgeBranchEvent["branch_digest"] | undefined
+    return this.events().map((event) => {
+      const {
+        branch_digest: _branchDigest,
+        branch_digest_version: _branchDigestVersion,
+        previous_branch_digest: _previousBranchDigest,
+        ...content
+      } = event
+      const unsigned: Omit<EdgeBranchEvent, "branch_digest"> = {
+        ...content,
+        branch_digest_version: 2,
+        ...(previousBranchDigest ? { previous_branch_digest: previousBranchDigest } : {}),
+      }
+      const branchDigest = edgeBranchDigest(
+        branchAnchorDigest,
+        unsigned,
+        state.delegation.lease.delegation_digest,
+      )
+      previousBranchDigest = branchDigest
+      return { ...unsigned, branch_digest: branchDigest }
+    })
   }
 
   close(): void {
@@ -621,11 +653,12 @@ export class EdgeStore {
       const event = branchEvent(row)
       const sequence = index + 1
       const proposalDigest = sha256Digest(event.proposal as unknown as JsonObject)
-      const expectedBranchDigest = sha256Digest({
-        edge_local_sequence: sequence,
-        previous_branch_digest: previous ?? state.delegation.lease.delegation_digest,
-        proposal_digest: proposalDigest,
-      })
+      const { branch_digest: _branchDigest, ...unsignedEvent } = event
+      const expectedBranchDigest = edgeBranchDigest(
+        edgeBranchAnchorDigest(state.delegation.lease.delegation_digest, state.activation),
+        unsignedEvent,
+        state.delegation.lease.delegation_digest,
+      )
       if (
         event.edge_local_sequence !== sequence ||
         event.proposal_digest !== proposalDigest ||
