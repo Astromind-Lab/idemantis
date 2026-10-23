@@ -678,6 +678,22 @@ export function reduceMission(
   const state = cloneState(previousState)
   state.current_sequence = event.sequence
 
+  if (reducerEvent.type === "ownership.activated") {
+    if (
+      event.ownership_epoch !== state.ownership_epoch + 1 ||
+      reducerEvent.payload.lease.run_id !== state.run_id ||
+      reducerEvent.payload.lease.ownership_epoch !== event.ownership_epoch
+    ) {
+      fail(
+        "OWNERSHIP_EPOCH_MISMATCH",
+        `Ownership activation must advance epoch ${state.ownership_epoch} by one`,
+        event,
+      )
+    }
+    state.ownership_epoch = event.ownership_epoch
+    return finish(state, [], event)
+  }
+
   if (state.terminal_outcome) {
     return finish(state, [], event)
   }
@@ -717,6 +733,13 @@ export function reduceMission(
       break
     case "timer.fired":
       commands = reduceTimer(definition, state, event, reducerEvent.payload)
+      break
+    case "ownership.lease_registered":
+    case "ownership.handoff_requested":
+    case "ownership.handoff_blocked":
+    case "ownership.released":
+    case "ownership.fence_activated":
+      commands = []
       break
   }
 

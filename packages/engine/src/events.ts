@@ -3,11 +3,17 @@ import {
   CommandIdSchema,
   DigestSchema,
   EffectIdSchema,
+  FenceProofSchema,
+  HandoffIdSchema,
   IssueResultSchema,
   JsonObjectSchema,
   JsonValueSchema,
+  LeaseIdSchema,
   ObservationIdSchema,
+  OwnershipHandoffBlockReasonSchema,
+  OwnershipLeaseSchema,
   ReconciliationResultSchema,
+  SourceIdSchema,
   StateInstanceIdSchema,
   TimerIdSchema,
   type AcceptedEvent,
@@ -78,6 +84,55 @@ export const TimerFiredPayloadSchema = Type.Object(
   { additionalProperties: false },
 )
 
+export const OwnershipLeaseRegisteredPayloadSchema = Type.Object(
+  { lease: OwnershipLeaseSchema },
+  { additionalProperties: false },
+)
+
+export const OwnershipHandoffRequestedPayloadSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    source_lease_id: LeaseIdSchema,
+    target_lease_id: LeaseIdSchema,
+    target_epoch: Type.Integer({ minimum: 2 }),
+    target_owner_mode: Type.Union([Type.Literal("runner"), Type.Literal("edge")]),
+    target_owner_id: SourceIdSchema,
+  },
+  { additionalProperties: false },
+)
+
+export const OwnershipHandoffBlockedPayloadSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    reason: OwnershipHandoffBlockReasonSchema,
+  },
+  { additionalProperties: false },
+)
+
+export const OwnershipReleasedPayloadSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    lease_id: LeaseIdSchema,
+  },
+  { additionalProperties: false },
+)
+
+export const OwnershipFenceActivatedPayloadSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    proof: FenceProofSchema,
+  },
+  { additionalProperties: false },
+)
+
+export const OwnershipActivatedPayloadSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    lease: OwnershipLeaseSchema,
+  },
+  { additionalProperties: false },
+)
+
 const validators = {
   "mission.admitted": Schema.Compile(MissionAdmittedPayloadSchema),
   "effect.dispatch_started": Schema.Compile(EffectDispatchStartedPayloadSchema),
@@ -85,6 +140,12 @@ const validators = {
   "effect.reconciliation_result_recorded": Schema.Compile(EffectReconciliationResultPayloadSchema),
   "observation.recorded": Schema.Compile(ObservationRecordedPayloadSchema),
   "timer.fired": Schema.Compile(TimerFiredPayloadSchema),
+  "ownership.lease_registered": Schema.Compile(OwnershipLeaseRegisteredPayloadSchema),
+  "ownership.handoff_requested": Schema.Compile(OwnershipHandoffRequestedPayloadSchema),
+  "ownership.handoff_blocked": Schema.Compile(OwnershipHandoffBlockedPayloadSchema),
+  "ownership.released": Schema.Compile(OwnershipReleasedPayloadSchema),
+  "ownership.fence_activated": Schema.Compile(OwnershipFenceActivatedPayloadSchema),
+  "ownership.activated": Schema.Compile(OwnershipActivatedPayloadSchema),
 } as const
 
 export function parseReducerEvent(event: AcceptedEvent): ReducerEvent {

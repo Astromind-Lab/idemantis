@@ -487,6 +487,71 @@ describe("deterministic reducer", () => {
     )
   })
 
+  it("advances ownership by one epoch and ignores delayed stale results", () => {
+    const first = admitted()
+    const lease = {
+      lease_id: "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      run_id: runId,
+      owner_mode: "runner",
+      owner_id: "runner-1",
+      ownership_epoch: 1,
+      branch_anchor_sequence: 1,
+      not_before: "2026-01-01T00:00:00.000Z",
+      not_after: "2026-01-02T00:00:00.000Z",
+      maximum_offline_duration_ms: 60_000,
+      allowed_clock_uncertainty_ms: 100,
+      delegation_digest: `sha256:${"d".repeat(64)}`,
+    } as const
+    const registered = reduceMission(
+      runtime,
+      first.state,
+      acceptedEvent(2, "ownership.lease_registered", { lease }),
+    )
+    const activated = reduceMission(
+      runtime,
+      registered.state,
+      acceptedEvent(
+        3,
+        "ownership.activated",
+        {
+          handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          lease: {
+            ...lease,
+            lease_id: "lse_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            owner_mode: "edge",
+            owner_id: "edge-1",
+            ownership_epoch: 2,
+            branch_anchor_sequence: 2,
+          },
+        },
+        2,
+      ),
+    )
+    const effectId = activated.state.active_effect_id as string
+    const delayed = reduceMission(runtime, activated.state, issueResult(4, effectId, "rejected"))
+
+    expect(activated.state.ownership_epoch).toBe(2)
+    expect(activated.commands).toEqual([])
+    expect(delayed.state.ownership_epoch).toBe(2)
+    expect(delayed.state.current_sequence).toBe(4)
+    expect(delayed.state.effects[effectId]?.status).toBe("prepared")
+    expect(() =>
+      reduceMission(
+        runtime,
+        delayed.state,
+        acceptedEvent(
+          5,
+          "ownership.activated",
+          {
+            handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+            lease: { ...lease, ownership_epoch: 4 },
+          },
+          4,
+        ),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "OWNERSHIP_EPOCH_MISMATCH" }))
+  })
+
   it("treats prototype-shaped expression keys as JSON data", () => {
     const input = JSON.parse('{"__proto__":{"source":"input"}}') as JsonObject
     const fields = JSON.parse('{"__proto__":{"kind":"literal","value":{"safe":true}}}') as Record<
