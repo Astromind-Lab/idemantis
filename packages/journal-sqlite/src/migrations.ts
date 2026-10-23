@@ -92,6 +92,80 @@ CREATE TABLE mission_snapshots (
 ) STRICT;
 `
 
+const dispatchAndTimersSql = `
+ALTER TABLE commands ADD COLUMN claimed_by TEXT;
+ALTER TABLE commands ADD COLUMN claim_deadline TEXT;
+
+CREATE TABLE effect_attempts (
+  attempt_id TEXT PRIMARY KEY,
+  command_id TEXT NOT NULL REFERENCES commands(command_id),
+  effect_id TEXT NOT NULL REFERENCES effects(effect_id),
+  status TEXT NOT NULL CHECK (status IN ('claimed', 'dispatch_started', 'result_recorded')),
+  ownership_epoch INTEGER NOT NULL CHECK (ownership_epoch >= 0),
+  claimed_by TEXT NOT NULL,
+  claim_deadline TEXT NOT NULL,
+  started_event_id TEXT REFERENCES mission_events(event_id),
+  result_event_id TEXT REFERENCES mission_events(event_id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (status = 'claimed' AND started_event_id IS NULL AND result_event_id IS NULL)
+    OR (status = 'dispatch_started' AND started_event_id IS NOT NULL AND result_event_id IS NULL)
+    OR (status = 'result_recorded' AND started_event_id IS NOT NULL AND result_event_id IS NOT NULL)
+  )
+) STRICT;
+
+ALTER TABLE commands
+ADD COLUMN active_attempt_id TEXT REFERENCES effect_attempts(attempt_id);
+
+CREATE INDEX effect_attempts_command_idx
+ON effect_attempts(command_id, created_at);
+
+CREATE TABLE timers (
+  timer_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  status TEXT NOT NULL CHECK (status IN ('scheduled', 'fired', 'cancelled', 'superseded')),
+  due_at TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  causing_event_id TEXT NOT NULL REFERENCES mission_events(event_id),
+  payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+  fire_event_id TEXT REFERENCES mission_events(event_id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (
+    (status = 'fired' AND fire_event_id IS NOT NULL)
+    OR (status <> 'fired' AND fire_event_id IS NULL)
+  )
+) STRICT;
+
+CREATE INDEX timers_due_idx
+ON timers(status, due_at, timer_id);
+
+INSERT INTO timers(
+  timer_id, run_id, status, due_at, purpose, causing_event_id,
+  payload_json, created_at, updated_at
+)
+SELECT
+  json_extract(payload_json, '$.timer_id'),
+  run_id,
+  'scheduled',
+  json_extract(payload_json, '$.due_at'),
+  json_extract(payload_json, '$.purpose'),
+  causing_event_id,
+  json_object(
+    'timer_id', json_extract(payload_json, '$.timer_id'),
+    'state_instance_id', json_extract(payload_json, '$.state_instance_id')
+  ),
+  created_at,
+  created_at
+FROM commands
+WHERE kind = 'timer.schedule';
+
+UPDATE commands
+SET status = 'completed'
+WHERE kind = 'timer.schedule';
+`
+
 function migration(version: number, name: string, sql: string): Migration {
   return {
     version,
@@ -101,4 +175,7 @@ function migration(version: number, name: string, sql: string): Migration {
   }
 }
 
-export const migrations = [migration(1, "core_journal", coreJournalSql)] as const
+export const migrations = [
+  migration(1, "core_journal", coreJournalSql),
+  migration(2, "dispatch_and_timers", dispatchAndTimersSql),
+] as const

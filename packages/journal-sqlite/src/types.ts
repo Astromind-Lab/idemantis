@@ -1,11 +1,16 @@
 import type {
   AcceptedEvent,
+  AttemptId,
+  AttemptRecord,
   CommandId,
   CommandRecord,
   Digest,
   EventAcceptance,
   ProposedEvent,
   RunId,
+  SourceId,
+  TimerId,
+  TimerRecord,
 } from "@idemantis/contracts"
 import type { MissionRuntimeDefinition, MissionState } from "@idemantis/engine"
 
@@ -56,6 +61,29 @@ export interface ReplayVerification {
 export interface ProjectionRebuildOptions {
   use_snapshot?: boolean
 }
+
+export interface CommandClaimOptions {
+  attempt_id: AttemptId
+  claimed_by: SourceId
+  claimed_at: string
+  lease_duration_ms: number
+}
+
+export interface ClaimedCommand {
+  command: CommandRecord
+  attempt: AttemptRecord
+}
+
+export interface TimerFireOptions {
+  timer_id: TimerId
+  event_id: AcceptedEvent["event_id"]
+  source_id: SourceId
+  fired_at: string
+}
+
+export type TimerFireResult =
+  | { status: "fired"; append: AppendResult; timer: TimerRecord }
+  | { status: "superseded"; timer: TimerRecord }
 
 export type JournalProposal = ProposedEvent
 export type JournalEvent = AcceptedEvent

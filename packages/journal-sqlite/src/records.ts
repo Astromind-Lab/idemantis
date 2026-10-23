@@ -1,18 +1,24 @@
 import {
   AcceptedEventSchema,
+  AttemptRecordSchema,
+  CommandStatusSchema,
   CommandRecordSchema,
   DigestSchema,
   EventAcceptanceSchema,
   ProposedEventSchema,
+  TimerRecordSchema,
   canonicalJson,
   createContractParser,
   sha256Digest,
   type AcceptedEvent,
+  type AttemptRecord,
+  type CommandStatus,
   type CommandRecord,
   type Digest,
   type EventAcceptance,
   type JsonObject,
   type ProposedEvent,
+  type TimerRecord,
 } from "@idemantis/contracts"
 import {
   EffectProjectionSchema,
@@ -26,6 +32,8 @@ import { JournalError } from "./errors.js"
 
 const parseAcceptedEventContract = createContractParser(AcceptedEventSchema)
 const parseCommandContract = createContractParser(CommandRecordSchema)
+const parseAttemptContract = createContractParser(AttemptRecordSchema)
+const parseTimerContract = createContractParser(TimerRecordSchema)
 const parseEventAcceptanceContract = createContractParser(EventAcceptanceSchema)
 export const parseProposedEvent = createContractParser(ProposedEventSchema)
 const stateValidator = Schema.Compile(MissionStateSchema)
@@ -60,6 +68,30 @@ export function parseCommand(text: string): CommandRecord {
     }
     throw new JournalError("CORRUPT_RECORD", "Stored command does not satisfy its contract")
   }
+}
+
+export function parseAttempt(value: unknown): AttemptRecord {
+  try {
+    return parseAttemptContract(value)
+  } catch {
+    throw new JournalError("CORRUPT_RECORD", "Stored attempt does not satisfy its contract")
+  }
+}
+
+export function parseTimer(value: unknown): TimerRecord {
+  try {
+    return parseTimerContract(value)
+  } catch {
+    throw new JournalError("CORRUPT_RECORD", "Stored timer does not satisfy its contract")
+  }
+}
+
+export function parseCommandStatus(value: unknown): CommandStatus {
+  if (!Schema.Check(CommandStatusSchema, value)) {
+    throw new JournalError("CORRUPT_RECORD", "Stored command status is invalid")
+  }
+
+  return value
 }
 
 export function parseState(text: string): MissionState {
