@@ -1,10 +1,12 @@
 import {
   EdgeReconnectUploadSchema,
+  canonicalJson,
   sha256Digest,
   type AttemptRecord,
   type CommandRecord,
   type EdgeDelegation,
   type EdgeExecutionScope,
+  type JsonObject,
   type ProposedEvent,
 } from "@idemantis/contracts"
 import { AdapterExecutor } from "@idemantis/adapter-kit"
@@ -236,6 +238,45 @@ describe("edge agent", () => {
     const upload = reopened.reconnectUpload()
     expect(upload.events.map((item) => item.edge_local_sequence)).toEqual([1, 2])
     expect(upload.final_branch_digest).toBe(result.event.branch_digest)
+    expect(Schema.Check(EdgeReconnectUploadSchema, upload)).toBe(true)
+  })
+
+  it("upgrades a persisted legacy branch when producing a reconnect upload", () => {
+    const path = edgePath()
+    const clock = new TestClock()
+    const selectedStore = store(path)
+    const selectedAgent = agent(selectedStore, clock)
+    const selectedDelegation = delegation()
+    selectedAgent.activate(selectedDelegation, { measured_clock_uncertainty_ms: 50 })
+    const appended = selectedAgent.append(
+      event("evt_01ARZ3NDEKTSV4RRFFQ69G5FAV", "effect.dispatch_started"),
+      { execution },
+    )
+    selectedStore.close()
+    const legacyEvent = structuredClone(appended.event)
+    delete legacyEvent.branch_digest_version
+    legacyEvent.branch_digest = sha256Digest({
+      edge_local_sequence: legacyEvent.edge_local_sequence,
+      previous_branch_digest: selectedDelegation.lease.delegation_digest,
+      proposal_digest: legacyEvent.proposal_digest,
+    })
+    const database = new DatabaseSync(path)
+    database
+      .prepare(
+        `UPDATE edge_branch_events
+         SET branch_digest = ?, event_json = ? WHERE edge_local_sequence = 1`,
+      )
+      .run(legacyEvent.branch_digest, canonicalJson(legacyEvent as unknown as JsonObject))
+    database
+      .prepare("UPDATE edge_session SET last_branch_digest = ? WHERE singleton = 1")
+      .run(legacyEvent.branch_digest)
+    database.close()
+
+    const reopened = store(path)
+    const upload = reopened.upload("2026-01-01T00:00:12.000Z")
+
+    expect(upload.events[0]).toMatchObject({ branch_digest_version: 2 })
+    expect(upload.events[0]?.branch_digest).not.toBe(legacyEvent.branch_digest)
     expect(Schema.Check(EdgeReconnectUploadSchema, upload)).toBe(true)
   })
 

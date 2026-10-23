@@ -1,24 +1,39 @@
 import {
   AttemptIdSchema,
+  ClientRequestIdSchema,
   CommandIdSchema,
+  EdgeMergeRequestSchema,
+  EdgeMergeResultSchema,
   EffectIdSchema,
   EventIdSchema,
   SourceIdSchema,
   TimerIdSchema,
   TimestampSchema,
   canonicalJson,
+  edgeBranchAnchorDigest,
+  edgeBranchDigest,
+  edgeDelegationDigest,
+  edgeMergeDigest,
   sha256Digest,
   type AcceptedEvent,
   type AttemptId,
   type AttemptRecord,
+  type ClientRequestId,
   type CommandId,
   type CommandRecord,
   type Digest,
+  type EdgeBranchEvent,
+  type EdgeMergeEventMapping,
+  type EdgeMergeRequest,
+  type EdgeMergeResult,
   type EffectId,
   type EventAcceptance,
   type EventId,
   type HandoffId,
+  type IngressReceipt,
   type JsonObject,
+  type JsonValue,
+  type MergeId,
   type OwnershipHandoffRecord,
   type OwnershipLease,
   type ProposedEvent,
@@ -37,6 +52,7 @@ import {
   OwnershipHandoffRequestedPayloadSchema,
   OwnershipLeaseRegisteredPayloadSchema,
   OwnershipReleasedPayloadSchema,
+  ReductionError,
   TimerFiredPayloadSchema,
   deriveTimerId,
   reduceMission,
@@ -87,7 +103,11 @@ import type {
   JournalOptions,
   MissionSnapshot,
   OwnershipState,
+  PendingInputKind,
+  PendingInputRecord,
   ProjectionRebuildOptions,
+  QuarantinedEdgeMerge,
+  QueuePendingInputOptions,
   ReplayVerification,
   StorageInfo,
   StoredMission,
@@ -123,6 +143,12 @@ const guardedEventTypes = new Set([
   "ownership.fence_activated",
   "ownership.effect_cancelled",
   "ownership.activated",
+])
+
+const pendingFactTypes = new Set([
+  "effect.issue_result_recorded",
+  "effect.reconciliation_result_recorded",
+  "observation.recorded",
 ])
 
 function text(row: Row, field: string): string {
@@ -790,46 +816,24 @@ export class SqliteJournal {
         return duplicate
       }
 
-      const pending = this.prepareAppend(event, digest)
-      this.assertDispatchContext(pending.accepted, payload, "claimed")
-      this.storeAppend(pending)
-      const result = this.connection
-        .prepare(
-          `UPDATE effect_attempts
-           SET status = 'dispatch_started', started_event_id = ?, updated_at = ?
-           WHERE attempt_id = ? AND status = 'claimed'`,
-        )
-        .run(event.event_id, pending.accepted.recorded_at, payload.attempt_id)
-
-      if (result.changes !== 1) {
-        throw new JournalError(
-          "TIMER_STATE_INVALID",
-          `Attempt ${payload.attempt_id} could not start dispatch`,
-          { run_id: event.run_id, event_id: event.event_id },
-        )
-      }
-
-      return this.appendResult(event.event_id, false)
+      return this.storeDispatchStartedInTransaction(event, digest)
     })
   }
 
   recordDispatchResult(proposal: ProposedEvent): AppendResult {
     const event = parseProposedEvent(proposal)
     let payload: EffectIssueResultPayload | EffectReconciliationResultPayload
-    let expectedKind: "effect.issue" | "effect.reconcile"
 
     if (
       event.type === "effect.issue_result_recorded" &&
       Schema.Check(EffectIssueResultPayloadSchema, event.payload)
     ) {
       payload = event.payload as unknown as EffectIssueResultPayload
-      expectedKind = "effect.issue"
     } else if (
       event.type === "effect.reconciliation_result_recorded" &&
       Schema.Check(EffectReconciliationResultPayloadSchema, event.payload)
     ) {
       payload = event.payload as unknown as EffectReconciliationResultPayload
-      expectedKind = "effect.reconcile"
     } else {
       throw new JournalError(
         "DISPATCH_EVENT_INVALID",
@@ -853,43 +857,255 @@ export class SqliteJournal {
         return duplicate
       }
 
-      const pending = this.prepareAppend(event, digest)
-      this.assertDispatchContext(pending.accepted, payload, "dispatch_started")
-      const command = this.commandRow(payload.command_id, true)
-      if (text(command, "kind") !== expectedKind) {
-        throw new JournalError(
-          "DISPATCH_EVENT_INVALID",
-          `Command ${payload.command_id} cannot accept ${event.type}`,
-          { run_id: event.run_id, event_id: event.event_id },
-        )
-      }
-
-      this.storeAppend(pending)
-      const attemptResult = this.connection
-        .prepare(
-          `UPDATE effect_attempts
-           SET status = 'result_recorded', result_event_id = ?, updated_at = ?
-           WHERE attempt_id = ? AND status = 'dispatch_started'`,
-        )
-        .run(event.event_id, pending.accepted.recorded_at, payload.attempt_id)
-      const commandResult = this.connection
-        .prepare(
-          `UPDATE commands
-           SET status = 'completed'
-           WHERE command_id = ? AND status = 'claimed' AND active_attempt_id = ?`,
-        )
-        .run(payload.command_id, payload.attempt_id)
-
-      if (attemptResult.changes !== 1 || commandResult.changes !== 1) {
-        throw new JournalError(
-          "ATTEMPT_STATE_INVALID",
-          `Attempt ${payload.attempt_id} could not record its result`,
-          { run_id: event.run_id, event_id: event.event_id },
-        )
-      }
-
-      return this.appendResult(event.event_id, false)
+      return this.storeDispatchResultInTransaction(event, digest)
     })
+  }
+
+  queuePendingInput(proposal: ProposedEvent, options: QueuePendingInputOptions): IngressReceipt {
+    const event = parseProposedEvent(proposal)
+    if (!Schema.Check(ClientRequestIdSchema, options.client_request_id)) {
+      throw new TypeError("client_request_id must satisfy ClientRequestId")
+    }
+    const kind = this.pendingInputKind(event)
+    const expectedSequence = this.pendingExpectedSequence(event, kind, options.client_request_id)
+    const digest = proposalDigest(event)
+
+    return this.#database.transaction(() => {
+      const run = this.runRow(event.run_id, true)
+      const lease = this.activeLeaseRow(event.run_id)
+      if (!lease || text(lease, "owner_mode") !== "edge") {
+        throw new JournalError(
+          "PENDING_INPUT_INVALID",
+          `Run ${event.run_id} is not owned by an edge executor`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      if (event.ownership_epoch > integer(run, "ownership_epoch")) {
+        throw new JournalError(
+          "PENDING_INPUT_INVALID",
+          `Input ${event.event_id} targets a future ownership epoch`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      const existing = this.connection
+        .prepare(
+          `SELECT * FROM pending_inputs
+           WHERE run_id = ? AND (client_request_id = ? OR proposal_event_id = ?)
+           ORDER BY ingress_sequence LIMIT 1`,
+        )
+        .get(event.run_id, options.client_request_id, event.event_id) as Row | undefined
+      if (existing) {
+        if (
+          text(existing, "client_request_id") !== options.client_request_id ||
+          text(existing, "proposal_event_id") !== event.event_id ||
+          text(existing, "proposal_digest") !== digest
+        ) {
+          throw new JournalError(
+            "PENDING_INPUT_COLLISION",
+            `Input identity conflicts with ingress ${integer(existing, "ingress_sequence")}`,
+            { run_id: event.run_id, event_id: event.event_id },
+          )
+        }
+        return this.pendingReceipt(existing)
+      }
+      const accepted = this.connection
+        .prepare(
+          `SELECT sequence, proposal_digest, recorded_at FROM mission_events
+           WHERE event_id = ?`,
+        )
+        .get(event.event_id) as Row | undefined
+      const receivedAt = timestamp(this.#clock)
+      if (accepted && text(accepted, "proposal_digest") !== digest) {
+        throw new JournalError(
+          "PENDING_INPUT_COLLISION",
+          `Event ${event.event_id} already has different canonical content`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      this.connection
+        .prepare(
+          `INSERT INTO pending_inputs(
+            run_id, client_request_id, input_kind, proposal_event_id, proposal_digest,
+            proposal_json, expected_sequence, outcome, accepted_sequence, received_at, resolved_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          event.run_id,
+          options.client_request_id,
+          kind,
+          event.event_id,
+          digest,
+          canonicalJson(event as unknown as JsonObject),
+          expectedSequence ?? null,
+          accepted ? "accepted" : "queued",
+          accepted ? integer(accepted, "sequence") : null,
+          receivedAt,
+          accepted ? text(accepted, "recorded_at") : null,
+        )
+      return this.pendingReceipt(this.pendingInputRow(event.run_id, options.client_request_id))
+    })
+  }
+
+  listPendingInputs(runId: RunId): PendingInputRecord[] {
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    return this.connection
+      .prepare("SELECT * FROM pending_inputs WHERE run_id = ? ORDER BY ingress_sequence")
+      .all(runId)
+      .map((raw) => this.pendingInputRecord(raw as Row))
+  }
+
+  processPendingInputs(runId: RunId, limit = 100): IngressReceipt[] {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new RangeError("limit must be a safe integer from 1 through 1000")
+    }
+    return this.#database.transaction(() => {
+      this.runRow(runId, true)
+      const activeLease = this.activeLeaseRow(runId)
+      if (
+        activeLease &&
+        text(activeLease, "owner_mode") === "edge" &&
+        !this.connection
+          .prepare("SELECT merge_id FROM edge_merges WHERE lease_id = ?")
+          .get(text(activeLease, "lease_id"))
+      ) {
+        throw new JournalError(
+          "PENDING_INPUT_INVALID",
+          `Run ${runId} still has an unmerged edge branch`,
+          { run_id: runId },
+        )
+      }
+      const rows = this.connection
+        .prepare(
+          `SELECT * FROM pending_inputs
+           WHERE run_id = ? AND outcome = 'queued'
+           ORDER BY ingress_sequence LIMIT ?`,
+        )
+        .all(runId, limit) as Row[]
+      const receipts = this.resolvePendingRows(rows)
+      if (receipts.some((receipt) => receipt.outcome === "accepted")) {
+        this.rebuildProjectionInTransaction(runId, timestamp(this.#clock))
+      }
+      return receipts
+    })
+  }
+
+  mergeEdgeBranch(value: EdgeMergeRequest): EdgeMergeResult {
+    if (!Schema.Check(EdgeMergeRequestSchema, value)) {
+      throw new JournalError("EDGE_MERGE_INVALID", "Edge merge request is invalid")
+    }
+    const request = structuredClone(value)
+    const digest = edgeMergeDigest(request)
+    const existing = this.edgeMergeRow(request.merge_id)
+    if (existing) {
+      return this.priorEdgeMerge(existing, digest)
+    }
+
+    try {
+      return this.#database.transaction(() => {
+        const duplicate = this.edgeMergeRow(request.merge_id)
+        if (duplicate) {
+          return this.priorEdgeMerge(duplicate, digest)
+        }
+        this.validateEdgeMerge(request)
+        const runId = request.upload.delegation.lease.run_id
+        const watermarkRow = asRow(
+          this.connection
+            .prepare(
+              `SELECT COALESCE(MAX(ingress_sequence), 0) AS watermark
+               FROM pending_inputs WHERE run_id = ?`,
+            )
+            .get(runId),
+          "pending input watermark",
+        )
+        const pendingWatermark = integer(watermarkRow, "watermark")
+        const edgeEvents: EdgeMergeEventMapping[] = []
+        for (const branchEvent of request.upload.events) {
+          const append = this.storeEdgeEvent(branchEvent)
+          edgeEvents.push({
+            edge_local_sequence: branchEvent.edge_local_sequence,
+            event_id: branchEvent.proposal.event_id,
+            canonical_sequence: append.acceptance.sequence,
+            branch_digest: branchEvent.branch_digest,
+          })
+        }
+        const pendingRows = this.connection
+          .prepare(
+            `SELECT * FROM pending_inputs
+             WHERE run_id = ? AND outcome = 'queued' AND ingress_sequence <= ?
+             ORDER BY ingress_sequence`,
+          )
+          .all(runId, pendingWatermark) as Row[]
+        const pendingOutcomes = this.resolvePendingRows(pendingRows)
+        const committedAt = timestamp(this.#clock)
+        const projection = this.rebuildProjectionInTransaction(runId, committedAt)
+        const lease = request.upload.delegation.lease
+        const result: EdgeMergeResult = {
+          merge_id: request.merge_id,
+          run_id: runId,
+          merge_digest: digest,
+          duplicate: false,
+          branch_anchor_sequence: lease.branch_anchor_sequence,
+          ownership_epoch: lease.ownership_epoch,
+          edge_events: edgeEvents,
+          pending_watermark: pendingWatermark,
+          pending_outcomes: pendingOutcomes,
+          final_sequence: projection.state.current_sequence,
+          state_digest: projection.state_digest,
+          committed_at: committedAt,
+        }
+        this.connection
+          .prepare(
+            `INSERT INTO edge_merges(
+              merge_id, run_id, lease_id, merge_digest, branch_anchor_sequence,
+              ownership_epoch, edge_event_count, pending_watermark, final_sequence,
+              state_digest, result_json, committed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            request.merge_id,
+            runId,
+            lease.lease_id,
+            digest,
+            lease.branch_anchor_sequence,
+            lease.ownership_epoch,
+            edgeEvents.length,
+            pendingWatermark,
+            result.final_sequence,
+            result.state_digest,
+            canonicalJson(result as unknown as JsonObject),
+            committedAt,
+          )
+        const mappingStatement = this.connection.prepare(
+          `INSERT INTO edge_merge_events(
+            merge_id, edge_local_sequence, event_id, canonical_sequence, branch_digest
+          ) VALUES (?, ?, ?, ?, ?)`,
+        )
+        for (const mapping of edgeEvents) {
+          mappingStatement.run(
+            request.merge_id,
+            mapping.edge_local_sequence,
+            mapping.event_id,
+            mapping.canonical_sequence,
+            mapping.branch_digest,
+          )
+        }
+        return result
+      })
+    } catch (error) {
+      this.quarantineEdgeMerge(request, digest, error)
+      throw error
+    }
+  }
+
+  listQuarantinedEdgeMerges(runId?: RunId): QuarantinedEdgeMerge[] {
+    this.#database.assertOpen()
+    const rows = runId
+      ? this.connection
+          .prepare("SELECT * FROM edge_merge_quarantine WHERE run_id = ? ORDER BY quarantine_id")
+          .all(runId)
+      : this.connection.prepare("SELECT * FROM edge_merge_quarantine ORDER BY quarantine_id").all()
+    return rows.map((raw) => this.quarantinedEdgeMerge(raw as Row))
   }
 
   getMission(runId: RunId): StoredMission {
@@ -1318,6 +1534,761 @@ export class SqliteJournal {
 
   [Symbol.dispose](): void {
     this.close()
+  }
+
+  private pendingInputKind(event: ProposedEvent): PendingInputKind {
+    if (event.source.kind === "edge") {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        "Edge events must arrive through branch reconciliation",
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    if (event.type === "timer.fired") {
+      if (event.source.kind !== "timer") {
+        throw new JournalError(
+          "PENDING_INPUT_INVALID",
+          "Timer input must come from a timer source",
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      return "timer"
+    }
+    if (pendingFactTypes.has(event.type)) {
+      return "external_fact"
+    }
+    if (
+      event.source.kind === "operator" ||
+      event.source.kind === "runner" ||
+      event.source.kind === "system"
+    ) {
+      return "intent"
+    }
+    throw new JournalError(
+      "PENDING_INPUT_INVALID",
+      `Event ${event.type} is not a supported pending input`,
+      { run_id: event.run_id, event_id: event.event_id },
+    )
+  }
+
+  private pendingExpectedSequence(
+    event: ProposedEvent,
+    kind: PendingInputKind,
+    clientRequestId: ClientRequestId,
+  ): number | undefined {
+    if (kind !== "intent") {
+      return undefined
+    }
+    const expectedSequence = Reflect.get(event.payload, "expected_sequence")
+    const payloadRequestId = Reflect.get(event.payload, "client_request_id")
+    if (
+      !Number.isSafeInteger(expectedSequence) ||
+      (expectedSequence as number) < 0 ||
+      payloadRequestId !== clientRequestId
+    ) {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        "Pending intent must bind its client request ID and expected sequence",
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    return expectedSequence as number
+  }
+
+  private pendingInputRow(runId: RunId, clientRequestId: ClientRequestId): Row {
+    return asRow(
+      this.connection
+        .prepare("SELECT * FROM pending_inputs WHERE run_id = ? AND client_request_id = ?")
+        .get(runId, clientRequestId),
+      `pending input ${clientRequestId}`,
+    )
+  }
+
+  private pendingInputRecord(row: Row): PendingInputRecord {
+    const proposal = parseProposedEvent(storedJson(text(row, "proposal_json"), "Pending proposal"))
+    const expectedSequence = column(row, "expected_sequence")
+    const acceptedSequence = column(row, "accepted_sequence")
+    const resolvedAt = nullableText(row, "resolved_at")
+    const outcome = text(row, "outcome")
+    const clientRequestId = text(row, "client_request_id")
+    const inputKind = text(row, "input_kind")
+    const digest = parseDigest(column(row, "proposal_digest"), "Pending proposal digest")
+    const receivedAt = text(row, "received_at")
+    let inferredKind: PendingInputKind
+    try {
+      inferredKind = this.pendingInputKind(proposal)
+    } catch {
+      throw new JournalError("CORRUPT_RECORD", "Stored pending input classification is invalid", {
+        run_id: proposal.run_id,
+        event_id: proposal.event_id,
+      })
+    }
+    if (
+      !["queued", "accepted", "rejected_stale", "rejected_invalid", "superseded"].includes(
+        outcome,
+      ) ||
+      !Schema.Check(ClientRequestIdSchema, clientRequestId) ||
+      !Schema.Check(TimestampSchema, receivedAt) ||
+      (resolvedAt !== undefined && !Schema.Check(TimestampSchema, resolvedAt)) ||
+      text(row, "run_id") !== proposal.run_id ||
+      text(row, "proposal_event_id") !== proposal.event_id ||
+      digest !== proposalDigest(proposal) ||
+      inputKind !== inferredKind ||
+      (expectedSequence !== null &&
+        (typeof expectedSequence !== "number" ||
+          !Number.isSafeInteger(expectedSequence) ||
+          expectedSequence < 0)) ||
+      (acceptedSequence !== null &&
+        (typeof acceptedSequence !== "number" ||
+          !Number.isSafeInteger(acceptedSequence) ||
+          acceptedSequence < 1)) ||
+      (inferredKind === "intent" &&
+        (expectedSequence === null ||
+          Reflect.get(proposal.payload, "expected_sequence") !== expectedSequence ||
+          Reflect.get(proposal.payload, "client_request_id") !== clientRequestId)) ||
+      (inferredKind !== "intent" && expectedSequence !== null)
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Stored pending input is invalid", {
+        run_id: proposal.run_id,
+        event_id: proposal.event_id,
+      })
+    }
+    if (outcome === "accepted") {
+      const accepted = this.connection
+        .prepare(
+          `SELECT run_id, sequence, proposal_digest FROM mission_events
+           WHERE event_id = ?`,
+        )
+        .get(proposal.event_id) as Row | undefined
+      if (
+        !accepted ||
+        text(accepted, "run_id") !== proposal.run_id ||
+        integer(accepted, "sequence") !== acceptedSequence ||
+        text(accepted, "proposal_digest") !== digest
+      ) {
+        throw new JournalError("CORRUPT_RECORD", "Accepted pending input has no canonical event", {
+          run_id: proposal.run_id,
+          event_id: proposal.event_id,
+        })
+      }
+    }
+    return {
+      ingress_sequence: integer(row, "ingress_sequence"),
+      run_id: proposal.run_id,
+      client_request_id: clientRequestId as ClientRequestId,
+      input_kind: inputKind as PendingInputKind,
+      proposal,
+      proposal_digest: digest,
+      ...(expectedSequence === null ? {} : { expected_sequence: expectedSequence as number }),
+      outcome: outcome as PendingInputRecord["outcome"],
+      ...(acceptedSequence === null ? {} : { accepted_sequence: acceptedSequence as number }),
+      received_at: receivedAt,
+      ...(resolvedAt ? { resolved_at: resolvedAt } : {}),
+    }
+  }
+
+  private pendingReceipt(row: Row): IngressReceipt {
+    const record = this.pendingInputRecord(row)
+    return {
+      run_id: record.run_id,
+      client_request_id: record.client_request_id,
+      proposal_digest: record.proposal_digest,
+      ingress_sequence: record.ingress_sequence,
+      outcome: record.outcome,
+      received_at: record.received_at,
+      ...(record.outcome === "accepted" ? { event_id: record.proposal.event_id } : {}),
+    }
+  }
+
+  private resolvePendingRows(rows: Row[]): IngressReceipt[] {
+    const receipts: IngressReceipt[] = []
+    for (const row of rows) {
+      const record = this.pendingInputRecord(row)
+      this.connection.exec("SAVEPOINT resolve_pending_input")
+      try {
+        const run = this.runRow(record.run_id, true)
+        if (
+          record.input_kind === "intent" &&
+          record.expected_sequence !== integer(run, "current_sequence")
+        ) {
+          this.resolvePendingOutcome(record, "rejected_stale")
+        } else if (record.input_kind === "timer") {
+          this.resolvePendingTimer(record)
+        } else {
+          const append = this.storePendingEvent(record.proposal, record.proposal_digest)
+          this.resolvePendingOutcome(record, "accepted", append.acceptance.sequence)
+        }
+        this.connection.exec("RELEASE resolve_pending_input")
+      } catch (error) {
+        this.connection.exec("ROLLBACK TO resolve_pending_input")
+        this.connection.exec("RELEASE resolve_pending_input")
+        if (!(error instanceof JournalError) && !(error instanceof ReductionError)) {
+          throw error
+        }
+        this.resolvePendingOutcome(record, "rejected_invalid")
+      }
+      receipts.push(
+        this.pendingReceipt(this.pendingInputRow(record.run_id, record.client_request_id)),
+      )
+    }
+    return receipts
+  }
+
+  private resolvePendingOutcome(
+    record: PendingInputRecord,
+    outcome: Exclude<PendingInputRecord["outcome"], "queued">,
+    acceptedSequence?: number,
+  ): void {
+    const resolvedAt = timestamp(this.#clock)
+    const result = this.connection
+      .prepare(
+        `UPDATE pending_inputs
+         SET outcome = ?, accepted_sequence = ?, resolved_at = ?
+         WHERE ingress_sequence = ? AND outcome = 'queued'`,
+      )
+      .run(outcome, acceptedSequence ?? null, resolvedAt, record.ingress_sequence)
+    if (result.changes !== 1) {
+      throw new JournalError(
+        "CORRUPT_RECORD",
+        `Pending input ${record.ingress_sequence} could not be resolved`,
+        { run_id: record.run_id, event_id: record.proposal.event_id },
+      )
+    }
+  }
+
+  private resolvePendingTimer(record: PendingInputRecord): void {
+    const event = record.proposal
+    if (event.schema_version !== 1 || !Schema.Check(TimerFiredPayloadSchema, event.payload)) {
+      throw new JournalError("PENDING_INPUT_INVALID", "Pending timer payload is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const timer = this.timerRow(event.payload.timer_id, true)
+    const current = this.timerRecord(timer)
+    const run = this.runRow(event.run_id, true)
+    if (
+      current.run_id !== event.run_id ||
+      event.logical_at !== current.due_at ||
+      event.causation_id !== current.causing_event_id ||
+      canonicalJson(event.payload as unknown as JsonObject) !== canonicalJson(current.payload)
+    ) {
+      throw new JournalError("PENDING_INPUT_INVALID", "Pending timer identity is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    if (
+      current.status !== "scheduled" ||
+      event.ownership_epoch !== integer(run, "ownership_epoch") ||
+      !this.timerIsCurrent(current, parseState(text(run, "state_json")))
+    ) {
+      if (current.status === "scheduled") {
+        this.connection
+          .prepare("UPDATE timers SET status = 'superseded', updated_at = ? WHERE timer_id = ?")
+          .run(timestamp(this.#clock), current.timer_id)
+      }
+      this.resolvePendingOutcome(record, "superseded")
+      return
+    }
+    const duplicate = this.findDuplicate(event.event_id, record.proposal_digest)
+    if (duplicate) {
+      this.resolvePendingOutcome(record, "accepted", duplicate.acceptance.sequence)
+      return
+    }
+    const pending = this.prepareAppend(event, record.proposal_digest)
+    this.storeAppend(pending)
+    const updated = this.connection
+      .prepare(
+        `UPDATE timers SET status = 'fired', fire_event_id = ?, updated_at = ?
+         WHERE timer_id = ? AND status = 'scheduled'`,
+      )
+      .run(event.event_id, pending.accepted.recorded_at, current.timer_id)
+    if (updated.changes !== 1) {
+      throw new JournalError("TIMER_STATE_INVALID", `Timer ${current.timer_id} could not fire`, {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    this.resolvePendingOutcome(record, "accepted", pending.accepted.sequence)
+  }
+
+  private storePendingEvent(event: ProposedEvent, digest: Digest): AppendResult {
+    if (event.schema_version !== 1) {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        `Pending event schema version ${event.schema_version} is unsupported`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    const duplicate = this.findDuplicate(event.event_id, digest)
+    if (duplicate) {
+      return duplicate
+    }
+    if (event.type === "effect.issue_result_recorded") {
+      return this.storeDispatchResultInTransaction(event, digest)
+    }
+    if (event.type === "effect.reconciliation_result_recorded") {
+      return this.storeDispatchResultInTransaction(event, digest)
+    }
+    if (guardedEventTypes.has(event.type)) {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        `Pending event ${event.type} requires another atomic operation`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    const pending = this.prepareAppend(event, digest)
+    this.storeAppend(pending)
+    return this.appendResult(event.event_id, false)
+  }
+
+  private validateEdgeMerge(request: EdgeMergeRequest): void {
+    const { upload } = request
+    const { delegation, activation, events } = upload
+    const lease = delegation.lease
+    const run = this.runRow(lease.run_id, true)
+    const runtime = this.runtimeFromRow(run)
+    const activeLease = this.activeLeaseRow(lease.run_id)
+    const priorLeaseMerge = this.connection
+      .prepare("SELECT merge_id FROM edge_merges WHERE lease_id = ?")
+      .get(lease.lease_id) as Row | undefined
+    if (priorLeaseMerge) {
+      throw new JournalError(
+        "EDGE_MERGE_CONFLICT",
+        `Lease ${lease.lease_id} already committed merge ${text(priorLeaseMerge, "merge_id")}`,
+        { run_id: lease.run_id },
+      )
+    }
+    if (
+      !activeLease ||
+      text(activeLease, "lease_id") !== lease.lease_id ||
+      text(activeLease, "owner_mode") !== "edge" ||
+      text(activeLease, "owner_id") !== lease.owner_id ||
+      integer(activeLease, "ownership_epoch") !== lease.ownership_epoch ||
+      canonicalJson(lease as unknown as JsonObject) !== text(activeLease, "lease_json") ||
+      integer(run, "ownership_epoch") !== lease.ownership_epoch ||
+      runtime.definition_digest !== delegation.definition_digest ||
+      runtime.execution_binding_digest !== delegation.execution_binding_digest ||
+      edgeDelegationDigest(delegation) !== lease.delegation_digest ||
+      activation.lease_id !== lease.lease_id ||
+      activation.edge_id !== lease.owner_id ||
+      activation.delegation_digest !== lease.delegation_digest ||
+      activation.measured_clock_uncertainty_ms > lease.allowed_clock_uncertainty_ms ||
+      events.length > delegation.resource_limits.maximum_branch_events
+    ) {
+      throw new JournalError(
+        "EDGE_MERGE_INVALID",
+        "Edge delegation does not match the active run",
+        {
+          run_id: lease.run_id,
+        },
+      )
+    }
+    const anchorEvent = this.connection
+      .prepare("SELECT event_id FROM mission_events WHERE run_id = ? AND sequence = ?")
+      .get(lease.run_id, lease.branch_anchor_sequence)
+    if (!anchorEvent) {
+      throw new JournalError("EDGE_MERGE_INVALID", "Edge branch anchor does not exist", {
+        run_id: lease.run_id,
+      })
+    }
+    const conflict = this.connection
+      .prepare(
+        `SELECT event_id FROM mission_events
+         WHERE run_id = ? AND sequence > ? AND type NOT LIKE 'ownership.%'
+         ORDER BY sequence LIMIT 1`,
+      )
+      .get(lease.run_id, lease.branch_anchor_sequence) as Row | undefined
+    if (conflict) {
+      throw new JournalError(
+        "EDGE_MERGE_CONFLICT",
+        `Canonical event ${text(conflict, "event_id")} advanced beyond the branch anchor`,
+        { run_id: lease.run_id, event_id: text(conflict, "event_id") as EventId },
+      )
+    }
+    const earliest = Date.parse(lease.not_before) + lease.allowed_clock_uncertainty_ms
+    const latest = Date.parse(lease.not_after) - lease.allowed_clock_uncertainty_ms
+    const activationAt = Date.parse(activation.wall_at)
+    const createdAt = Date.parse(upload.created_at)
+    const branchAnchorDigest = edgeBranchAnchorDigest(lease.delegation_digest, activation)
+    let previousDigest: Digest | undefined
+    let previousRecordedAt = Number.NEGATIVE_INFINITY
+    let dispatchCount = 0
+    const eventIds = new Set<string>()
+    for (const [index, event] of events.entries()) {
+      const recordedAt = Date.parse(event.recorded_at)
+      const proposal = event.proposal
+      const unsigned = { ...event }
+      delete (unsigned as Partial<EdgeBranchEvent>).branch_digest
+      const expectedDigest = edgeBranchDigest(
+        branchAnchorDigest,
+        unsigned as Omit<EdgeBranchEvent, "branch_digest">,
+        lease.delegation_digest,
+      )
+      const executionAuthorized = event.execution
+        ? delegation.allowed_actions.some(
+            (allowed) =>
+              allowed.state === event.execution?.state &&
+              allowed.effect_class === event.execution.effect_class &&
+              allowed.operation === event.execution.operation &&
+              allowed.adapter_instance_id === event.execution.adapter_instance_id &&
+              allowed.input_digests.includes(event.execution.input_digest),
+          )
+        : true
+      const startsDispatch = proposal.type === "effect.dispatch_started"
+      if (
+        event.edge_local_sequence !== index + 1 ||
+        event.branch_digest_version !== 2 ||
+        event.proposal_digest !== proposalDigest(proposal) ||
+        event.branch_digest !== expectedDigest ||
+        (index === 0
+          ? event.previous_branch_digest !== undefined
+          : event.previous_branch_digest !== previousDigest) ||
+        proposal.run_id !== lease.run_id ||
+        proposal.source.kind !== "edge" ||
+        proposal.source.source_id !== lease.owner_id ||
+        proposal.ownership_epoch !== lease.ownership_epoch ||
+        proposal.schema_version !== 1 ||
+        !delegation.allowed_event_types.includes(proposal.type) ||
+        (proposal.type === "effect.dispatch_started") !== (event.execution !== undefined) ||
+        !executionAuthorized ||
+        !Number.isFinite(recordedAt) ||
+        !Number.isFinite(activationAt) ||
+        recordedAt < activationAt ||
+        (startsDispatch && recordedAt < earliest) ||
+        (startsDispatch && recordedAt >= latest) ||
+        (startsDispatch && recordedAt - activationAt >= lease.maximum_offline_duration_ms) ||
+        recordedAt < previousRecordedAt ||
+        eventIds.has(proposal.event_id) ||
+        this.connection
+          .prepare("SELECT event_id FROM mission_events WHERE event_id = ?")
+          .get(proposal.event_id)
+      ) {
+        throw new JournalError(
+          "EDGE_MERGE_INVALID",
+          `Edge event ${event.edge_local_sequence} failed branch validation`,
+          { run_id: lease.run_id, event_id: proposal.event_id },
+        )
+      }
+      eventIds.add(proposal.event_id)
+      dispatchCount += startsDispatch ? 1 : 0
+      previousDigest = event.branch_digest
+      previousRecordedAt = recordedAt
+    }
+    if (
+      upload.final_branch_digest !== (previousDigest ?? branchAnchorDigest) ||
+      dispatchCount > delegation.resource_limits.maximum_dispatches ||
+      !Number.isFinite(createdAt) ||
+      createdAt < activationAt ||
+      createdAt < previousRecordedAt ||
+      activationAt >= latest
+    ) {
+      throw new JournalError("EDGE_MERGE_INVALID", "Final edge branch metadata is invalid", {
+        run_id: lease.run_id,
+      })
+    }
+  }
+
+  private storeEdgeEvent(event: EdgeBranchEvent): AppendResult {
+    const proposal = parseProposedEvent(event.proposal)
+    const digest = proposalDigest(proposal)
+    if (proposal.type === "effect.dispatch_started") {
+      this.assertEdgeDispatchScope(proposal, event)
+      return this.storeDispatchStartedInTransaction(proposal, digest, event.recorded_at)
+    }
+    if (
+      proposal.type === "effect.issue_result_recorded" ||
+      proposal.type === "effect.reconciliation_result_recorded"
+    ) {
+      return this.storeDispatchResultInTransaction(proposal, digest, event.recorded_at)
+    }
+    if (
+      proposal.type === "timer.fired" &&
+      Schema.Check(TimerFiredPayloadSchema, proposal.payload)
+    ) {
+      const timer = this.timerRow(proposal.payload.timer_id, true)
+      if (text(timer, "run_id") !== proposal.run_id) {
+        throw new JournalError("EDGE_MERGE_INVALID", "Edge timer belongs to another run", {
+          run_id: proposal.run_id,
+          event_id: proposal.event_id,
+        })
+      }
+      const current = this.timerRecord(timer)
+      const run = this.runRow(proposal.run_id, true)
+      if (
+        current.status !== "scheduled" ||
+        proposal.logical_at !== current.due_at ||
+        proposal.causation_id !== current.causing_event_id ||
+        canonicalJson(proposal.payload as unknown as JsonObject) !==
+          canonicalJson(current.payload) ||
+        !this.timerIsCurrent(current, parseState(text(run, "state_json")))
+      ) {
+        throw new JournalError("EDGE_MERGE_INVALID", "Edge timer is not currently fireable", {
+          run_id: proposal.run_id,
+          event_id: proposal.event_id,
+        })
+      }
+      const pending = this.prepareAppend(proposal, digest, event.recorded_at)
+      this.storeAppend(pending)
+      this.connection
+        .prepare(
+          `UPDATE timers SET status = ?, fire_event_id = ?, updated_at = ?
+           WHERE timer_id = ? AND status = 'scheduled'`,
+        )
+        .run("fired", proposal.event_id, event.recorded_at, current.timer_id)
+      return this.appendResult(proposal.event_id, false)
+    }
+    if (guardedEventTypes.has(proposal.type)) {
+      throw new JournalError("EDGE_MERGE_INVALID", `Edge event ${proposal.type} is not mergeable`, {
+        run_id: proposal.run_id,
+        event_id: proposal.event_id,
+      })
+    }
+    const pending = this.prepareAppend(proposal, digest, event.recorded_at)
+    this.storeAppend(pending)
+    return this.appendResult(proposal.event_id, false)
+  }
+
+  private assertEdgeDispatchScope(event: ProposedEvent, branchEvent: EdgeBranchEvent): void {
+    if (
+      !branchEvent.execution ||
+      !Schema.Check(EffectDispatchStartedPayloadSchema, event.payload)
+    ) {
+      throw new JournalError("EDGE_MERGE_INVALID", "Edge dispatch scope is missing", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const payload = event.payload as unknown as EffectDispatchStartedPayload
+    const command = this.commandRecord(this.commandRow(payload.command_id, true))
+    const effect = this.connection
+      .prepare("SELECT projection_json FROM effects WHERE effect_id = ? AND run_id = ?")
+      .get(payload.effect_id, event.run_id) as Row | undefined
+    const operation = Reflect.get(command.payload, "operation")
+    const input = Reflect.get(command.payload, "input")
+    if (
+      !effect ||
+      typeof operation !== "string" ||
+      input === undefined ||
+      Reflect.get(command.payload, "effect_id") !== payload.effect_id ||
+      parseEffect(text(effect, "projection_json")).state_name !== branchEvent.execution.state ||
+      operation !== branchEvent.execution.operation ||
+      sha256Digest(input as JsonValue) !== branchEvent.execution.input_digest
+    ) {
+      throw new JournalError(
+        "EDGE_MERGE_INVALID",
+        `Edge dispatch ${event.event_id} does not match its canonical command`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+  }
+
+  private storeDispatchStartedInTransaction(
+    event: ProposedEvent,
+    digest: Digest,
+    recordedAt?: string,
+  ): AppendResult {
+    if (
+      event.type !== "effect.dispatch_started" ||
+      !Schema.Check(EffectDispatchStartedPayloadSchema, event.payload)
+    ) {
+      throw new JournalError("DISPATCH_EVENT_INVALID", "Dispatch start payload is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const payload = event.payload as unknown as EffectDispatchStartedPayload
+    const pending = this.prepareAppend(event, digest, recordedAt)
+    this.assertDispatchContext(pending.accepted, payload, "claimed")
+    this.storeAppend(pending)
+    const result = this.connection
+      .prepare(
+        `UPDATE effect_attempts
+         SET status = 'dispatch_started', started_event_id = ?, updated_at = ?
+         WHERE attempt_id = ? AND status = 'claimed'`,
+      )
+      .run(event.event_id, pending.accepted.recorded_at, payload.attempt_id)
+    if (result.changes !== 1) {
+      throw new JournalError(
+        "ATTEMPT_STATE_INVALID",
+        `Attempt ${payload.attempt_id} could not start dispatch`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    return this.appendResult(event.event_id, false)
+  }
+
+  private storeDispatchResultInTransaction(
+    event: ProposedEvent,
+    digest: Digest,
+    recordedAt?: string,
+  ): AppendResult {
+    let payload: EffectIssueResultPayload | EffectReconciliationResultPayload
+    let expectedKind: "effect.issue" | "effect.reconcile"
+    if (
+      event.type === "effect.issue_result_recorded" &&
+      Schema.Check(EffectIssueResultPayloadSchema, event.payload)
+    ) {
+      payload = event.payload as unknown as EffectIssueResultPayload
+      expectedKind = "effect.issue"
+    } else if (
+      event.type === "effect.reconciliation_result_recorded" &&
+      Schema.Check(EffectReconciliationResultPayloadSchema, event.payload)
+    ) {
+      payload = event.payload as unknown as EffectReconciliationResultPayload
+      expectedKind = "effect.reconcile"
+    } else {
+      throw new JournalError("DISPATCH_EVENT_INVALID", "Dispatch result payload is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const pending = this.prepareAppend(event, digest, recordedAt)
+    this.assertDispatchContext(pending.accepted, payload, "dispatch_started")
+    const command = this.commandRow(payload.command_id, true)
+    if (text(command, "kind") !== expectedKind) {
+      throw new JournalError(
+        "DISPATCH_EVENT_INVALID",
+        `Command ${payload.command_id} cannot accept ${event.type}`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    this.storeAppend(pending)
+    const attemptResult = this.connection
+      .prepare(
+        `UPDATE effect_attempts
+         SET status = 'result_recorded', result_event_id = ?, updated_at = ?
+         WHERE attempt_id = ? AND status = 'dispatch_started'`,
+      )
+      .run(event.event_id, pending.accepted.recorded_at, payload.attempt_id)
+    const commandResult = this.connection
+      .prepare(
+        `UPDATE commands SET status = 'completed'
+         WHERE command_id = ? AND status = 'claimed' AND active_attempt_id = ?`,
+      )
+      .run(payload.command_id, payload.attempt_id)
+    if (attemptResult.changes !== 1 || commandResult.changes !== 1) {
+      throw new JournalError(
+        "ATTEMPT_STATE_INVALID",
+        `Attempt ${payload.attempt_id} could not record its result`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    return this.appendResult(event.event_id, false)
+  }
+
+  private rebuildProjectionInTransaction(runId: RunId, updatedAt: string): StoredMission {
+    const run = this.runRow(runId, true)
+    const outcome = this.replay(runId, this.runtimeFromRow(run), false)
+    this.syncEffects(outcome.state, true)
+    this.updateRun(
+      { state: outcome.state, state_digest: outcome.state_digest, commands: [] },
+      updatedAt,
+    )
+    return this.storedMission(this.runRow(runId, true))
+  }
+
+  private edgeMergeRow(mergeId: MergeId): Row | undefined {
+    this.#database.assertOpen()
+    return this.connection.prepare("SELECT * FROM edge_merges WHERE merge_id = ?").get(mergeId) as
+      | Row
+      | undefined
+  }
+
+  private priorEdgeMerge(row: Row, digest: Digest): EdgeMergeResult {
+    if (text(row, "merge_digest") !== digest) {
+      throw new JournalError(
+        "EDGE_MERGE_ID_COLLISION",
+        `Merge ${text(row, "merge_id")} was already used for different content`,
+        { run_id: text(row, "run_id") as RunId },
+      )
+    }
+    const stored = storedJson(text(row, "result_json"), "Stored edge merge")
+    if (
+      !Schema.Check(EdgeMergeResultSchema, stored) ||
+      stored.duplicate ||
+      stored.merge_id !== text(row, "merge_id") ||
+      stored.run_id !== text(row, "run_id") ||
+      stored.merge_digest !== text(row, "merge_digest") ||
+      stored.branch_anchor_sequence !== integer(row, "branch_anchor_sequence") ||
+      stored.ownership_epoch !== integer(row, "ownership_epoch") ||
+      stored.edge_events.length !== integer(row, "edge_event_count") ||
+      stored.pending_watermark !== integer(row, "pending_watermark") ||
+      stored.final_sequence !== integer(row, "final_sequence") ||
+      stored.state_digest !== text(row, "state_digest") ||
+      stored.committed_at !== text(row, "committed_at")
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Stored edge merge result is invalid")
+    }
+    const mappings = this.connection
+      .prepare(
+        `SELECT edge_merge_events.*, mission_events.run_id, mission_events.sequence
+         FROM edge_merge_events
+         JOIN mission_events ON mission_events.event_id = edge_merge_events.event_id
+         WHERE merge_id = ? ORDER BY edge_local_sequence`,
+      )
+      .all(stored.merge_id) as Row[]
+    if (
+      mappings.length !== stored.edge_events.length ||
+      mappings.some((mapping, index) => {
+        const expected = stored.edge_events[index]
+        return (
+          !expected ||
+          integer(mapping, "edge_local_sequence") !== expected.edge_local_sequence ||
+          text(mapping, "event_id") !== expected.event_id ||
+          integer(mapping, "canonical_sequence") !== expected.canonical_sequence ||
+          integer(mapping, "sequence") !== expected.canonical_sequence ||
+          text(mapping, "branch_digest") !== expected.branch_digest ||
+          text(mapping, "run_id") !== stored.run_id
+        )
+      })
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Stored edge merge mapping is invalid", {
+        run_id: stored.run_id,
+      })
+    }
+    return { ...stored, duplicate: true }
+  }
+
+  private quarantineEdgeMerge(request: EdgeMergeRequest, digest: Digest, error: unknown): void {
+    const reasonCode = error instanceof JournalError ? error.code : "EDGE_MERGE_INVALID"
+    const detail = error instanceof Error ? error.message : "Edge merge failed"
+    const quarantinedAt = timestamp(this.#clock)
+    this.#database.transaction(() => {
+      this.connection
+        .prepare(
+          `INSERT OR IGNORE INTO edge_merge_quarantine(
+            merge_id, run_id, merge_digest, reason_code, detail, request_json, quarantined_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          request.merge_id,
+          request.upload.delegation.lease.run_id,
+          digest,
+          reasonCode,
+          detail,
+          canonicalJson(request as unknown as JsonObject),
+          quarantinedAt,
+        )
+    })
+  }
+
+  private quarantinedEdgeMerge(row: Row): QuarantinedEdgeMerge {
+    const request = storedJson(text(row, "request_json"), "Quarantined edge merge")
+    if (!Schema.Check(EdgeMergeRequestSchema, request)) {
+      throw new JournalError("CORRUPT_RECORD", "Quarantined edge merge request is invalid")
+    }
+    return {
+      quarantine_id: integer(row, "quarantine_id"),
+      merge_id: text(row, "merge_id") as MergeId,
+      run_id: text(row, "run_id") as RunId,
+      merge_digest: parseDigest(column(row, "merge_digest"), "Quarantined merge digest"),
+      reason_code: text(row, "reason_code"),
+      detail: text(row, "detail"),
+      request,
+      quarantined_at: text(row, "quarantined_at"),
+    }
   }
 
   private updateHandoffEvent(
@@ -1894,19 +2865,19 @@ export class SqliteJournal {
     return this.#database.connection
   }
 
-  private accept(proposal: ProposedEvent, sequence: number): AcceptedEvent {
+  private accept(proposal: ProposedEvent, sequence: number, recordedAt?: string): AcceptedEvent {
     return {
       ...proposal,
       sequence,
-      recorded_at: timestamp(this.#clock),
+      recorded_at: recordedAt ?? timestamp(this.#clock),
     }
   }
 
-  private prepareAppend(event: ProposedEvent, digest: Digest): PendingAppend {
+  private prepareAppend(event: ProposedEvent, digest: Digest, recordedAt?: string): PendingAppend {
     const run = this.runRow(event.run_id, true)
     const definition = this.runtimeFromRow(run)
     const previousState = parseState(text(run, "state_json"))
-    const accepted = this.accept(event, integer(run, "current_sequence") + 1)
+    const accepted = this.accept(event, integer(run, "current_sequence") + 1, recordedAt)
     const reduction = reduceMission(definition, previousState, accepted)
     return { accepted, digest, reduction }
   }

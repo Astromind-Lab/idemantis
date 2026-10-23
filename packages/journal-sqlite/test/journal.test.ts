@@ -255,7 +255,7 @@ describe("SQLite journal", () => {
     const journal = open(path)
 
     expect(journal.storageInfo()).toEqual({
-      schema_version: 3,
+      schema_version: 4,
       journal_mode: "wal",
       foreign_keys: true,
     })
@@ -290,7 +290,7 @@ describe("SQLite journal", () => {
 
     const journal = open(path)
 
-    expect(journal.storageInfo().schema_version).toBe(3)
+    expect(journal.storageInfo().schema_version).toBe(4)
     expect(() => admitted(journal)).not.toThrow()
   })
 
