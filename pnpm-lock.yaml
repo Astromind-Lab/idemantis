@@ -233,6 +233,15 @@ importers:
         specifier: 4.10.2
         version: 4.10.2
 
+  packages/sdk:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
 packages:
   "@biomejs/biome@2.6.2":
     resolution:
