@@ -296,6 +296,15 @@ importers:
         specifier: 1.4.3
         version: 1.4.3
 
+  packages/fault-suite:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/simulator":
+        specifier: workspace:*
+        version: link:../simulator
+
   packages/journal-sqlite:
     dependencies:
       "@idemantis/contracts":
