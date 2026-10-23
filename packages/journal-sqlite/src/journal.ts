@@ -31,6 +31,7 @@ import {
   EffectIssueResultPayloadSchema,
   EffectReconciliationResultPayloadSchema,
   OwnershipActivatedPayloadSchema,
+  OwnershipEffectCancelledPayloadSchema,
   OwnershipFenceActivatedPayloadSchema,
   OwnershipHandoffBlockedPayloadSchema,
   OwnershipHandoffRequestedPayloadSchema,
@@ -46,6 +47,7 @@ import {
   type MissionRuntimeDefinition,
   type MissionState,
   type OwnershipActivatedPayload,
+  type OwnershipEffectCancelledPayload,
   type OwnershipFenceActivatedPayload,
   type OwnershipHandoffBlockedPayload,
   type OwnershipHandoffRequestedPayload,
@@ -119,6 +121,7 @@ const guardedEventTypes = new Set([
   "ownership.handoff_blocked",
   "ownership.released",
   "ownership.fence_activated",
+  "ownership.effect_cancelled",
   "ownership.activated",
 ])
 
@@ -318,6 +321,7 @@ export class SqliteJournal {
       })
     }
     const payload = event.payload as unknown as OwnershipHandoffRequestedPayload
+    const targetLease = payload.target_lease
     const digest = proposalDigest(event)
 
     return this.#database.transaction(() => {
@@ -332,8 +336,10 @@ export class SqliteJournal {
         text(activeLease, "lease_id") !== payload.source_lease_id ||
         text(activeLease, "owner_mode") !== event.source.kind ||
         text(activeLease, "owner_id") !== event.source.source_id ||
-        payload.target_lease_id === payload.source_lease_id ||
-        payload.target_epoch !== integer(run, "ownership_epoch") + 1 ||
+        targetLease.run_id !== event.run_id ||
+        targetLease.lease_id === payload.source_lease_id ||
+        targetLease.ownership_epoch !== integer(run, "ownership_epoch") + 1 ||
+        targetLease.branch_anchor_sequence > integer(run, "current_sequence") ||
         parseState(text(run, "state_json")).terminal_outcome !== null ||
         integer(run, "claims_frozen") !== 0 ||
         this.openHandoffRow(event.run_id)
@@ -344,6 +350,7 @@ export class SqliteJournal {
           { run_id: event.run_id, event_id: event.event_id },
         )
       }
+      this.validateLeaseWindow(targetLease)
       const pending = this.prepareAppend(event, digest)
       const sourceLease = parseOwnershipLease(
         storedJson(text(activeLease, "lease_json"), "Stored ownership lease"),
@@ -361,20 +368,21 @@ export class SqliteJournal {
       this.connection
         .prepare(
           `INSERT INTO ownership_handoffs(
-            handoff_id, run_id, source_lease_id, target_lease_id, source_epoch,
+            handoff_id, run_id, source_lease_id, target_lease_id, target_lease_json, source_epoch,
             target_epoch, target_owner_mode, target_owner_id, status,
             requested_event_id, requested_at, updated_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'requested', ?, ?, ?)`,
         )
         .run(
           payload.handoff_id,
           event.run_id,
           payload.source_lease_id,
-          payload.target_lease_id,
+          targetLease.lease_id,
+          canonicalJson(targetLease as unknown as JsonObject),
           event.ownership_epoch,
-          payload.target_epoch,
-          payload.target_owner_mode,
-          payload.target_owner_id,
+          targetLease.ownership_epoch,
+          targetLease.owner_mode,
+          targetLease.owner_id,
           event.event_id,
           pending.accepted.recorded_at,
           pending.accepted.recorded_at,
@@ -508,15 +516,27 @@ export class SqliteJournal {
             event_id: event.event_id,
           })
         }
+        const effect = this.connection
+          .prepare(
+            "SELECT effect_id FROM effects WHERE effect_id = ? AND run_id = ? AND ownership_epoch = ?",
+          )
+          .get(payload.effect_id, event.run_id, integer(row, "source_epoch"))
+        if (!effect) {
+          throw new JournalError("OWNERSHIP_INVALID", "Fence effect is not in the source epoch", {
+            run_id: event.run_id,
+            event_id: event.event_id,
+          })
+        }
         this.connection
           .prepare(
             `INSERT INTO ownership_fences(
-            handoff_id, adapter_instance_id, scope, scope_reference,
+            handoff_id, effect_id, adapter_instance_id, scope, scope_reference,
             ownership_epoch, proof_json, event_id, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
           .run(
             payload.handoff_id,
+            payload.effect_id,
             payload.proof.adapter_instance_id,
             payload.proof.scope,
             payload.proof.scope_reference,
@@ -531,6 +551,43 @@ export class SqliteJournal {
            SET status = 'fenced', updated_at = ? WHERE handoff_id = ?`,
           )
           .run(recordedAt, payload.handoff_id)
+      },
+    )
+  }
+
+  recordOwnershipCancellation(proposal: ProposedEvent): AppendResult {
+    const event = parseProposedEvent(proposal)
+    if (
+      event.type !== "ownership.effect_cancelled" ||
+      !Schema.Check(OwnershipEffectCancelledPayloadSchema, event.payload)
+    ) {
+      throw new JournalError("OWNERSHIP_INVALID", "Cancellation event is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const payload = event.payload as unknown as OwnershipEffectCancelledPayload
+    return this.updateHandoffEvent(
+      event,
+      payload.handoff_id,
+      ["requested", "blocked"],
+      (recordedAt) => {
+        const effect = this.connection
+          .prepare("SELECT effect_id FROM effects WHERE effect_id = ? AND run_id = ?")
+          .get(payload.effect_id, event.run_id)
+        if (!effect) {
+          throw new JournalError("OWNERSHIP_INVALID", "Cancellation effect is not in the run", {
+            run_id: event.run_id,
+            event_id: event.event_id,
+          })
+        }
+        this.connection
+          .prepare(
+            `INSERT INTO ownership_cancellations(
+              handoff_id, effect_id, result, event_id, created_at
+            ) VALUES (?, ?, ?, ?, ?)`,
+          )
+          .run(payload.handoff_id, payload.effect_id, payload.result, event.event_id, recordedAt)
       },
     )
   }
@@ -565,6 +622,7 @@ export class SqliteJournal {
         lease.run_id !== event.run_id ||
         lease.owner_mode !== text(row, "target_owner_mode") ||
         lease.owner_id !== text(row, "target_owner_id") ||
+        canonicalJson(lease as unknown as JsonObject) !== text(row, "target_lease_json") ||
         event.source.kind !== lease.owner_mode ||
         event.source.source_id !== lease.owner_id ||
         lease.ownership_epoch !== integer(row, "target_epoch") ||
@@ -579,9 +637,35 @@ export class SqliteJournal {
         )
       }
       this.validateLeaseWindow(lease)
-      const openAttempts = this.countOpenDispatches(event.run_id, integer(row, "source_epoch"))
-      const fenceCount = this.countHandoffFences(payload.handoff_id)
-      if (openAttempts > 0 && fenceCount === 0) {
+      const resumeCommands = this.pendingOwnershipCommands(
+        event.run_id,
+        integer(row, "source_epoch"),
+      )
+      if (
+        resumeCommands.length !== payload.resume_commands.length ||
+        resumeCommands.some((command, index) => {
+          const resume = payload.resume_commands[index]
+          return (
+            !resume ||
+            resume.previous_command_id !== command.command_id ||
+            resume.kind !== command.kind ||
+            canonicalJson(resume.payload) !== canonicalJson(command.payload)
+          )
+        })
+      ) {
+        throw new JournalError(
+          "OWNERSHIP_INVALID",
+          `Handoff ${payload.handoff_id} does not preserve its pending commands`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      if (
+        this.countUnfencedOpenDispatches(
+          event.run_id,
+          integer(row, "source_epoch"),
+          payload.handoff_id,
+        ) > 0
+      ) {
         throw new JournalError(
           "OWNERSHIP_HANDOFF_BLOCKED",
           `Handoff ${payload.handoff_id} has an unfenced in-flight attempt`,
@@ -589,6 +673,19 @@ export class SqliteJournal {
         )
       }
       const pending = this.prepareAppend(event, digest)
+      if (this.handoffHasFutureFence(payload.handoff_id, pending.accepted.recorded_at)) {
+        throw new JournalError(
+          "OWNERSHIP_HANDOFF_BLOCKED",
+          `Handoff ${payload.handoff_id} has a fence that is not effective`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      if (Date.parse(pending.accepted.recorded_at) >= Date.parse(lease.not_after)) {
+        throw new JournalError("OWNERSHIP_INVALID", `Lease ${lease.lease_id} has expired`, {
+          run_id: event.run_id,
+          event_id: event.event_id,
+        })
+      }
       this.storeAppend(pending)
       this.insertOwnershipLease(lease, event.event_id, pending.accepted.recorded_at)
       this.connection
@@ -910,7 +1007,10 @@ export class SqliteJournal {
   getOwnership(runId: RunId): OwnershipState {
     this.#database.assertOpen()
     const run = this.runRow(runId, true)
-    const activeLease = this.activeLeaseRow(runId)
+    const leaseRows = this.connection
+      .prepare("SELECT * FROM ownership_leases WHERE run_id = ? ORDER BY ownership_epoch")
+      .all(runId) as Row[]
+    const activeLease = leaseRows.find((row) => text(row, "status") === "active")
     const handoff = this.connection
       .prepare(
         `SELECT * FROM ownership_handoffs
@@ -919,7 +1019,9 @@ export class SqliteJournal {
       .get(runId) as Row | undefined
     const fenceRows = handoff
       ? (this.connection
-          .prepare("SELECT proof_json FROM ownership_fences WHERE handoff_id = ? ORDER BY event_id")
+          .prepare(
+            "SELECT effect_id, proof_json FROM ownership_fences WHERE handoff_id = ? ORDER BY effect_id",
+          )
           .all(text(handoff, "handoff_id")) as Row[])
       : []
 
@@ -927,9 +1029,11 @@ export class SqliteJournal {
       claims_frozen: integer(run, "claims_frozen") === 1,
       ...(activeLease ? { active_lease: this.storedOwnershipLease(activeLease) } : {}),
       ...(handoff ? { handoff: this.ownershipHandoffRecord(handoff) } : {}),
-      fence_proofs: fenceRows.map((row) =>
-        parseFenceProof(storedJson(text(row, "proof_json"), "Stored fence proof")),
-      ),
+      leases: leaseRows.map((row) => this.storedOwnershipLease(row)),
+      fences: fenceRows.map((row) => ({
+        effect_id: text(row, "effect_id") as EffectId,
+        proof: parseFenceProof(storedJson(text(row, "proof_json"), "Stored fence proof")),
+      })),
     }
   }
 
@@ -1336,6 +1440,9 @@ export class SqliteJournal {
       run_id: text(row, "run_id"),
       source_lease_id: text(row, "source_lease_id"),
       target_lease_id: text(row, "target_lease_id"),
+      target_lease: parseOwnershipLease(
+        storedJson(text(row, "target_lease_json"), "Stored handoff target lease"),
+      ),
       source_epoch: integer(row, "source_epoch"),
       target_epoch: integer(row, "target_epoch"),
       target_owner_mode: text(row, "target_owner_mode"),
@@ -1347,7 +1454,26 @@ export class SqliteJournal {
     })
   }
 
-  private countOpenDispatches(runId: RunId, ownershipEpoch: number): number {
+  private pendingOwnershipCommands(runId: RunId, ownershipEpoch: number): CommandRecord[] {
+    return this.connection
+      .prepare(
+        `SELECT commands.*
+         FROM commands
+         JOIN mission_events ON mission_events.event_id = commands.causing_event_id
+         WHERE commands.run_id = ? AND commands.ownership_epoch = ?
+           AND commands.status = 'pending'
+           AND commands.kind IN ('effect.issue', 'effect.reconcile')
+         ORDER BY mission_events.sequence, commands.ordinal`,
+      )
+      .all(runId, ownershipEpoch)
+      .map((row) => this.commandRecord(row as Row))
+  }
+
+  private countUnfencedOpenDispatches(
+    runId: RunId,
+    ownershipEpoch: number,
+    handoffId: HandoffId,
+  ): number {
     const row = asRow(
       this.connection
         .prepare(
@@ -1355,22 +1481,35 @@ export class SqliteJournal {
            FROM effect_attempts
            JOIN commands ON commands.command_id = effect_attempts.command_id
            WHERE commands.run_id = ? AND effect_attempts.ownership_epoch = ?
-             AND effect_attempts.status = 'dispatch_started'`,
+             AND effect_attempts.status = 'dispatch_started'
+             AND NOT EXISTS (
+               SELECT 1 FROM ownership_fences
+               WHERE ownership_fences.handoff_id = ?
+                 AND ownership_fences.effect_id = effect_attempts.effect_id
+             )
+             AND NOT EXISTS (
+               SELECT 1 FROM ownership_cancellations
+               WHERE ownership_cancellations.handoff_id = ?
+                 AND ownership_cancellations.effect_id = effect_attempts.effect_id
+             )`,
         )
-        .get(runId, ownershipEpoch),
-      "open dispatch count",
+        .get(runId, ownershipEpoch, handoffId, handoffId),
+      "unfenced dispatch count",
     )
     return integer(row, "count")
   }
 
-  private countHandoffFences(handoffId: HandoffId): number {
-    const row = asRow(
-      this.connection
-        .prepare("SELECT COUNT(*) AS count FROM ownership_fences WHERE handoff_id = ?")
-        .get(handoffId),
-      "handoff fence count",
-    )
-    return integer(row, "count")
+  private handoffHasFutureFence(handoffId: HandoffId, recordedAt: string): boolean {
+    const acceptedAt = Date.parse(recordedAt)
+    return this.connection
+      .prepare("SELECT proof_json FROM ownership_fences WHERE handoff_id = ?")
+      .all(handoffId)
+      .some((row) => {
+        const proof = parseFenceProof(
+          storedJson(text(row as Row, "proof_json"), "Stored fence proof"),
+        )
+        return Date.parse(proof.effective_at) > acceptedAt
+      })
   }
 
   private validateTimestamp(value: string, label: string): number {
@@ -1394,6 +1533,9 @@ export class SqliteJournal {
     }
     if (!Schema.Check(SourceIdSchema, options.claimed_by)) {
       throw new TypeError("claimed_by must satisfy SourceId")
+    }
+    if (options.owner_mode !== "runner" && options.owner_mode !== "edge") {
+      throw new TypeError("owner_mode must be runner or edge")
     }
     const claimedAt = this.validateTimestamp(options.claimed_at, "claimed_at")
     if (!Number.isSafeInteger(options.lease_duration_ms) || options.lease_duration_ms < 1) {
@@ -1427,6 +1569,19 @@ export class SqliteJournal {
     const epoch = integer(run, "ownership_epoch")
     const commandEpoch = integer(command, "ownership_epoch")
     const existingAttempt = this.attemptRow(options.attempt_id, false)
+    const activeLease = this.activeLeaseRow(runId)
+
+    if (
+      activeLease &&
+      (text(activeLease, "owner_mode") !== options.owner_mode ||
+        text(activeLease, "owner_id") !== options.claimed_by)
+    ) {
+      throw new JournalError(
+        "COMMAND_OWNERSHIP_STALE",
+        `Worker ${options.claimed_by} does not hold the active lease for ${runId}`,
+        { run_id: runId },
+      )
+    }
 
     if (existingAttempt) {
       const attempt = this.attemptRecord(existingAttempt)
@@ -1463,7 +1618,6 @@ export class SqliteJournal {
         { run_id: runId },
       )
     }
-    const activeLease = this.activeLeaseRow(runId)
     if (activeLease) {
       const lease = parseOwnershipLease(
         storedJson(text(activeLease, "lease_json"), "Stored ownership lease"),
@@ -1471,6 +1625,7 @@ export class SqliteJournal {
       const claimedAt = this.validateTimestamp(options.claimed_at, "claimed_at")
       if (
         lease.owner_id !== options.claimed_by ||
+        lease.owner_mode !== options.owner_mode ||
         lease.ownership_epoch !== epoch ||
         claimedAt < Date.parse(lease.not_before) ||
         claimedAt >= Date.parse(lease.not_after)
@@ -1615,6 +1770,21 @@ export class SqliteJournal {
         `Attempt ${payload.attempt_id} expired before dispatch started`,
         { run_id: event.run_id, event_id: event.event_id },
       )
+    }
+
+    if (expectedStatus === "claimed") {
+      const activeLease = this.activeLeaseRow(event.run_id)
+      if (
+        activeLease &&
+        (text(activeLease, "owner_mode") !== event.source.kind ||
+          text(activeLease, "owner_id") !== event.source.source_id)
+      ) {
+        throw new JournalError(
+          "ATTEMPT_NOT_ACTIVE",
+          `Attempt ${payload.attempt_id} is not owned by the active lease`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
     }
   }
 

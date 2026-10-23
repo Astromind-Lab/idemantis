@@ -180,6 +180,7 @@ export const OwnershipHandoffRecordSchema = Type.Object(
     run_id: RunIdSchema,
     source_lease_id: LeaseIdSchema,
     target_lease_id: LeaseIdSchema,
+    target_lease: OwnershipLeaseSchema,
     source_epoch: Type.Integer({ minimum: 1 }),
     target_epoch: Type.Integer({ minimum: 2 }),
     target_owner_mode: Type.Union([Type.Literal("runner"), Type.Literal("edge")]),

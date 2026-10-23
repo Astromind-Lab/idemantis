@@ -13,7 +13,6 @@ import {
   OwnershipHandoffBlockReasonSchema,
   OwnershipLeaseSchema,
   ReconciliationResultSchema,
-  SourceIdSchema,
   StateInstanceIdSchema,
   TimerIdSchema,
   type AcceptedEvent,
@@ -93,10 +92,7 @@ export const OwnershipHandoffRequestedPayloadSchema = Type.Object(
   {
     handoff_id: HandoffIdSchema,
     source_lease_id: LeaseIdSchema,
-    target_lease_id: LeaseIdSchema,
-    target_epoch: Type.Integer({ minimum: 2 }),
-    target_owner_mode: Type.Union([Type.Literal("runner"), Type.Literal("edge")]),
-    target_owner_id: SourceIdSchema,
+    target_lease: OwnershipLeaseSchema,
   },
   { additionalProperties: false },
 )
@@ -120,7 +116,26 @@ export const OwnershipReleasedPayloadSchema = Type.Object(
 export const OwnershipFenceActivatedPayloadSchema = Type.Object(
   {
     handoff_id: HandoffIdSchema,
+    effect_id: EffectIdSchema,
     proof: FenceProofSchema,
+  },
+  { additionalProperties: false },
+)
+
+export const OwnershipEffectCancelledPayloadSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    effect_id: EffectIdSchema,
+    result: Type.Literal("confirmed_stopped"),
+  },
+  { additionalProperties: false },
+)
+
+export const OwnershipResumeCommandSchema = Type.Object(
+  {
+    previous_command_id: CommandIdSchema,
+    kind: Type.Union([Type.Literal("effect.issue"), Type.Literal("effect.reconcile")]),
+    payload: JsonObjectSchema,
   },
   { additionalProperties: false },
 )
@@ -129,6 +144,7 @@ export const OwnershipActivatedPayloadSchema = Type.Object(
   {
     handoff_id: HandoffIdSchema,
     lease: OwnershipLeaseSchema,
+    resume_commands: Type.Array(OwnershipResumeCommandSchema, { maxItems: 1_000 }),
   },
   { additionalProperties: false },
 )
@@ -145,6 +161,7 @@ const validators = {
   "ownership.handoff_blocked": Schema.Compile(OwnershipHandoffBlockedPayloadSchema),
   "ownership.released": Schema.Compile(OwnershipReleasedPayloadSchema),
   "ownership.fence_activated": Schema.Compile(OwnershipFenceActivatedPayloadSchema),
+  "ownership.effect_cancelled": Schema.Compile(OwnershipEffectCancelledPayloadSchema),
   "ownership.activated": Schema.Compile(OwnershipActivatedPayloadSchema),
 } as const
 

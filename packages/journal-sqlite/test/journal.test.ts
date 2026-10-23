@@ -181,6 +181,7 @@ function claimFirstCommand(
   return journal.claimCommand(command.command_id, {
     attempt_id: selectedAttemptId,
     claimed_by: "journal-worker",
+    owner_mode: "runner",
     claimed_at: claimedAt,
     lease_duration_ms: leaseDurationMs,
   })
@@ -374,6 +375,7 @@ describe("SQLite journal", () => {
       journal.claimNext(runId, {
         attempt_id: secondAttemptId,
         claimed_by: "other-worker",
+        owner_mode: "runner",
         claimed_at: "2026-01-01T01:00:00Z",
         lease_duration_ms: 60_000,
       }),
@@ -387,6 +389,7 @@ describe("SQLite journal", () => {
     const second = journal.claimCommand(first.command.command_id, {
       attempt_id: secondAttemptId,
       claimed_by: "other-worker",
+      owner_mode: "runner",
       claimed_at: "2026-01-01T00:00:03Z",
       lease_duration_ms: 60_000,
     })
@@ -438,6 +441,7 @@ describe("SQLite journal", () => {
       journal.claimNext(runId, {
         attempt_id: secondAttemptId,
         claimed_by: "other-worker",
+        owner_mode: "runner",
         claimed_at: "2026-01-01T01:00:00Z",
         lease_duration_ms: 60_000,
       }),

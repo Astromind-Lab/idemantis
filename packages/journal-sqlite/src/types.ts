@@ -8,6 +8,7 @@ import type {
   EventAcceptance,
   ProposedEvent,
   FenceProof,
+  EffectId,
   OwnershipHandoffRecord,
   OwnershipLease,
   RunId,
@@ -68,6 +69,7 @@ export interface ProjectionRebuildOptions {
 export interface CommandClaimOptions {
   attempt_id: AttemptId
   claimed_by: SourceId
+  owner_mode: "runner" | "edge"
   claimed_at: string
   lease_duration_ms: number
 }
@@ -90,7 +92,13 @@ export interface OwnershipState {
   claims_frozen: boolean
   active_lease?: StoredOwnershipLease
   handoff?: OwnershipHandoffRecord
-  fence_proofs: FenceProof[]
+  leases: StoredOwnershipLease[]
+  fences: OwnershipFenceRecord[]
+}
+
+export interface OwnershipFenceRecord {
+  effect_id: EffectId
+  proof: FenceProof
 }
 
 export interface TimerFireOptions {

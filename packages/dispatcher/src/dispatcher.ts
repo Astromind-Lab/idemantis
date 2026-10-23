@@ -22,6 +22,7 @@ export class CommandDispatcher {
   readonly #journal: SqliteJournal
   readonly #executor: EffectExecutor
   readonly #workerId: CommandDispatcherOptions["worker_id"]
+  readonly #ownerMode: NonNullable<CommandDispatcherOptions["owner_mode"]>
   readonly #leaseDurationMs: number
   readonly #clock: Clock
   readonly #identities: IdentityFactory
@@ -33,6 +34,7 @@ export class CommandDispatcher {
     this.#journal = options.journal
     this.#executor = options.executor
     this.#workerId = options.worker_id
+    this.#ownerMode = options.owner_mode ?? "runner"
     this.#leaseDurationMs = options.lease_duration_ms
     this.#clock = options.clock ?? new SystemClock()
     this.#identities = options.identities ?? new SecureIdentityFactory()
@@ -42,6 +44,7 @@ export class CommandDispatcher {
     const claim = this.#journal.claimNext(runId, {
       attempt_id: this.#identities.attemptId(),
       claimed_by: this.#workerId,
+      owner_mode: this.#ownerMode,
       claimed_at: this.#clock.now().toISOString(),
       lease_duration_ms: this.#leaseDurationMs,
     })
@@ -131,7 +134,7 @@ export class CommandDispatcher {
       run_id: claim.command.run_id,
       type,
       schema_version: 1,
-      source: { kind: "runner", source_id: this.#workerId },
+      source: { kind: this.#ownerMode, source_id: this.#workerId },
       causation_id: causationId,
       ownership_epoch: claim.command.ownership_epoch,
       payload,

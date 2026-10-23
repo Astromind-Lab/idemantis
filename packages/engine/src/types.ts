@@ -15,7 +15,6 @@ import type {
   FenceProof,
   HandoffId,
   RunId,
-  SourceId,
   StateInstanceId,
   TimerId,
 } from "@idemantis/contracts"
@@ -103,6 +102,7 @@ export type ReducerEventType =
   | "ownership.handoff_blocked"
   | "ownership.released"
   | "ownership.fence_activated"
+  | "ownership.effect_cancelled"
   | "ownership.activated"
 
 export interface MissionAdmittedPayload {
@@ -166,10 +166,7 @@ export interface OwnershipLeaseRegisteredPayload {
 export interface OwnershipHandoffRequestedPayload {
   handoff_id: HandoffId
   source_lease_id: OwnershipLease["lease_id"]
-  target_lease_id: OwnershipLease["lease_id"]
-  target_epoch: number
-  target_owner_mode: "runner" | "edge"
-  target_owner_id: SourceId
+  target_lease: OwnershipLease
 }
 
 export interface OwnershipHandoffBlockedPayload {
@@ -184,12 +181,26 @@ export interface OwnershipReleasedPayload {
 
 export interface OwnershipFenceActivatedPayload {
   handoff_id: HandoffId
+  effect_id: EffectId
   proof: FenceProof
+}
+
+export interface OwnershipEffectCancelledPayload {
+  handoff_id: HandoffId
+  effect_id: EffectId
+  result: "confirmed_stopped"
+}
+
+export interface OwnershipResumeCommand {
+  previous_command_id: CommandId
+  kind: "effect.issue" | "effect.reconcile"
+  payload: JsonObject
 }
 
 export interface OwnershipActivatedPayload {
   handoff_id: HandoffId
   lease: OwnershipLease
+  resume_commands: OwnershipResumeCommand[]
 }
 
 export type ReducerEvent =
@@ -207,4 +218,5 @@ export type ReducerEvent =
   | { type: "ownership.handoff_blocked"; payload: OwnershipHandoffBlockedPayload }
   | { type: "ownership.released"; payload: OwnershipReleasedPayload }
   | { type: "ownership.fence_activated"; payload: OwnershipFenceActivatedPayload }
+  | { type: "ownership.effect_cancelled"; payload: OwnershipEffectCancelledPayload }
   | { type: "ownership.activated"; payload: OwnershipActivatedPayload }

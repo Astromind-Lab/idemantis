@@ -198,6 +198,7 @@ CREATE TABLE ownership_handoffs (
   run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
   source_lease_id TEXT NOT NULL REFERENCES ownership_leases(lease_id),
   target_lease_id TEXT NOT NULL,
+  target_lease_json TEXT NOT NULL CHECK (json_valid(target_lease_json)),
   source_epoch INTEGER NOT NULL CHECK (source_epoch >= 1),
   target_epoch INTEGER NOT NULL CHECK (target_epoch = source_epoch + 1),
   target_owner_mode TEXT NOT NULL CHECK (target_owner_mode IN ('runner', 'edge')),
@@ -220,6 +221,7 @@ WHERE status <> 'active';
 
 CREATE TABLE ownership_fences (
   handoff_id TEXT NOT NULL REFERENCES ownership_handoffs(handoff_id),
+  effect_id TEXT NOT NULL REFERENCES effects(effect_id),
   adapter_instance_id TEXT NOT NULL,
   scope TEXT NOT NULL,
   scope_reference TEXT NOT NULL,
@@ -227,7 +229,16 @@ CREATE TABLE ownership_fences (
   proof_json TEXT NOT NULL CHECK (json_valid(proof_json)),
   event_id TEXT NOT NULL UNIQUE REFERENCES mission_events(event_id),
   created_at TEXT NOT NULL,
-  PRIMARY KEY (handoff_id, event_id)
+  PRIMARY KEY (handoff_id, effect_id)
+) STRICT;
+
+CREATE TABLE ownership_cancellations (
+  handoff_id TEXT NOT NULL REFERENCES ownership_handoffs(handoff_id),
+  effect_id TEXT NOT NULL REFERENCES effects(effect_id),
+  result TEXT NOT NULL CHECK (result = 'confirmed_stopped'),
+  event_id TEXT NOT NULL UNIQUE REFERENCES mission_events(event_id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (handoff_id, effect_id)
 ) STRICT;
 `
 

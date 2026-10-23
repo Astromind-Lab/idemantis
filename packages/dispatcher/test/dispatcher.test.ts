@@ -119,10 +119,49 @@ const mission = defineMission({
   },
 })
 
+const twoStepMission = defineMission({
+  id: "two-step-dispatch",
+  version: "1.0.0",
+  input: Type.Object(
+    { route: Type.String(), vehicle: Type.String() },
+    { additionalProperties: false },
+  ),
+  initial: "firstDispatch",
+  states: {
+    firstDispatch: effectState({
+      operation: dispatch,
+      effectSlot: "first",
+      input: mapFields({ route: fromInput("route") }),
+      retry: safeRetry({ attempts: 2, backoffMs: 100 }),
+      onSettled: "secondDispatch",
+      onFailed: "failed",
+      onUncertain: "unresolved",
+    }),
+    secondDispatch: effectState({
+      operation: dispatch,
+      effectSlot: "second",
+      input: mapFields({ route: fromInput("route") }),
+      retry: safeRetry({ attempts: 2, backoffMs: 100 }),
+      onSettled: "complete",
+      onFailed: "failed",
+      onUncertain: "unresolved",
+    }),
+    complete: finalState("completed"),
+    failed: finalState("failed"),
+    unresolved: finalState("unresolved"),
+  },
+})
+
 const runtime: MissionRuntimeDefinition = {
   manifest: mission.manifest,
   definition_digest: mission.definitionDigest,
   execution_binding_digest: `sha256:${"b".repeat(64)}`,
+}
+
+const twoStepRuntime: MissionRuntimeDefinition = {
+  manifest: twoStepMission.manifest,
+  definition_digest: twoStepMission.definitionDigest,
+  execution_binding_digest: `sha256:${"c".repeat(64)}`,
 }
 
 const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
@@ -163,7 +202,7 @@ function tickingClock() {
   }
 }
 
-function open(): SqliteJournal {
+function open(selectedRuntime = runtime): SqliteJournal {
   const directory = mkdtempSync(join(tmpdir(), "idemantis-dispatcher-"))
   temporaryDirectories.push(directory)
   const journal = new SqliteJournal({
@@ -171,11 +210,11 @@ function open(): SqliteJournal {
     clock: tickingClock(),
   })
   journals.push(journal)
-  journal.admit(runtime, admission())
+  journal.admit(selectedRuntime, admission(selectedRuntime))
   return journal
 }
 
-function admission(): ProposedEvent {
+function admission(selectedRuntime = runtime): ProposedEvent {
   return {
     event_id: "evt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
     run_id: runId,
@@ -184,8 +223,8 @@ function admission(): ProposedEvent {
     source: { kind: "system", source_id: "dispatcher-test" },
     ownership_epoch: 1,
     payload: {
-      definition_digest: runtime.definition_digest,
-      execution_binding_digest: runtime.execution_binding_digest,
+      definition_digest: selectedRuntime.definition_digest,
+      execution_binding_digest: selectedRuntime.execution_binding_digest,
       input: { route: "north", vehicle: "vehicle-7" },
     },
   }
@@ -368,6 +407,56 @@ describe("command dispatcher", () => {
 })
 
 describe("ownership handoff", () => {
+  it("recreates pending work and lets an edge owner hand it back", async () => {
+    const journal = open()
+    const resolve = vi.fn(() => ({ capabilities }))
+    const runner = new OwnershipCoordinator({
+      journal,
+      source_id: "runner-1",
+      bindings: { resolve },
+    })
+    runner.registerLease(ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB0", "runner-1", 1))
+
+    const toEdge = await runner.handoff({
+      handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FAX",
+      target_lease: ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB1", "edge-1", 2, "edge"),
+    })
+    expect(journal.listCommands(runId).at(-1)).toMatchObject({
+      status: "pending",
+      ownership_epoch: 2,
+    })
+    expect(journal.listEffects(runId)[0]?.ownership_epoch).toBe(2)
+    const edgeDispatcher = new CommandDispatcher({
+      journal,
+      executor: { issue: async () => "not_sent", reconcile: async () => "unknown" },
+      worker_id: "edge-1",
+      owner_mode: "edge",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:00:02Z"),
+      identities: identities(),
+    })
+    const edgeDispatch = await edgeDispatcher.dispatchNext(runId)
+    const edge = new OwnershipCoordinator({
+      journal,
+      source_id: "edge-1",
+      bindings: { resolve },
+    })
+    const toRunner = await edge.handoff({
+      handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FAY",
+      target_lease: ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB2", "runner-2", 3),
+    })
+
+    expect(toEdge.status).toBe("active")
+    expect(edgeDispatch).toMatchObject({ status: "recorded", result: "not_sent" })
+    expect(toRunner.status).toBe("active")
+    expect(resolve).not.toHaveBeenCalled()
+    expect(
+      journal.listEvents(runId).filter((event) => event.type === "ownership.handoff_requested"),
+    ).toHaveLength(2)
+    expect(journal.getOwnership(runId).active_lease?.lease.owner_id).toBe("runner-2")
+    expect(journal.listEffects(runId)[0]?.ownership_epoch).toBe(3)
+  })
+
   it("rejects workers outside the active lease identity and time window", async () => {
     const journal = open()
     const coordinator = new OwnershipCoordinator({
@@ -390,8 +479,19 @@ describe("ownership handoff", () => {
       lease_duration_ms: 60_000,
       clock: new VirtualClock("2026-01-02T00:00:00Z"),
     })
+    const wrongMode = new CommandDispatcher({
+      journal,
+      executor: { issue: async () => "completed", reconcile: async () => "unknown" },
+      worker_id: "runner-1",
+      owner_mode: "edge",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:00:02Z"),
+    })
 
     await expect(wrongOwner.dispatchNext(runId)).rejects.toMatchObject({
+      code: "COMMAND_OWNERSHIP_STALE",
+    })
+    await expect(wrongMode.dispatchNext(runId)).rejects.toMatchObject({
       code: "COMMAND_OWNERSHIP_STALE",
     })
     await expect(expired.dispatchNext(runId)).rejects.toMatchObject({
@@ -473,6 +573,8 @@ describe("ownership handoff", () => {
       bindings: {
         resolve: () => ({
           capabilities: transferableCapabilities,
+          adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          fence_scope_reference: "vehicle-7",
           activate_fence: async (request) => {
             activeEpoch = request.ownership_epoch
             return {
@@ -513,6 +615,13 @@ describe("ownership handoff", () => {
     expect(applied).toBe(0)
     expect(activeEpoch).toBe(2)
     expect(journal.getMission(runId).state.ownership_epoch).toBe(2)
+    expect(journal.getMission(runId).state.current_state).toBe("reconcileVehicle")
+    expect(journal.listEffects(runId)[0]).toMatchObject({ status: "uncertain", ownership_epoch: 2 })
+    expect(journal.listCommands(runId).at(-1)).toMatchObject({
+      kind: "effect.reconcile",
+      ownership_epoch: 2,
+      status: "pending",
+    })
     expect(journal.getOwnership(runId)).toMatchObject({
       claims_frozen: false,
       active_lease: { lease: { owner_id: "edge-1", ownership_epoch: 2 } },
@@ -521,7 +630,120 @@ describe("ownership handoff", () => {
     expect(journal.verifyRun(runId).event_count).toBe(journal.listEvents(runId).length)
   })
 
-  it("blocks takeover while an uncertain in-flight attempt has no transferable fence", async () => {
+  it("does not accept a fence recorded for a different in-flight effect", async () => {
+    const journal = open(twoStepRuntime)
+    const clock = new VirtualClock("2026-01-01T00:00:02Z")
+    const coordinator = new OwnershipCoordinator({
+      journal,
+      source_id: "runner-1",
+      clock,
+      bindings: { resolve: () => ({ capabilities }) },
+    })
+    coordinator.registerLease(ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB8", "runner-1", 1))
+    let invocation = 0
+    let markStarted = () => {}
+    let releaseRequest = () => {}
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const delayed = new Promise<void>((resolve) => {
+      releaseRequest = resolve
+    })
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: {
+        issue: async () => {
+          invocation += 1
+          if (invocation === 1) {
+            return "completed"
+          }
+          markStarted()
+          await delayed
+          return "rejected"
+        },
+        reconcile: async () => "unknown",
+      },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: identities(),
+    })
+    await dispatcher.dispatchNext(runId)
+    const secondDispatch = dispatcher.dispatchNext(runId)
+    await started
+    const effects = journal.listEffects(runId)
+    const settled = effects.find((effect) => effect.status === "settled")
+    const dispatching = effects.find((effect) => effect.status === "dispatching")
+    if (!settled || !dispatching) {
+      throw new Error("Expected settled and dispatching effects")
+    }
+    const handoffId = "hnd_01ARZ3NDEKTSV4RRFFQ69G5FB1" as const
+    const sourceLeaseId = "lse_01ARZ3NDEKTSV4RRFFQ69G5FB8" as const
+    const targetLease = ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB9", "edge-1", 2, "edge")
+    const ownershipEvent = (
+      eventId: EventId,
+      type: string,
+      payload: ProposedEvent["payload"],
+      epoch = 1,
+      source: ProposedEvent["source"] = { kind: "runner", source_id: "runner-1" },
+    ): ProposedEvent => ({
+      event_id: eventId,
+      run_id: runId,
+      type,
+      schema_version: 1,
+      source,
+      ownership_epoch: epoch,
+      payload,
+    })
+
+    journal.requestOwnershipHandoff(
+      ownershipEvent("evt_01ARZ3NDEKTSV4RRFFQ69G5FC0", "ownership.handoff_requested", {
+        handoff_id: handoffId,
+        source_lease_id: sourceLeaseId,
+        target_lease: targetLease,
+      }),
+    )
+    journal.releaseOwnership(
+      ownershipEvent("evt_01ARZ3NDEKTSV4RRFFQ69G5FC1", "ownership.released", {
+        handoff_id: handoffId,
+        lease_id: sourceLeaseId,
+      }),
+    )
+    journal.recordOwnershipFence(
+      ownershipEvent("evt_01ARZ3NDEKTSV4RRFFQ69G5FC2", "ownership.fence_activated", {
+        handoff_id: handoffId,
+        effect_id: settled.effect_id,
+        proof: {
+          adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          scope: "subject",
+          scope_reference: "settled-effect",
+          ownership_epoch: 2,
+          activation_reference: "unrelated-fence",
+          effective_at: "2026-01-01T00:00:02.000Z",
+          maximum_activation_delay_ms: 100,
+          evidence_digest: `sha256:${"b".repeat(64)}`,
+        },
+      }),
+    )
+
+    expect(() =>
+      journal.activateOwnership(
+        ownershipEvent(
+          "evt_01ARZ3NDEKTSV4RRFFQ69G5FC3",
+          "ownership.activated",
+          { handoff_id: handoffId, lease: targetLease, resume_commands: [] },
+          2,
+          { kind: "edge", source_id: "edge-1" },
+        ),
+      ),
+    ).toThrowError(expect.objectContaining({ code: "OWNERSHIP_HANDOFF_BLOCKED" }))
+    expect(journal.getMission(runId).state.ownership_epoch).toBe(1)
+    expect(dispatching.status).toBe("dispatching")
+    releaseRequest()
+    await secondDispatch
+  })
+
+  it("blocks takeover while a settle-first effect is still dispatching", async () => {
     const journal = open()
     const clock = new VirtualClock("2026-01-01T00:00:02Z")
     let releaseRequest = () => {}
@@ -564,13 +786,257 @@ describe("ownership handoff", () => {
 
     expect(handoff).toMatchObject({
       status: "blocked",
-      reason: "unfenced_attempt_uncertain",
+      reason: "settle_required",
       handoff: { status: "blocked" },
     })
     expect(journal.getOwnership(runId)).toMatchObject({
       claims_frozen: true,
       active_lease: { lease: { owner_id: "runner-1", ownership_epoch: 1 } },
     })
+    releaseRequest()
+    await dispatch
+  })
+
+  it("resumes a released handoff after a future-effective fence is replaced", async () => {
+    const journal = open()
+    const clock = new VirtualClock("2026-01-01T00:00:02Z")
+    let releaseRequest = () => {}
+    let markStarted = () => {}
+    let fenceAttempt = 0
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const delayed = new Promise<void>((resolve) => {
+      releaseRequest = resolve
+    })
+    const coordinator = new OwnershipCoordinator({
+      journal,
+      source_id: "runner-1",
+      clock,
+      bindings: {
+        resolve: () => ({
+          capabilities: transferableCapabilities,
+          adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          fence_scope_reference: "vehicle-7",
+          activate_fence: async (request) => {
+            fenceAttempt += 1
+            return {
+              adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+              scope: "subject",
+              scope_reference: "vehicle-7",
+              ownership_epoch: request.ownership_epoch,
+              activation_reference: `fence-${fenceAttempt}`,
+              effective_at: fenceAttempt === 1 ? "2026-01-01T00:00:03.000Z" : request.requested_at,
+              maximum_activation_delay_ms: 1_000,
+              evidence_digest: `sha256:${"a".repeat(64)}`,
+            }
+          },
+        }),
+      },
+    })
+    coordinator.registerLease(ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB3", "runner-1", 1))
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: {
+        issue: async () => {
+          markStarted()
+          await delayed
+          return "rejected"
+        },
+        reconcile: async () => "unknown",
+      },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: identities(),
+    })
+    const request = {
+      handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FAZ",
+      target_lease: ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB4", "edge-1", 2, "edge"),
+    } as const
+
+    const dispatch = dispatcher.dispatchNext(runId)
+    await started
+    const blocked = await coordinator.handoff(request)
+    const resumed = await coordinator.handoff(request)
+    releaseRequest()
+    await dispatch
+
+    expect(blocked).toMatchObject({ status: "blocked", reason: "fence_activation_failed" })
+    expect(resumed.status).toBe("active")
+    expect(fenceAttempt).toBe(2)
+    expect(
+      journal.listEvents(runId).filter((event) => event.type === "ownership.handoff_requested"),
+    ).toHaveLength(1)
+  })
+
+  it("records a confirmed cancel-first stop before activating ownership", async () => {
+    const journal = open()
+    const clock = new VirtualClock("2026-01-01T00:00:02Z")
+    let markStarted = () => {}
+    let releaseRequest = () => {}
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const delayed = new Promise<void>((resolve) => {
+      releaseRequest = resolve
+    })
+    const cancel = vi.fn(async () => "confirmed_stopped" as const)
+    const coordinator = new OwnershipCoordinator({
+      journal,
+      source_id: "runner-1",
+      clock,
+      bindings: {
+        resolve: () => ({
+          capabilities: { ...capabilities, handoff_mode: "cancel_first", cancellation: true },
+          cancel,
+        }),
+      },
+    })
+    coordinator.registerLease(ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB5", "runner-1", 1))
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: {
+        issue: async () => {
+          markStarted()
+          await delayed
+          return "rejected"
+        },
+        reconcile: async () => "unknown",
+      },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: identities(),
+    })
+    const dispatch = dispatcher.dispatchNext(runId)
+    await started
+
+    const handoff = await coordinator.handoff({
+      handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FB0",
+      target_lease: ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB6", "edge-1", 2, "edge"),
+    })
+
+    expect(handoff.status).toBe("active")
+    expect(cancel).toHaveBeenCalledOnce()
+    expect(journal.listEffects(runId)[0]?.status).toBe("cancelled")
+    expect(
+      journal.listEvents(runId).some((event) => event.type === "ownership.effect_cancelled"),
+    ).toBe(true)
+    expect(journal.listCommands(runId).at(-1)).toMatchObject({
+      kind: "effect.reconcile",
+      ownership_epoch: 2,
+      status: "pending",
+    })
+    const edge = new OwnershipCoordinator({
+      journal,
+      source_id: "edge-1",
+      clock,
+      bindings: { resolve: () => ({ capabilities }) },
+    })
+    const returned = await edge.handoff({
+      handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FB7",
+      target_lease: ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB8", "runner-2", 3),
+    })
+    expect(returned.status).toBe("active")
+    expect(journal.listEffects(runId)[0]?.ownership_epoch).toBe(3)
+    expect(journal.listCommands(runId).at(-1)).toMatchObject({
+      kind: "effect.reconcile",
+      ownership_epoch: 3,
+      status: "pending",
+    })
+    releaseRequest()
+    await dispatch
+    expect(journal.verifyRun(runId).event_count).toBe(journal.listEvents(runId).length)
+  })
+
+  it("resumes a handoff after cancellation was persisted before activation", async () => {
+    const journal = open()
+    const clock = new VirtualClock("2026-01-01T00:00:02Z")
+    let markStarted = () => {}
+    let releaseRequest = () => {}
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve
+    })
+    const delayed = new Promise<void>((resolve) => {
+      releaseRequest = resolve
+    })
+    const cancel = vi.fn(async () => "confirmed_stopped" as const)
+    const coordinator = new OwnershipCoordinator({
+      journal,
+      source_id: "runner-1",
+      clock,
+      bindings: {
+        resolve: () => ({
+          capabilities: { ...capabilities, handoff_mode: "cancel_first", cancellation: true },
+          cancel,
+        }),
+      },
+    })
+    coordinator.registerLease(ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FB9", "runner-1", 1))
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: {
+        issue: async () => {
+          markStarted()
+          await delayed
+          return "rejected"
+        },
+        reconcile: async () => "unknown",
+      },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: identities(),
+    })
+    const dispatch = dispatcher.dispatchNext(runId)
+    await started
+    const request = {
+      handoff_id: "hnd_01ARZ3NDEKTSV4RRFFQ69G5FB8",
+      target_lease: ownershipLease("lse_01ARZ3NDEKTSV4RRFFQ69G5FC0", "edge-1", 2, "edge"),
+    } as const
+    journal.requestOwnershipHandoff({
+      event_id: "evt_01ARZ3NDEKTSV4RRFFQ69G5FC1",
+      run_id: runId,
+      type: "ownership.handoff_requested",
+      schema_version: 1,
+      source: { kind: "runner", source_id: "runner-1" },
+      ownership_epoch: 1,
+      payload: {
+        handoff_id: request.handoff_id,
+        source_lease_id: "lse_01ARZ3NDEKTSV4RRFFQ69G5FB9",
+        target_lease: request.target_lease,
+      },
+    })
+    await expect(
+      coordinator.handoff({
+        ...request,
+        target_lease: { ...request.target_lease, not_after: "2026-01-03T00:00:00.000Z" },
+      }),
+    ).rejects.toThrow("different handoff")
+    expect(cancel).not.toHaveBeenCalled()
+    const effect = journal.listEffects(runId)[0]
+    if (!effect) {
+      throw new Error("Expected an in-flight effect")
+    }
+    journal.recordOwnershipCancellation({
+      event_id: "evt_01ARZ3NDEKTSV4RRFFQ69G5FC2",
+      run_id: runId,
+      type: "ownership.effect_cancelled",
+      schema_version: 1,
+      source: { kind: "runner", source_id: "runner-1" },
+      ownership_epoch: 1,
+      payload: {
+        handoff_id: request.handoff_id,
+        effect_id: effect.effect_id,
+        result: "confirmed_stopped",
+      },
+    })
+
+    const resumed = await coordinator.handoff(request)
+    expect(resumed.status).toBe("active")
+    expect(cancel).not.toHaveBeenCalled()
+    expect(journal.getOwnership(runId).active_lease?.lease.owner_id).toBe("edge-1")
     releaseRequest()
     await dispatch
   })

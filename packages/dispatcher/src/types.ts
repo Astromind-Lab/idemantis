@@ -1,6 +1,7 @@
 import type {
   AttemptId,
   AttemptRecord,
+  AdapterInstanceId,
   CancellationResult,
   CommandRecord,
   EventId,
@@ -48,6 +49,8 @@ export interface HandoffFenceRequest {
 
 export interface OwnershipHandoffBinding {
   capabilities: OperationCapabilities
+  adapter_instance_id?: AdapterInstanceId
+  fence_scope_reference?: string
   activate_fence?: (request: HandoffFenceRequest) => Promise<FenceProof>
   cancel?: (effect: HandoffEffect) => Promise<CancellationResult>
 }
@@ -81,6 +84,7 @@ export interface CommandDispatcherOptions {
   journal: SqliteJournal
   executor: EffectExecutor
   worker_id: SourceId
+  owner_mode?: "runner" | "edge"
   lease_duration_ms: number
   clock?: Clock
   identities?: IdentityFactory
