@@ -1,0 +1,153 @@
+import type {
+  CommandId,
+  CommandRecord,
+  Digest,
+  EffectId,
+  EffectStatus,
+  EventId,
+  JsonObject,
+  JsonValue,
+  MissionStatus,
+  ObservationId,
+  RunId,
+  StateInstanceId,
+  TimerId,
+} from "@idemantis/contracts"
+import type { FinalOutcome, MissionManifest } from "@idemantis/sdk"
+
+export interface MissionRuntimeDefinition {
+  manifest: MissionManifest
+  definition_digest: Digest
+  execution_binding_digest: Digest
+}
+
+export interface EffectProjection {
+  effect_id: EffectId
+  state_instance_id: StateInstanceId
+  state_name: string
+  effect_slot: string
+  operation: string
+  status: EffectStatus
+  required: boolean
+  issue_count: number
+  retry_timer_id: TimerId | null
+  ownership_epoch: number
+}
+
+export interface MissionState {
+  run_id: RunId
+  definition_digest: Digest
+  execution_binding_digest: Digest
+  status: MissionStatus
+  current_state: string
+  current_state_instance_id: StateInstanceId
+  current_sequence: number
+  ownership_epoch: number
+  input: JsonObject
+  active_effect_id: EffectId | null
+  terminal_outcome: FinalOutcome | null
+  effects: Record<string, EffectProjection>
+  observations: Record<string, true>
+}
+
+export interface ReductionResult {
+  state: MissionState
+  commands: CommandRecord[]
+  state_digest: Digest
+}
+
+export interface ReplayFrame {
+  sequence: number
+  event_id: EventId
+  state_digest: Digest
+  command_ids: CommandId[]
+}
+
+export interface ReplayResult {
+  state: MissionState
+  commands: CommandRecord[]
+  frames: ReplayFrame[]
+  state_digest: Digest
+}
+
+export type ReductionErrorCode =
+  | "INVALID_DEFINITION"
+  | "INVALID_EVENT_PAYLOAD"
+  | "INVALID_INPUT"
+  | "INVALID_PREVIOUS_STATE"
+  | "RUN_MISMATCH"
+  | "SEQUENCE_MISMATCH"
+  | "OWNERSHIP_EPOCH_MISMATCH"
+  | "ADMISSION_REQUIRED"
+  | "ALREADY_ADMITTED"
+  | "UNSUPPORTED_EVENT"
+  | "INVALID_TRANSITION"
+  | "INVALID_REDUCTION_OUTPUT"
+  | "EMPTY_REPLAY"
+
+export type ReducerEventType =
+  | "mission.admitted"
+  | "effect.dispatch_started"
+  | "effect.issue_result_recorded"
+  | "effect.reconciliation_result_recorded"
+  | "observation.recorded"
+  | "timer.fired"
+
+export interface MissionAdmittedPayload {
+  definition_digest: Digest
+  execution_binding_digest: Digest
+  input: JsonObject
+}
+
+export interface EffectDispatchStartedPayload {
+  effect_id: EffectId
+}
+
+export type EffectIssueResult =
+  | "not_sent"
+  | "accepted"
+  | "completed"
+  | "rejected"
+  | "failed"
+  | "uncertain"
+
+export interface EffectIssueResultPayload {
+  effect_id: EffectId
+  result: EffectIssueResult
+}
+
+export type EffectReconciliationResult =
+  | "confirmed_completed"
+  | "confirmed_not_applied"
+  | "confirmed_in_progress"
+  | "conflicting_state"
+  | "unknown"
+
+export interface EffectReconciliationResultPayload {
+  effect_id: EffectId
+  result: EffectReconciliationResult
+}
+
+export interface ObservationRecordedPayload {
+  observation_id: ObservationId
+  effect_id?: EffectId
+  observation_type: string
+  subject?: JsonValue
+  payload: JsonObject
+}
+
+export interface TimerFiredPayload {
+  timer_id: TimerId
+  state_instance_id: StateInstanceId
+}
+
+export type ReducerEvent =
+  | { type: "mission.admitted"; payload: MissionAdmittedPayload }
+  | { type: "effect.dispatch_started"; payload: EffectDispatchStartedPayload }
+  | { type: "effect.issue_result_recorded"; payload: EffectIssueResultPayload }
+  | {
+      type: "effect.reconciliation_result_recorded"
+      payload: EffectReconciliationResultPayload
+    }
+  | { type: "observation.recorded"; payload: ObservationRecordedPayload }
+  | { type: "timer.fired"; payload: TimerFiredPayload }
