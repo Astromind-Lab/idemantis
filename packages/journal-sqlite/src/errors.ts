@@ -22,6 +22,11 @@ export type JournalErrorCode =
   | "CORRUPT_RECORD"
   | "MIGRATION_MISMATCH"
   | "REPLAY_DIVERGENCE"
+  | "PENDING_INPUT_INVALID"
+  | "PENDING_INPUT_COLLISION"
+  | "EDGE_MERGE_INVALID"
+  | "EDGE_MERGE_CONFLICT"
+  | "EDGE_MERGE_ID_COLLISION"
 
 export class JournalError extends Error {
   override readonly name = "JournalError"

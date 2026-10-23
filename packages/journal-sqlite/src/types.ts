@@ -4,8 +4,12 @@ import type {
   AttemptRecord,
   CommandId,
   CommandRecord,
+  ClientRequestId,
   Digest,
+  EdgeMergeRequest,
   EventAcceptance,
+  IngressOutcome,
+  MergeId,
   ProposedEvent,
   FenceProof,
   EffectId,
@@ -18,10 +22,43 @@ import type {
 } from "@idemantis/contracts"
 import type { MissionRuntimeDefinition, MissionState } from "@idemantis/engine"
 
+export type { EdgeMergeEventMapping, EdgeMergeResult } from "@idemantis/contracts"
+
 export interface JournalOptions {
   path: string
   clock?: () => Date
   busy_timeout_ms?: number
+}
+
+export type PendingInputKind = "external_fact" | "timer" | "intent"
+
+export interface QueuePendingInputOptions {
+  client_request_id: ClientRequestId
+}
+
+export interface PendingInputRecord {
+  ingress_sequence: number
+  run_id: RunId
+  client_request_id: ClientRequestId
+  input_kind: PendingInputKind
+  proposal: ProposedEvent
+  proposal_digest: Digest
+  expected_sequence?: number
+  outcome: IngressOutcome
+  accepted_sequence?: number
+  received_at: string
+  resolved_at?: string
+}
+
+export interface QuarantinedEdgeMerge {
+  quarantine_id: number
+  merge_id: MergeId
+  run_id: RunId
+  merge_digest: Digest
+  reason_code: string
+  detail: string
+  request: EdgeMergeRequest
+  quarantined_at: string
 }
 
 export interface AppendResult {

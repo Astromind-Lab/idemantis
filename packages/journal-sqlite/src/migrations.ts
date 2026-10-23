@@ -242,6 +242,77 @@ CREATE TABLE ownership_cancellations (
 ) STRICT;
 `
 
+const edgeReconciliationSql = `
+CREATE TABLE pending_inputs (
+  ingress_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  client_request_id TEXT NOT NULL,
+  input_kind TEXT NOT NULL CHECK (input_kind IN ('external_fact', 'timer', 'intent')),
+  proposal_event_id TEXT NOT NULL,
+  proposal_digest TEXT NOT NULL,
+  proposal_json TEXT NOT NULL CHECK (json_valid(proposal_json)),
+  expected_sequence INTEGER CHECK (expected_sequence IS NULL OR expected_sequence >= 0),
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ('queued', 'accepted', 'rejected_stale', 'rejected_invalid', 'superseded')
+  ),
+  accepted_sequence INTEGER CHECK (accepted_sequence IS NULL OR accepted_sequence >= 1),
+  received_at TEXT NOT NULL,
+  resolved_at TEXT,
+  UNIQUE (run_id, client_request_id),
+  UNIQUE (run_id, proposal_event_id),
+  CHECK (
+    (outcome = 'queued' AND accepted_sequence IS NULL AND resolved_at IS NULL)
+    OR (outcome = 'accepted' AND accepted_sequence IS NOT NULL AND resolved_at IS NOT NULL)
+    OR (outcome IN ('rejected_stale', 'rejected_invalid', 'superseded')
+        AND accepted_sequence IS NULL AND resolved_at IS NOT NULL)
+  )
+) STRICT;
+
+CREATE INDEX pending_inputs_run_outcome_sequence_idx
+ON pending_inputs(run_id, outcome, ingress_sequence);
+
+CREATE TABLE edge_merges (
+  merge_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  lease_id TEXT NOT NULL REFERENCES ownership_leases(lease_id),
+  merge_digest TEXT NOT NULL,
+  branch_anchor_sequence INTEGER NOT NULL CHECK (branch_anchor_sequence >= 0),
+  ownership_epoch INTEGER NOT NULL CHECK (ownership_epoch >= 1),
+  edge_event_count INTEGER NOT NULL CHECK (edge_event_count >= 0),
+  pending_watermark INTEGER NOT NULL CHECK (pending_watermark >= 0),
+  final_sequence INTEGER NOT NULL CHECK (final_sequence >= 1),
+  state_digest TEXT NOT NULL,
+  result_json TEXT NOT NULL CHECK (json_valid(result_json)),
+  committed_at TEXT NOT NULL,
+  UNIQUE (lease_id)
+) STRICT;
+
+CREATE TABLE edge_merge_events (
+  merge_id TEXT NOT NULL REFERENCES edge_merges(merge_id),
+  edge_local_sequence INTEGER NOT NULL CHECK (edge_local_sequence >= 1),
+  event_id TEXT NOT NULL UNIQUE REFERENCES mission_events(event_id),
+  canonical_sequence INTEGER NOT NULL CHECK (canonical_sequence >= 1),
+  branch_digest TEXT NOT NULL,
+  PRIMARY KEY (merge_id, edge_local_sequence),
+  UNIQUE (merge_id, canonical_sequence)
+) STRICT;
+
+CREATE TABLE edge_merge_quarantine (
+  quarantine_id INTEGER PRIMARY KEY AUTOINCREMENT,
+  merge_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  merge_digest TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  request_json TEXT NOT NULL CHECK (json_valid(request_json)),
+  quarantined_at TEXT NOT NULL,
+  UNIQUE (merge_id, merge_digest)
+) STRICT;
+
+CREATE INDEX edge_merge_quarantine_run_idx
+ON edge_merge_quarantine(run_id, quarantine_id);
+`
+
 function migration(version: number, name: string, sql: string): Migration {
   return {
     version,
@@ -255,4 +326,5 @@ export const migrations = [
   migration(1, "core_journal", coreJournalSql),
   migration(2, "dispatch_and_timers", dispatchAndTimersSql),
   migration(3, "ownership_epochs", ownershipEpochsSql),
+  migration(4, "edge_reconciliation", edgeReconciliationSql),
 ] as const
