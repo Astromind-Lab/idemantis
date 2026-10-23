@@ -106,6 +106,7 @@ const EffectStateManifestSchema = Type.Object(
         { additionalProperties: false },
       ),
     ),
+    on_acknowledged: Type.Optional(StateNameSchema),
     on_settled: StateNameSchema,
     on_failed: StateNameSchema,
     on_uncertain: StateNameSchema,
@@ -155,6 +156,7 @@ const ObservationWaitStateManifestSchema = Type.Object(
 const ReconcileStateManifestSchema = Type.Object(
   {
     kind: Type.Literal("reconcile"),
+    effect_state: StateNameSchema,
     operation: StateNameSchema,
     subject: ValueExpressionSchema,
     execution: ExecutionOwnerSchema,

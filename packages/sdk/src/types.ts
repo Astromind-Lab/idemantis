@@ -54,6 +54,7 @@ export interface EffectStateDefinition {
   automaticTakeover: boolean
   activeHandoff: boolean
   cancellation?: CancellationPolicy
+  onAccepted?: StateName
   onSettled: StateName
   onFailed: StateName
   onUncertain: StateName
@@ -74,6 +75,7 @@ export interface ObservationWaitStateDefinition {
 
 export interface ReconcileStateDefinition {
   kind: "reconcile"
+  effectState: StateName
   operation: OperationDefinition
   subject: ValueExpression
   execution: ExecutionOwner
@@ -135,6 +137,7 @@ export interface EffectStateManifest {
     on_cancelled: StateName
     on_completion_during_cancel: StateName
   }
+  on_acknowledged?: StateName
   on_settled: StateName
   on_failed: StateName
   on_uncertain: StateName
@@ -151,6 +154,7 @@ export interface ObservationWaitStateManifest {
 
 export interface ReconcileStateManifest {
   kind: "reconcile"
+  effect_state: StateName
   operation: string
   subject: ValueExpression
   execution: ExecutionOwner
@@ -232,6 +236,7 @@ export type MissionDefinitionIssueCode =
   | "DUPLICATE_OPERATION_KEY"
   | "UNSAFE_RETRY"
   | "RECONCILIATION_UNAVAILABLE"
+  | "RECONCILIATION_TARGET_INVALID"
   | "CANCELLATION_UNSUPPORTED"
   | "CANCELLATION_RACE_UNHANDLED"
   | "HANDOFF_UNSUPPORTED"

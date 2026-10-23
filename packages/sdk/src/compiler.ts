@@ -409,11 +409,23 @@ function validateObservationWait(
 function validateReconcileState(
   stateName: string,
   state: ReconcileStateDefinition,
+  states: Record<StateName, StateDefinition>,
   issues: MissionDefinitionIssue[],
 ): void {
   const path = `states.${stateName}`
   validateOperation(state.operation, `${path}.operation`, issues)
   validateExpression(state.subject, `${path}.subject`, issues)
+
+  if (states[state.effectState]?.kind !== "effect") {
+    issues.push(
+      issue(
+        "RECONCILIATION_TARGET_INVALID",
+        `${path}.effectState`,
+        `State ${state.effectState} is not an effect state`,
+        "Reference the effect whose outcome this state reconciles",
+      ),
+    )
+  }
 
   if (state.operation.capabilities.reconciliation === "none") {
     issues.push(
@@ -446,6 +458,10 @@ function transitionTargets(state: StateDefinition): Array<[string, StateName]> {
         ["onFailed", state.onFailed],
         ["onUncertain", state.onUncertain],
       ]
+
+      if (state.onAccepted) {
+        targets.push(["onAccepted", state.onAccepted])
+      }
 
       if (state.cancellation) {
         targets.push(["cancellation.onCancelled", state.cancellation.onCancelled])
@@ -552,7 +568,7 @@ function validateGraph(definition: MissionDefinition): MissionDefinitionIssue[] 
     } else if (state.kind === "observation_wait") {
       validateObservationWait(stateName, state, definition.states, issues)
     } else if (state.kind === "reconcile") {
-      validateReconcileState(stateName, state, issues)
+      validateReconcileState(stateName, state, definition.states, issues)
     } else if (
       state.kind !== "final" ||
       !["completed", "cancelled", "compensated", "failed", "unresolved"].includes(state.outcome)
@@ -672,6 +688,7 @@ function stateManifest(state: StateDefinition): StateManifest {
               },
             }
           : {}),
+        ...(state.onAccepted ? { on_acknowledged: state.onAccepted } : {}),
         on_settled: state.onSettled,
         on_failed: state.onFailed,
         on_uncertain: state.onUncertain,
@@ -691,6 +708,7 @@ function stateManifest(state: StateDefinition): StateManifest {
     case "reconcile":
       return {
         kind: "reconcile",
+        effect_state: state.effectState,
         operation: state.operation.key,
         subject: state.subject,
         execution: state.execution,
@@ -725,6 +743,14 @@ function graphEdges(stateName: StateName, state: StateDefinition): MissionGraphE
         { from: stateName, to: state.onFailed, trigger: "effect.failed" },
         { from: stateName, to: state.onUncertain, trigger: "effect.uncertain" },
       ]
+
+      if (state.onAccepted) {
+        edges.push({
+          from: stateName,
+          to: state.onAccepted,
+          trigger: "effect.acknowledged",
+        })
+      }
 
       if (state.cancellation) {
         edges.push({
