@@ -1,4 +1,7 @@
 export * from "./descriptor.js"
 export * from "./errors.js"
+export * from "./executor.js"
+export * from "./manifest.js"
+export * from "./policy.js"
 export * from "./schemas.js"
 export * from "./types.js"
