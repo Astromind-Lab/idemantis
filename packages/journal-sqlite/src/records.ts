@@ -6,6 +6,9 @@ import {
   DigestSchema,
   EventAcceptanceSchema,
   ProposedEventSchema,
+  FenceProofSchema,
+  OwnershipHandoffRecordSchema,
+  OwnershipLeaseSchema,
   TimerRecordSchema,
   canonicalJson,
   createContractParser,
@@ -18,6 +21,9 @@ import {
   type EventAcceptance,
   type JsonObject,
   type ProposedEvent,
+  type FenceProof,
+  type OwnershipHandoffRecord,
+  type OwnershipLease,
   type TimerRecord,
 } from "@idemantis/contracts"
 import {
@@ -35,6 +41,9 @@ const parseCommandContract = createContractParser(CommandRecordSchema)
 const parseAttemptContract = createContractParser(AttemptRecordSchema)
 const parseTimerContract = createContractParser(TimerRecordSchema)
 const parseEventAcceptanceContract = createContractParser(EventAcceptanceSchema)
+const parseOwnershipLeaseContract = createContractParser(OwnershipLeaseSchema)
+const parseOwnershipHandoffContract = createContractParser(OwnershipHandoffRecordSchema)
+const parseFenceProofContract = createContractParser(FenceProofSchema)
 export const parseProposedEvent = createContractParser(ProposedEventSchema)
 const stateValidator = Schema.Compile(MissionStateSchema)
 const effectValidator = Schema.Compile(EffectProjectionSchema)
@@ -83,6 +92,33 @@ export function parseTimer(value: unknown): TimerRecord {
     return parseTimerContract(value)
   } catch {
     throw new JournalError("CORRUPT_RECORD", "Stored timer does not satisfy its contract")
+  }
+}
+
+export function parseOwnershipLease(value: unknown): OwnershipLease {
+  try {
+    return parseOwnershipLeaseContract(value)
+  } catch {
+    throw new JournalError("CORRUPT_RECORD", "Stored ownership lease does not satisfy its contract")
+  }
+}
+
+export function parseOwnershipHandoff(value: unknown): OwnershipHandoffRecord {
+  try {
+    return parseOwnershipHandoffContract(value)
+  } catch {
+    throw new JournalError(
+      "CORRUPT_RECORD",
+      "Stored ownership handoff does not satisfy its contract",
+    )
+  }
+}
+
+export function parseFenceProof(value: unknown): FenceProof {
+  try {
+    return parseFenceProofContract(value)
+  } catch {
+    throw new JournalError("CORRUPT_RECORD", "Stored fence proof does not satisfy its contract")
   }
 }
 

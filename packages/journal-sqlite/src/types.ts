@@ -7,6 +7,9 @@ import type {
   Digest,
   EventAcceptance,
   ProposedEvent,
+  FenceProof,
+  OwnershipHandoffRecord,
+  OwnershipLease,
   RunId,
   SourceId,
   TimerId,
@@ -72,6 +75,22 @@ export interface CommandClaimOptions {
 export interface ClaimedCommand {
   command: CommandRecord
   attempt: AttemptRecord
+}
+
+export interface StoredOwnershipLease {
+  lease: OwnershipLease
+  status: "active" | "released"
+  activated_event_id: AcceptedEvent["event_id"]
+  released_event_id?: AcceptedEvent["event_id"]
+  created_at: string
+  updated_at: string
+}
+
+export interface OwnershipState {
+  claims_frozen: boolean
+  active_lease?: StoredOwnershipLease
+  handoff?: OwnershipHandoffRecord
+  fence_proofs: FenceProof[]
 }
 
 export interface TimerFireOptions {
