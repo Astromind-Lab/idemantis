@@ -1,3 +1,4 @@
+export * from "./conformance.js"
 export * from "./descriptor.js"
 export * from "./errors.js"
 export * from "./executor.js"
