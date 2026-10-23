@@ -1,3 +1,4 @@
+import { AdapterExecutor, defineAdapterOperation } from "@idemantis/adapter-kit"
 import {
   AttemptIdSchema,
   EventIdSchema,
@@ -262,6 +263,79 @@ describe("command dispatcher", () => {
     expect(reconcile).toHaveBeenCalledOnce()
     expect(journal.getMission(runId).state.status).toBe("unresolved")
     expect(await dispatcher.dispatchNext(runId)).toEqual({ status: "idle" })
+  })
+
+  it("executes a validated adapter operation through the durable dispatcher", async () => {
+    const journal = open()
+    const clock = new VirtualClock("2026-01-01T00:00:02Z")
+    let receivedAttempt: string | undefined
+    let receivedEffect: string | undefined
+    const operation = defineAdapterOperation({
+      key: "vehicle.dispatch",
+      adapter: "vehicle",
+      operation: "vehicle.dispatch",
+      schemaVersion: 1,
+      inputSchema: Type.Object({ route: Type.String() }, { additionalProperties: false }),
+      outputSchema: Type.Object({ dispatch: Type.String() }, { additionalProperties: false }),
+      subjectSchema: Type.String(),
+      effectClass: "physical_actuation",
+      consequence: "compensatable",
+      capabilities,
+      timeout: { minimumMs: 10, defaultMs: 1_000, maximumMs: 5_000 },
+      reconciliationLookupFields: ["vehicle"],
+      observationTypes: ["vehicle.arrived"],
+      observationCorrelationFields: ["effect_id"],
+      maximumFenceActivationDelayMs: 100,
+      async issue(context) {
+        receivedAttempt = context.attempt_id
+        receivedEffect = context.effect_id
+        return { result: "completed", output: { dispatch: "dispatch-7" } }
+      },
+      async reconcile() {
+        return {
+          result: "confirmed_completed",
+          output: { dispatch: "dispatch-7" },
+        }
+      },
+      async activateFence(context) {
+        return {
+          adapter_instance_id: context.adapter_instance_id,
+          scope: "subject",
+          scope_reference: context.scope_reference,
+          ownership_epoch: context.ownership_epoch,
+          activation_reference: "fence-1",
+          effective_at: context.requested_at,
+          maximum_activation_delay_ms: 100,
+          evidence_digest: `sha256:${"e".repeat(64)}`,
+        }
+      },
+    })
+    const executor = new AdapterExecutor({
+      registrations: [
+        {
+          adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          operation,
+        },
+      ],
+      source_id: "runner-1",
+      location: "runner",
+      clock,
+    })
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor,
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: identities(),
+    })
+
+    const outcome = await dispatcher.dispatchNext(runId)
+
+    expect(outcome).toMatchObject({ status: "recorded", result: "completed" })
+    expect(journal.getMission(runId).state.status).toBe("completed")
+    expect(receivedAttempt).toBe(journal.listAttempts(runId)[0]?.attempt_id)
+    expect(receivedEffect).toBe(journal.listEffects(runId)[0]?.effect_id)
   })
 })
 

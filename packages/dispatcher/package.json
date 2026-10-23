@@ -26,6 +26,7 @@
     "@idemantis/journal-sqlite": "workspace:*"
   },
   "devDependencies": {
+    "@idemantis/adapter-kit": "workspace:*",
     "@idemantis/engine": "workspace:*",
     "@idemantis/sdk": "workspace:*",
     "typebox": "1.4.3"
