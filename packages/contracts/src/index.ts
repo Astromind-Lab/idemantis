@@ -1,6 +1,7 @@
 export * from "./canonical.js"
 export * from "./capabilities.js"
 export * from "./effects.js"
+export * from "./edge.js"
 export * from "./events.js"
 export * from "./execution.js"
 export * from "./ids.js"
