@@ -172,6 +172,23 @@ export type StateManifest =
   | ReconcileStateManifest
   | FinalStateManifest
 
+export type MissionGraphNode =
+  | { id: StateName; kind: "effect" | "reconcile"; operation: string }
+  | { id: StateName; kind: "observation_wait" }
+  | { id: StateName; kind: "final"; outcome: FinalOutcome }
+
+export interface MissionGraphEdge {
+  from: StateName
+  to: StateName
+  trigger: string
+}
+
+/** The deterministic node and transition representation used by inspection tools. */
+export interface MissionGraph {
+  nodes: MissionGraphNode[]
+  edges: MissionGraphEdge[]
+}
+
 /** The canonical JSON contract registered for execution and replay. */
 export interface MissionManifest {
   manifest_schema_version: 1
@@ -182,6 +199,7 @@ export interface MissionManifest {
   initial: StateName
   operations: Record<string, OperationManifest>
   states: Record<StateName, StateManifest>
+  graph: MissionGraph
 }
 
 /** A validated manifest and its content identity. */

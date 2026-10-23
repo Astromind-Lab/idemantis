@@ -188,6 +188,55 @@ const StateManifestSchema = Type.Union([
   FinalStateManifestSchema,
 ])
 
+const MissionGraphNodeSchema = Type.Union([
+  Type.Object(
+    {
+      id: StateNameSchema,
+      kind: Type.Union([Type.Literal("effect"), Type.Literal("reconcile")]),
+      operation: StateNameSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      id: StateNameSchema,
+      kind: Type.Literal("observation_wait"),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      id: StateNameSchema,
+      kind: Type.Literal("final"),
+      outcome: Type.Union([
+        Type.Literal("completed"),
+        Type.Literal("cancelled"),
+        Type.Literal("compensated"),
+        Type.Literal("failed"),
+        Type.Literal("unresolved"),
+      ]),
+    },
+    { additionalProperties: false },
+  ),
+])
+
+const MissionGraphSchema = Type.Object(
+  {
+    nodes: Type.Array(MissionGraphNodeSchema),
+    edges: Type.Array(
+      Type.Object(
+        {
+          from: StateNameSchema,
+          to: StateNameSchema,
+          trigger: Type.String({ minLength: 1, maxLength: 128 }),
+        },
+        { additionalProperties: false },
+      ),
+    ),
+  },
+  { additionalProperties: false },
+)
+
 /** Runtime schema for manifests accepted by the deterministic interpreter. */
 export const MissionManifestSchema = Type.Unsafe<MissionManifest>(
   Type.Object(
@@ -200,6 +249,7 @@ export const MissionManifestSchema = Type.Unsafe<MissionManifest>(
       initial: StateNameSchema,
       operations: Type.Record(StateNameSchema, OperationManifestSchema),
       states: Type.Record(StateNameSchema, StateManifestSchema),
+      graph: MissionGraphSchema,
     },
     { $id: "MissionManifest", additionalProperties: false },
   ),

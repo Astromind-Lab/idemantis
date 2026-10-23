@@ -253,6 +253,33 @@ describe("mission compilation", () => {
     expect(Schema.Check(MissionManifestSchema, { ...first.manifest, unexpected: true })).toBe(false)
   })
 
+  it("emits an inspectable delivery graph", () => {
+    const graph = defineMission(deliveryDefinition()).manifest.graph
+
+    expect(graph.nodes).toHaveLength(10)
+    expect(graph.edges).toHaveLength(25)
+    expect(graph.nodes.map((node) => node.id)).toEqual(
+      [...graph.nodes.map((node) => node.id)].sort(),
+    )
+    expect(graph.nodes).toContainEqual({
+      id: "dispatchVehicle",
+      kind: "effect",
+      operation: "vehicle.dispatch",
+    })
+    expect(graph.nodes).toContainEqual({ id: "complete", kind: "final", outcome: "completed" })
+    expect(graph.edges).toContainEqual({
+      from: "dispatchVehicle",
+      to: "waitForArrival",
+      trigger: "effect.settled",
+    })
+    expect(graph.edges).toContainEqual({
+      from: "waitForArrival",
+      to: "reconcileVehicle",
+      trigger: "observation.timeout",
+    })
+    expect(graph.edges.filter((edge) => edge.from === "complete")).toEqual([])
+  })
+
   it("does not freeze the caller's input schema", () => {
     const definition = deliveryDefinition()
     const input = definition.input

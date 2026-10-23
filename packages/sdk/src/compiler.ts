@@ -19,6 +19,9 @@ import type {
   EffectStateDefinition,
   MissionDefinition,
   MissionDefinitionIssue,
+  MissionGraph,
+  MissionGraphEdge,
+  MissionGraphNode,
   MissionManifest,
   ObservationWaitStateDefinition,
   OperationDefinition,
@@ -702,6 +705,99 @@ function stateManifest(state: StateDefinition): StateManifest {
   }
 }
 
+function graphNode(stateName: StateName, state: StateDefinition): MissionGraphNode {
+  switch (state.kind) {
+    case "effect":
+    case "reconcile":
+      return { id: stateName, kind: state.kind, operation: state.operation.key }
+    case "observation_wait":
+      return { id: stateName, kind: state.kind }
+    case "final":
+      return { id: stateName, kind: state.kind, outcome: state.outcome }
+  }
+}
+
+function graphEdges(stateName: StateName, state: StateDefinition): MissionGraphEdge[] {
+  switch (state.kind) {
+    case "effect": {
+      const edges: MissionGraphEdge[] = [
+        { from: stateName, to: state.onSettled, trigger: "effect.settled" },
+        { from: stateName, to: state.onFailed, trigger: "effect.failed" },
+        { from: stateName, to: state.onUncertain, trigger: "effect.uncertain" },
+      ]
+
+      if (state.cancellation) {
+        edges.push({
+          from: stateName,
+          to: state.cancellation.onCancelled,
+          trigger: "effect.cancelled",
+        })
+        edges.push({
+          from: stateName,
+          to: state.cancellation.onCompletionDuringCancel as string,
+          trigger: "effect.completed_during_cancel",
+        })
+      }
+
+      return edges
+    }
+    case "observation_wait":
+      return [
+        { from: stateName, to: state.onObserved, trigger: "observation.received" },
+        {
+          from: stateName,
+          to: state.timeout?.onTimeout as string,
+          trigger: "observation.timeout",
+        },
+      ]
+    case "reconcile":
+      return [
+        {
+          from: stateName,
+          to: state.onConfirmedCompleted,
+          trigger: "reconcile.confirmed_completed",
+        },
+        {
+          from: stateName,
+          to: state.onConfirmedNotApplied,
+          trigger: "reconcile.confirmed_not_applied",
+        },
+        {
+          from: stateName,
+          to: state.onConfirmedInProgress,
+          trigger: "reconcile.confirmed_in_progress",
+        },
+        {
+          from: stateName,
+          to: state.onConflictingState,
+          trigger: "reconcile.conflicting_state",
+        },
+        { from: stateName, to: state.onUnknown, trigger: "reconcile.unknown" },
+      ]
+    case "final":
+      return []
+  }
+}
+
+function buildGraph(states: Record<StateName, StateDefinition>): MissionGraph {
+  const nodes: MissionGraphNode[] = []
+  const edges: MissionGraphEdge[] = []
+
+  for (const stateName of Object.keys(states).sort()) {
+    const state = states[stateName] as StateDefinition
+    nodes.push(graphNode(stateName, state))
+    edges.push(...graphEdges(stateName, state))
+  }
+
+  edges.sort((left, right) => {
+    const leftKey = `${left.from}\u0000${left.trigger}\u0000${left.to}`
+    const rightKey = `${right.from}\u0000${right.trigger}\u0000${right.to}`
+    return leftKey.localeCompare(rightKey)
+  })
+
+  return { nodes, edges }
+}
+
 function buildManifest(definition: MissionDefinition): MissionManifest {
   const operations = new Map<string, OperationManifest>()
   const states: Record<string, StateManifest> = {}
@@ -744,6 +840,7 @@ function buildManifest(definition: MissionDefinition): MissionManifest {
       [...operations.entries()].sort(([left], [right]) => left.localeCompare(right)),
     ),
     states,
+    graph: buildGraph(definition.states),
   }
 }
 
