@@ -1,0 +1,30 @@
+{
+  "name": "@idemantis/simulator",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@idemantis/adapter-kit": "workspace:*",
+    "@idemantis/contracts": "workspace:*",
+    "@idemantis/sdk": "workspace:*",
+    "typebox": "1.4.3"
+  }
+}
