@@ -245,6 +245,21 @@ importers:
         specifier: 1.4.3
         version: 1.4.3
 
+  packages/journal-sqlite:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/engine":
+        specifier: workspace:*
+        version: link:../engine
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
   packages/sdk:
     dependencies:
       "@idemantis/contracts":
