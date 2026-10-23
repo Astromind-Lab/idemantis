@@ -137,6 +137,7 @@ function deliveryStates() {
       onUncertain: "reconcileReservation",
     }),
     reconcileReservation: reconcileState({
+      effectState: "reserveDestination",
       operation: reserve,
       subject: fromInput("destination"),
       onConfirmedCompleted: "dispatchVehicle",
@@ -157,6 +158,7 @@ function deliveryStates() {
         onCancelled: "cancelled",
         onCompletionDuringCancel: "unresolved",
       },
+      onAccepted: "waitForArrival",
       onSettled: "waitForArrival",
       onFailed: "failed",
       onUncertain: "reconcileVehicle",
@@ -169,6 +171,7 @@ function deliveryStates() {
       onObserved: "openAccess",
     }),
     reconcileVehicle: reconcileState({
+      effectState: "dispatchVehicle",
       operation: snapshot,
       subject: fromInput("vehicle"),
       onConfirmedCompleted: "openAccess",
@@ -257,7 +260,7 @@ describe("mission compilation", () => {
     const graph = defineMission(deliveryDefinition()).manifest.graph
 
     expect(graph.nodes).toHaveLength(10)
-    expect(graph.edges).toHaveLength(25)
+    expect(graph.edges).toHaveLength(26)
     expect(graph.nodes.map((node) => node.id)).toEqual(
       [...graph.nodes.map((node) => node.id)].sort(),
     )
@@ -270,7 +273,7 @@ describe("mission compilation", () => {
     expect(graph.edges).toContainEqual({
       from: "dispatchVehicle",
       to: "waitForArrival",
-      trigger: "effect.settled",
+      trigger: "effect.acknowledged",
     })
     expect(graph.edges).toContainEqual({
       from: "waitForArrival",
