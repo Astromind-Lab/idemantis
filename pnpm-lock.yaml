@@ -296,6 +296,21 @@ importers:
         specifier: 1.4.3
         version: 1.4.3
 
+  packages/fault-suite:
+    dependencies:
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/edge-agent":
+        specifier: workspace:*
+        version: link:../edge-agent
+      "@idemantis/simulator":
+        specifier: workspace:*
+        version: link:../simulator
+
   packages/journal-sqlite:
     dependencies:
       "@idemantis/contracts":
