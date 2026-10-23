@@ -7,6 +7,7 @@ import {
   DigestSchema,
   EffectIdSchema,
   EventIdSchema,
+  HandoffIdSchema,
   InterventionIdSchema,
   LeaseIdSchema,
   ObservationIdSchema,
@@ -136,7 +137,7 @@ export const OwnershipLeaseSchema = Type.Object(
   {
     lease_id: LeaseIdSchema,
     run_id: RunIdSchema,
-    owner_mode: OwnershipModeSchema,
+    owner_mode: Type.Union([Type.Literal("runner"), Type.Literal("edge")]),
     owner_id: SourceIdSchema,
     ownership_epoch: Type.Integer({ minimum: 1 }),
     branch_anchor_sequence: Type.Integer({ minimum: 0 }),
@@ -148,6 +149,48 @@ export const OwnershipLeaseSchema = Type.Object(
     fence_proof: Type.Optional(FenceProofSchema),
   },
   { $id: "OwnershipLease", additionalProperties: false },
+)
+
+export const OwnershipHandoffStatusSchema = Type.Union(
+  [
+    Type.Literal("requested"),
+    Type.Literal("blocked"),
+    Type.Literal("released"),
+    Type.Literal("fenced"),
+    Type.Literal("active"),
+  ],
+  { $id: "OwnershipHandoffStatus" },
+)
+
+export const OwnershipHandoffBlockReasonSchema = Type.Union(
+  [
+    Type.Literal("unfenced_attempt_uncertain"),
+    Type.Literal("settle_required"),
+    Type.Literal("cancel_required"),
+    Type.Literal("unsupported_effect"),
+    Type.Literal("fence_activation_failed"),
+    Type.Literal("cancellation_failed"),
+  ],
+  { $id: "OwnershipHandoffBlockReason" },
+)
+
+export const OwnershipHandoffRecordSchema = Type.Object(
+  {
+    handoff_id: HandoffIdSchema,
+    run_id: RunIdSchema,
+    source_lease_id: LeaseIdSchema,
+    target_lease_id: LeaseIdSchema,
+    target_lease: OwnershipLeaseSchema,
+    source_epoch: Type.Integer({ minimum: 1 }),
+    target_epoch: Type.Integer({ minimum: 2 }),
+    target_owner_mode: Type.Union([Type.Literal("runner"), Type.Literal("edge")]),
+    target_owner_id: SourceIdSchema,
+    status: OwnershipHandoffStatusSchema,
+    requested_at: TimestampSchema,
+    updated_at: TimestampSchema,
+    blocked_reason: Type.Optional(OwnershipHandoffBlockReasonSchema),
+  },
+  { $id: "OwnershipHandoffRecord", additionalProperties: false },
 )
 
 export const InterventionStatusSchema = Type.Union(
@@ -218,6 +261,9 @@ export type TimerStatus = Type.Static<typeof TimerStatusSchema>
 export type TimerRecord = Type.Static<typeof TimerRecordSchema>
 export type OwnershipMode = Type.Static<typeof OwnershipModeSchema>
 export type OwnershipLease = Type.Static<typeof OwnershipLeaseSchema>
+export type OwnershipHandoffStatus = Type.Static<typeof OwnershipHandoffStatusSchema>
+export type OwnershipHandoffBlockReason = Type.Static<typeof OwnershipHandoffBlockReasonSchema>
+export type OwnershipHandoffRecord = Type.Static<typeof OwnershipHandoffRecordSchema>
 export type InterventionStatus = Type.Static<typeof InterventionStatusSchema>
 export type InterventionRecord = Type.Static<typeof InterventionRecordSchema>
 export type IngressOutcome = Type.Static<typeof IngressOutcomeSchema>

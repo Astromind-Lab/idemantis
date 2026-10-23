@@ -10,6 +10,10 @@ import type {
   JsonValue,
   MissionStatus,
   ObservationId,
+  OwnershipHandoffBlockReason,
+  OwnershipLease,
+  FenceProof,
+  HandoffId,
   RunId,
   StateInstanceId,
   TimerId,
@@ -93,6 +97,13 @@ export type ReducerEventType =
   | "effect.reconciliation_result_recorded"
   | "observation.recorded"
   | "timer.fired"
+  | "ownership.lease_registered"
+  | "ownership.handoff_requested"
+  | "ownership.handoff_blocked"
+  | "ownership.released"
+  | "ownership.fence_activated"
+  | "ownership.effect_cancelled"
+  | "ownership.activated"
 
 export interface MissionAdmittedPayload {
   definition_digest: Digest
@@ -148,6 +159,50 @@ export interface TimerFiredPayload {
   state_instance_id: StateInstanceId
 }
 
+export interface OwnershipLeaseRegisteredPayload {
+  lease: OwnershipLease
+}
+
+export interface OwnershipHandoffRequestedPayload {
+  handoff_id: HandoffId
+  source_lease_id: OwnershipLease["lease_id"]
+  target_lease: OwnershipLease
+}
+
+export interface OwnershipHandoffBlockedPayload {
+  handoff_id: HandoffId
+  reason: OwnershipHandoffBlockReason
+}
+
+export interface OwnershipReleasedPayload {
+  handoff_id: HandoffId
+  lease_id: OwnershipLease["lease_id"]
+}
+
+export interface OwnershipFenceActivatedPayload {
+  handoff_id: HandoffId
+  effect_id: EffectId
+  proof: FenceProof
+}
+
+export interface OwnershipEffectCancelledPayload {
+  handoff_id: HandoffId
+  effect_id: EffectId
+  result: "confirmed_stopped"
+}
+
+export interface OwnershipResumeCommand {
+  previous_command_id: CommandId
+  kind: "effect.issue" | "effect.reconcile"
+  payload: JsonObject
+}
+
+export interface OwnershipActivatedPayload {
+  handoff_id: HandoffId
+  lease: OwnershipLease
+  resume_commands: OwnershipResumeCommand[]
+}
+
 export type ReducerEvent =
   | { type: "mission.admitted"; payload: MissionAdmittedPayload }
   | { type: "effect.dispatch_started"; payload: EffectDispatchStartedPayload }
@@ -158,3 +213,10 @@ export type ReducerEvent =
     }
   | { type: "observation.recorded"; payload: ObservationRecordedPayload }
   | { type: "timer.fired"; payload: TimerFiredPayload }
+  | { type: "ownership.lease_registered"; payload: OwnershipLeaseRegisteredPayload }
+  | { type: "ownership.handoff_requested"; payload: OwnershipHandoffRequestedPayload }
+  | { type: "ownership.handoff_blocked"; payload: OwnershipHandoffBlockedPayload }
+  | { type: "ownership.released"; payload: OwnershipReleasedPayload }
+  | { type: "ownership.fence_activated"; payload: OwnershipFenceActivatedPayload }
+  | { type: "ownership.effect_cancelled"; payload: OwnershipEffectCancelledPayload }
+  | { type: "ownership.activated"; payload: OwnershipActivatedPayload }

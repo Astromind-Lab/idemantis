@@ -19,6 +19,7 @@ export const EffectStatusSchema = Type.Union(
     Type.Literal("observed"),
     Type.Literal("settled"),
     Type.Literal("uncertain"),
+    Type.Literal("fenced"),
     Type.Literal("rejected"),
     Type.Literal("failed"),
     Type.Literal("cancel_pending"),

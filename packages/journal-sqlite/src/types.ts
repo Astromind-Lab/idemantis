@@ -7,6 +7,10 @@ import type {
   Digest,
   EventAcceptance,
   ProposedEvent,
+  FenceProof,
+  EffectId,
+  OwnershipHandoffRecord,
+  OwnershipLease,
   RunId,
   SourceId,
   TimerId,
@@ -65,6 +69,7 @@ export interface ProjectionRebuildOptions {
 export interface CommandClaimOptions {
   attempt_id: AttemptId
   claimed_by: SourceId
+  owner_mode: "runner" | "edge"
   claimed_at: string
   lease_duration_ms: number
 }
@@ -72,6 +77,28 @@ export interface CommandClaimOptions {
 export interface ClaimedCommand {
   command: CommandRecord
   attempt: AttemptRecord
+}
+
+export interface StoredOwnershipLease {
+  lease: OwnershipLease
+  status: "active" | "released"
+  activated_event_id: AcceptedEvent["event_id"]
+  released_event_id?: AcceptedEvent["event_id"]
+  created_at: string
+  updated_at: string
+}
+
+export interface OwnershipState {
+  claims_frozen: boolean
+  active_lease?: StoredOwnershipLease
+  handoff?: OwnershipHandoffRecord
+  leases: StoredOwnershipLease[]
+  fences: OwnershipFenceRecord[]
+}
+
+export interface OwnershipFenceRecord {
+  effect_id: EffectId
+  proof: FenceProof
 }
 
 export interface TimerFireOptions {

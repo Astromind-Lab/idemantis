@@ -46,6 +46,25 @@ const missionStateValidator = Schema.Compile(MissionStateSchema)
 const commandValidator = Schema.Compile(CommandRecordSchema)
 const manifestValidator = Schema.Compile(MissionManifestSchema)
 
+const ownershipTerminalEffectStatuses = new Set([
+  "settled",
+  "rejected",
+  "failed",
+  "cancelled",
+  "compensated",
+  "compensation_failed",
+])
+
+const cancellableEffectStatuses = new Set([
+  "dispatching",
+  "acknowledged",
+  "in_progress",
+  "observed",
+  "uncertain",
+  "cancel_pending",
+  "cancelling",
+])
+
 function fail(
   code: ConstructorParameters<typeof ReductionError>[0],
   message: string,
@@ -352,6 +371,9 @@ function reduceIssueResult(
   }
 
   const effect = effectProjection(state, payload.effect_id)
+  if (effect.status === "fenced") {
+    return []
+  }
   const effectState = stateManifest(definition.manifest, effect.state_name)
   if (effectState.kind !== "effect") {
     fail("INVALID_DEFINITION", `Effect ${effect.effect_id} points to a non-effect state`, event)
@@ -539,6 +561,9 @@ function reduceReconciliationResult(
   }
 
   const effect = effectProjection(state, payload.effect_id)
+  if (effect.status === "fenced") {
+    return []
+  }
   const effectState = stateManifest(definition.manifest, effect.state_name)
   if (effectState.kind !== "effect") {
     fail("INVALID_DEFINITION", `Effect ${effect.effect_id} points to a non-effect state`, event)
@@ -678,6 +703,50 @@ export function reduceMission(
   const state = cloneState(previousState)
   state.current_sequence = event.sequence
 
+  if (reducerEvent.type === "ownership.activated") {
+    if (
+      event.ownership_epoch !== state.ownership_epoch + 1 ||
+      reducerEvent.payload.lease.run_id !== state.run_id ||
+      reducerEvent.payload.lease.ownership_epoch !== event.ownership_epoch
+    ) {
+      fail(
+        "OWNERSHIP_EPOCH_MISMATCH",
+        `Ownership activation must advance epoch ${state.ownership_epoch} by one`,
+        event,
+      )
+    }
+    state.ownership_epoch = event.ownership_epoch
+    for (const effect of Object.values(state.effects)) {
+      if (
+        !ownershipTerminalEffectStatuses.has(effect.status) ||
+        state.active_effect_id === effect.effect_id
+      ) {
+        effect.ownership_epoch = event.ownership_epoch
+      }
+      if (effect.status === "fenced") {
+        effect.status = "uncertain"
+      }
+    }
+    const commands = reducerEvent.payload.resume_commands.map((resume, index) => {
+      const effectId = Reflect.get(resume.payload, "effect_id")
+      if (typeof effectId !== "string" || !Object.hasOwn(state.effects, effectId)) {
+        fail(
+          "INVALID_TRANSITION",
+          `Ownership resume command ${resume.previous_command_id} has no active effect`,
+          event,
+        )
+      }
+      return createCommand(
+        event,
+        state,
+        `ownership.${event.ownership_epoch}.resume.${index}`,
+        resume.kind,
+        resume.payload,
+      )
+    })
+    return finish(state, commands, event)
+  }
+
   if (state.terminal_outcome) {
     return finish(state, [], event)
   }
@@ -718,6 +787,57 @@ export function reduceMission(
     case "timer.fired":
       commands = reduceTimer(definition, state, event, reducerEvent.payload)
       break
+    case "ownership.lease_registered":
+    case "ownership.handoff_requested":
+    case "ownership.handoff_blocked":
+    case "ownership.released":
+      commands = []
+      break
+    case "ownership.fence_activated": {
+      const effect = effectProjection(state, reducerEvent.payload.effect_id)
+      if (!cancellableEffectStatuses.has(effect.status)) {
+        commands = []
+        break
+      }
+      const effectState = stateManifest(definition.manifest, effect.state_name)
+      if (effectState.kind !== "effect") {
+        fail("INVALID_DEFINITION", `Effect ${effect.effect_id} points to a non-effect state`, event)
+      }
+      effect.retry_timer_id = null
+      effect.status = "fenced"
+      commands =
+        state.active_effect_id === effect.effect_id
+          ? enterState(definition, state, effectState.on_uncertain, event, effect.effect_id)
+          : []
+      break
+    }
+    case "ownership.effect_cancelled": {
+      const effect = effectProjection(state, reducerEvent.payload.effect_id)
+      if (!cancellableEffectStatuses.has(effect.status)) {
+        fail(
+          "INVALID_TRANSITION",
+          `Effect ${effect.effect_id} cannot be cancelled from ${effect.status}`,
+          event,
+        )
+      }
+      const effectState = stateManifest(definition.manifest, effect.state_name)
+      if (effectState.kind !== "effect") {
+        fail("INVALID_DEFINITION", `Effect ${effect.effect_id} points to a non-effect state`, event)
+      }
+      effect.retry_timer_id = null
+      effect.status = "cancelled"
+      commands =
+        state.active_effect_id === effect.effect_id
+          ? enterState(
+              definition,
+              state,
+              effectState.cancellation?.on_cancelled ?? effectState.on_uncertain,
+              event,
+              effect.effect_id,
+            )
+          : []
+      break
+    }
   }
 
   return finish(state, commands, event)

@@ -34,6 +34,7 @@ export const ObservationIdSchema = Type.String({
 })
 export const TimerIdSchema = Type.String({ $id: "TimerId", pattern: `^tmr_${ulid}$` })
 export const LeaseIdSchema = Type.String({ $id: "LeaseId", pattern: `^lse_${ulid}$` })
+export const HandoffIdSchema = Type.String({ $id: "HandoffId", pattern: `^hnd_${ulid}$` })
 export const InterventionIdSchema = Type.String({
   $id: "InterventionId",
   pattern: `^int_${ulid}$`,
@@ -101,6 +102,7 @@ export type AttemptId = Type.Static<typeof AttemptIdSchema>
 export type ObservationId = Type.Static<typeof ObservationIdSchema>
 export type TimerId = Type.Static<typeof TimerIdSchema>
 export type LeaseId = Type.Static<typeof LeaseIdSchema>
+export type HandoffId = Type.Static<typeof HandoffIdSchema>
 export type InterventionId = Type.Static<typeof InterventionIdSchema>
 export type AdapterInstanceId = Type.Static<typeof AdapterInstanceIdSchema>
 export type StateInstanceId = Type.Static<typeof StateInstanceIdSchema>

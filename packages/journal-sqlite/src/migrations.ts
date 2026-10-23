@@ -166,6 +166,82 @@ SET status = 'completed'
 WHERE kind = 'timer.schedule';
 `
 
+const ownershipEpochsSql = `
+ALTER TABLE mission_runs
+ADD COLUMN claims_frozen INTEGER NOT NULL DEFAULT 0 CHECK (claims_frozen IN (0, 1));
+
+CREATE TABLE ownership_leases (
+  lease_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  owner_mode TEXT NOT NULL CHECK (owner_mode IN ('runner', 'edge')),
+  owner_id TEXT NOT NULL,
+  ownership_epoch INTEGER NOT NULL CHECK (ownership_epoch >= 1),
+  status TEXT NOT NULL CHECK (status IN ('active', 'released')),
+  lease_json TEXT NOT NULL CHECK (json_valid(lease_json)),
+  activated_event_id TEXT NOT NULL REFERENCES mission_events(event_id),
+  released_event_id TEXT REFERENCES mission_events(event_id),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE (run_id, ownership_epoch),
+  CHECK (
+    (status = 'active' AND released_event_id IS NULL)
+    OR (status = 'released' AND released_event_id IS NOT NULL)
+  )
+) STRICT;
+
+CREATE UNIQUE INDEX ownership_leases_one_active_idx
+ON ownership_leases(run_id)
+WHERE status = 'active';
+
+CREATE TABLE ownership_handoffs (
+  handoff_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  source_lease_id TEXT NOT NULL REFERENCES ownership_leases(lease_id),
+  target_lease_id TEXT NOT NULL,
+  target_lease_json TEXT NOT NULL CHECK (json_valid(target_lease_json)),
+  source_epoch INTEGER NOT NULL CHECK (source_epoch >= 1),
+  target_epoch INTEGER NOT NULL CHECK (target_epoch = source_epoch + 1),
+  target_owner_mode TEXT NOT NULL CHECK (target_owner_mode IN ('runner', 'edge')),
+  target_owner_id TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('requested', 'blocked', 'released', 'fenced', 'active')),
+  blocked_reason TEXT,
+  requested_event_id TEXT NOT NULL REFERENCES mission_events(event_id),
+  released_event_id TEXT REFERENCES mission_events(event_id),
+  activated_event_id TEXT REFERENCES mission_events(event_id),
+  requested_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  CHECK (status <> 'blocked' OR blocked_reason IS NOT NULL),
+  CHECK (status NOT IN ('released', 'fenced', 'active') OR released_event_id IS NOT NULL),
+  CHECK (status <> 'active' OR activated_event_id IS NOT NULL)
+) STRICT;
+
+CREATE UNIQUE INDEX ownership_handoffs_one_open_idx
+ON ownership_handoffs(run_id)
+WHERE status <> 'active';
+
+CREATE TABLE ownership_fences (
+  handoff_id TEXT NOT NULL REFERENCES ownership_handoffs(handoff_id),
+  effect_id TEXT NOT NULL REFERENCES effects(effect_id),
+  adapter_instance_id TEXT NOT NULL,
+  scope TEXT NOT NULL,
+  scope_reference TEXT NOT NULL,
+  ownership_epoch INTEGER NOT NULL CHECK (ownership_epoch >= 1),
+  proof_json TEXT NOT NULL CHECK (json_valid(proof_json)),
+  event_id TEXT NOT NULL UNIQUE REFERENCES mission_events(event_id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (handoff_id, effect_id)
+) STRICT;
+
+CREATE TABLE ownership_cancellations (
+  handoff_id TEXT NOT NULL REFERENCES ownership_handoffs(handoff_id),
+  effect_id TEXT NOT NULL REFERENCES effects(effect_id),
+  result TEXT NOT NULL CHECK (result = 'confirmed_stopped'),
+  event_id TEXT NOT NULL UNIQUE REFERENCES mission_events(event_id),
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (handoff_id, effect_id)
+) STRICT;
+`
+
 function migration(version: number, name: string, sql: string): Migration {
   return {
     version,
@@ -178,4 +254,5 @@ function migration(version: number, name: string, sql: string): Migration {
 export const migrations = [
   migration(1, "core_journal", coreJournalSql),
   migration(2, "dispatch_and_timers", dispatchAndTimersSql),
+  migration(3, "ownership_epochs", ownershipEpochsSql),
 ] as const
