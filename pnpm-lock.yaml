@@ -220,6 +220,19 @@ importers:
         specifier: 5.0.5
         version: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5))
 
+  packages/adapter-kit:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+    devDependencies:
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+
   packages/contracts:
     dependencies:
       canonicalize:
