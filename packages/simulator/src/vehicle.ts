@@ -34,6 +34,7 @@ interface Assignment {
   route: string
   pickup: string
   destination: string
+  status: Exclude<VehicleStatus, "idle">
 }
 
 export interface VehicleSimulatorOptions {
@@ -46,6 +47,7 @@ export class VehicleSimulator {
   readonly #kernel: SimulationKernel
   readonly #probe: SimulatedTargetProbe
   readonly #vehicleId: string
+  readonly #assignments = new Map<EffectId, Assignment>()
   #status: VehicleStatus = "idle"
   #assignment: Assignment | undefined
   #activeEpoch = 1
@@ -89,23 +91,24 @@ export class VehicleSimulator {
         if (input.vehicle_id !== this.#vehicleId) {
           return { result: "rejected", evidence: { reason: "vehicle_not_found" } }
         }
-        if (this.#assignment?.effect_id === context.effect_id) {
+        const prior = this.#assignments.get(context.effect_id)
+        if (prior) {
           if (
-            this.#assignment.route !== input.route ||
-            this.#assignment.pickup !== input.pickup ||
-            this.#assignment.destination !== input.destination
+            prior.route !== input.route ||
+            prior.pickup !== input.pickup ||
+            prior.destination !== input.destination
           ) {
             return { result: "rejected", evidence: { reason: "idempotency_conflict" } }
           }
-          if (this.#status === "stopped" || this.#status === "faulted") {
+          if (prior.status === "stopped" || prior.status === "faulted") {
             return { result: "rejected", evidence: { reason: "assignment_inactive" } }
           }
-          return this.#status === "arrived"
+          return prior.status === "arrived"
             ? {
                 result: "completed",
-                output: { assignment_id: this.#assignment.assignment_id },
+                output: { assignment_id: prior.assignment_id },
               }
-            : { result: "accepted", external_reference: this.#assignment.assignment_id }
+            : { result: "accepted", external_reference: prior.assignment_id }
         }
         if (this.#assignment && !["idle", "stopped"].includes(this.#status)) {
           return { result: "rejected", evidence: { reason: "vehicle_busy" } }
@@ -117,8 +120,10 @@ export class VehicleSimulator {
           route: input.route,
           pickup: input.pickup,
           destination: input.destination,
+          status: "assigned",
         }
         this.#assignment = assignment
+        this.#assignments.set(context.effect_id, assignment)
         this.#status = "assigned"
         this.#probe.apply("vehicle.dispatch", context.effect_id, {
           assignment_id: assignment.assignment_id,
@@ -140,29 +145,42 @@ export class VehicleSimulator {
           return { result: "uncertain", evidence: { reason: "response_lost" } }
         }
         this.#status = "moving"
+        assignment.status = "moving"
         return { result: "accepted", external_reference: assignment.assignment_id }
       },
       reconcile: async (context, subject) => {
         this.#probe.reconcile("vehicle.dispatch", context.effect_id)
-        if (subject.vehicle_id !== this.#vehicleId || !this.#assignment) {
+        if (subject.vehicle_id !== this.#vehicleId) {
           return { result: "confirmed_not_applied" }
         }
-        if (this.#assignment.effect_id !== context.effect_id) {
+        const assignment = this.#assignments.get(context.effect_id)
+        if (!assignment) {
+          return { result: "confirmed_not_applied" }
+        }
+        if (assignment.status === "stopped" || assignment.status === "faulted") {
           return { result: "conflicting_state" }
         }
-        if (this.#status === "arrived") {
+        if (assignment.status === "arrived") {
           return {
             result: "confirmed_completed",
-            output: { assignment_id: this.#assignment.assignment_id },
+            output: { assignment_id: assignment.assignment_id },
           }
         }
         return {
           result: "confirmed_in_progress",
-          external_reference: this.#assignment.assignment_id,
+          external_reference: assignment.assignment_id,
         }
       },
       cancel: async (context, subject) => {
         this.#probe.issue("vehicle.dispatch.cancel", context.effect_id)
+        if (context.ownership_epoch < this.#activeEpoch) {
+          this.#probe.rejectStale(
+            "vehicle.dispatch.cancel",
+            context.effect_id,
+            context.ownership_epoch,
+          )
+          return { result: "rejected_still_active", evidence: { reason: "stale_epoch" } }
+        }
         if (subject.vehicle_id !== this.#vehicleId || !this.#assignment) {
           return { result: "failed_not_changed", evidence: { reason: "assignment_not_found" } }
         }
@@ -173,6 +191,7 @@ export class VehicleSimulator {
           return { result: "confirmed_stopped" }
         }
         this.#status = "stopped"
+        this.#assignment.status = "stopped"
         this.#probe.apply("vehicle.dispatch.cancel", context.effect_id, {
           assignment_id: this.#assignment.assignment_id,
         })
@@ -211,9 +230,18 @@ export class VehicleSimulator {
               route: this.#assignment.route,
               pickup: this.#assignment.pickup,
               destination: this.#assignment.destination,
+              status: this.#assignment.status,
             },
           }
         : {}),
+      assignment_history: [...this.#assignments.values()].map((assignment) => ({
+        effect_id: assignment.effect_id,
+        assignment_id: assignment.assignment_id,
+        route: assignment.route,
+        pickup: assignment.pickup,
+        destination: assignment.destination,
+        status: assignment.status,
+      })),
     })
   }
 
@@ -232,9 +260,6 @@ export class VehicleSimulator {
       operation: "vehicle.dispatch",
       stage,
     })
-    if (fault?.action === "drop_observation") {
-      return
-    }
     const delay = baseDelay + (fault?.action === "delay" ? (fault.delay_ms ?? 0) : 0)
     const observationId = `${type}-${assignment.effect_id}`
     this.#kernel.schedule(
@@ -248,7 +273,11 @@ export class VehicleSimulator {
         payload: { observation_type: type },
       },
       () => {
-        if (this.#status === "stopped" || this.#status === "faulted") {
+        if (
+          this.#assignment !== assignment ||
+          assignment.status === "stopped" ||
+          assignment.status === "faulted"
+        ) {
           this.#kernel.record({
             target: this.#probe.target,
             operation: "vehicle.dispatch",
@@ -260,8 +289,20 @@ export class VehicleSimulator {
         }
         if (type === "vehicle.arrived") {
           this.#status = "arrived"
-        } else if (this.#status === "assigned") {
+          assignment.status = "arrived"
+        } else if (assignment.status === "assigned") {
           this.#status = "moving"
+          assignment.status = "moving"
+        }
+        if (fault?.action === "drop_observation") {
+          this.#kernel.record({
+            target: this.#probe.target,
+            operation: "vehicle.dispatch",
+            stage: "observation.dropped",
+            correlation_id: assignment.effect_id,
+            payload: { observation_type: type },
+          })
+          return
         }
         const observation = {
           observation_id: observationId,

@@ -205,6 +205,14 @@ export class ResourceSimulator {
       },
       cancel: async (context, subject) => {
         this.#probe.issue("resource.reserve.cancel", context.effect_id)
+        if (context.ownership_epoch < this.#activeEpoch) {
+          this.#probe.rejectStale(
+            "resource.reserve.cancel",
+            context.effect_id,
+            context.ownership_epoch,
+          )
+          return { result: "rejected_still_active", evidence: { reason: "stale_epoch" } }
+        }
         const result = this.#stopReservation(subject)
         if (result.result === "confirmed_stopped") {
           this.#probe.apply("resource.reserve.cancel", context.effect_id, {
@@ -215,6 +223,14 @@ export class ResourceSimulator {
       },
       compensate: async (context, subject) => {
         this.#probe.issue("resource.reserve.compensate", context.effect_id)
+        if (context.ownership_epoch < this.#activeEpoch) {
+          this.#probe.rejectStale(
+            "resource.reserve.compensate",
+            context.effect_id,
+            context.ownership_epoch,
+          )
+          return { result: "rejected", evidence: { reason: "stale_epoch" } }
+        }
         const result = this.#stopReservation(subject)
         if (result.result !== "confirmed_stopped") {
           return { result: "failed", evidence: result.evidence }
