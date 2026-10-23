@@ -126,17 +126,26 @@ export class SimulationKernel {
   schedule(work: ScheduledWork, run: () => void | Promise<void>): number {
     positiveInteger(work.after_ms, "schedule delay")
     positiveInteger(work.jitter_ms ?? 0, "schedule jitter")
+    const preflight: SimulationTraceEntry = {
+      sequence: this.#trace.length + 1,
+      at: this.now().toISOString(),
+      target: work.target,
+      operation: work.operation,
+      stage: "work.scheduled",
+      correlation_id: work.correlation_id,
+      payload: structuredClone(work.payload ?? {}),
+    }
+    if (!Schema.Check(SimulationTraceEntrySchema, preflight)) {
+      throw new SimulationError("INVALID_SCHEDULE", "Scheduled work does not satisfy its schema")
+    }
+    date(this.#now + work.after_ms + (work.jitter_ms ?? 0))
     const dueAt = this.#now + work.after_ms + this.jitter(work.jitter_ms ?? 0)
-    date(dueAt)
     const item: QueueItem = {
       ...structuredClone(work),
       id: this.#nextTaskId,
       due_at: dueAt,
       run,
     }
-    this.#nextTaskId += 1
-    this.#queue.push(item)
-    this.#queue.sort((left, right) => left.due_at - right.due_at || left.id - right.id)
     this.record({
       ...work,
       stage: "work.scheduled",
@@ -146,6 +155,9 @@ export class SimulationKernel {
         due_at: date(dueAt).toISOString(),
       },
     })
+    this.#nextTaskId += 1
+    this.#queue.push(item)
+    this.#queue.sort((left, right) => left.due_at - right.due_at || left.id - right.id)
     return item.id
   }
 

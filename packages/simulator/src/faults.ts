@@ -17,6 +17,12 @@ export class FaultSchedule {
     if (new Set(rules.map((rule) => rule.id)).size !== rules.length) {
       throw new SimulationError("DUPLICATE_FAULT", "Fault schedule repeats a rule identity")
     }
+    const selectors = rules.map(
+      (rule) => `${rule.target}\u0000${rule.operation}\u0000${rule.stage}\u0000${rule.occurrence}`,
+    )
+    if (new Set(selectors).size !== selectors.length) {
+      throw new SimulationError("DUPLICATE_FAULT", "Fault schedule repeats an occurrence selector")
+    }
     for (const rule of rules) {
       if ((rule.action === "delay") !== (rule.delay_ms !== undefined)) {
         throw new SimulationError(
@@ -29,6 +35,7 @@ export class FaultSchedule {
   }
 
   take(match: FaultMatch): FaultRule | undefined {
+    let selected: FaultRule | undefined
     for (const rule of this.#rules) {
       if (
         rule.consumed ||
@@ -39,13 +46,13 @@ export class FaultSchedule {
         continue
       }
       rule.matches += 1
-      if (rule.matches === rule.occurrence) {
+      if (selected === undefined && rule.matches === rule.occurrence) {
         rule.consumed = true
         const { consumed: _consumed, matches: _matches, ...value } = rule
-        return clone(value)
+        selected = clone(value)
       }
     }
-    return undefined
+    return selected
   }
 
   snapshot(): FaultRuleState[] {
