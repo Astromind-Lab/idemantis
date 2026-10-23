@@ -186,8 +186,17 @@ export class SimulationKernel {
     while (await this.runNext()) {}
   }
 
-  async runUntil(predicate: () => boolean): Promise<boolean> {
+  async runUntil(predicate: () => boolean, deadline?: Date): Promise<boolean> {
+    const deadlineAt = deadline?.getTime()
+    if (deadlineAt !== undefined && (!Number.isFinite(deadlineAt) || deadlineAt < this.#now)) {
+      throw new SimulationError("INVALID_TIME", "Simulation deadline cannot precede current time")
+    }
     while (!predicate()) {
+      const next = this.#queue[0]
+      if (deadlineAt !== undefined && (!next || next.due_at > deadlineAt)) {
+        this.#now = deadlineAt
+        return false
+      }
       if (!(await this.runNext())) {
         return false
       }

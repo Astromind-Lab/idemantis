@@ -164,17 +164,25 @@ class MissionProgress {
   }
 }
 
-function completedOutput<Output>(
-  envelope: IssueResultEnvelope<Output>,
-  operation: string,
-): Output | undefined {
-  if (envelope.result === "completed") {
-    return envelope.output
+function completedOutput<Output>(envelope: IssueResultEnvelope<Output>): Output | undefined {
+  return envelope.result === "completed" ? envelope.output : undefined
+}
+
+async function waitForObservation(
+  kernel: SimulationKernel,
+  mission: CompiledMission,
+  state: string,
+  type: string,
+): Promise<boolean> {
+  const definition = mission.manifest.states[state]
+  if (definition?.kind !== "observation_wait") {
+    throw new SimulationError(
+      "SCENARIO_INVARIANT_FAILED",
+      `State ${state} is not an observation wait`,
+    )
   }
-  if (["failed", "rejected", "not_sent"].includes(envelope.result)) {
-    throw new SimulationError("SCENARIO_INVARIANT_FAILED", `${operation} did not complete`)
-  }
-  return undefined
+  const deadline = new Date(kernel.now().getTime() + definition.timeout.after_ms)
+  return kernel.runUntil(() => kernel.observations(type).length > 0, deadline)
 }
 
 function invariants(
@@ -278,14 +286,30 @@ export async function runReferenceScenario(
     owner: input.mission_id,
     expires_at: input.reservation_expires_at,
   })
-  let reservationId = completedOutput(reserveEnvelope, "resource.reserve")?.reservation_id
+  let reservationId = completedOutput(reserveEnvelope)?.reservation_id
   if (reserveEnvelope.result === "uncertain") {
     progress.enter("reconcile_reservation", "effect.uncertain")
     const reconciliation = await resource.reserve.reconcile?.(context(kernel, 1, 2, 2, 1), {
       resource_id: input.destination_id,
       reservation_key: input.reservation_key,
     })
-    if (reconciliation?.result !== "confirmed_completed") {
+    if (reconciliation?.result === "confirmed_completed") {
+      reservationId = reconciliation.output.reservation_id
+      progress.enter("dispatch_vehicle", "reconcile.confirmed_completed")
+    } else if (reconciliation?.result === "conflicting_state") {
+      progress.enter("unresolved", "reconcile.conflicting_state")
+      return report(
+        options,
+        input,
+        faultSchedule,
+        mission,
+        "failed",
+        "unresolved",
+        kernel,
+        snapshots(),
+      )
+    } else {
+      progress.enter("unresolved", "reconcile.unknown")
       return report(
         options,
         input,
@@ -297,8 +321,6 @@ export async function runReferenceScenario(
         snapshots(),
       )
     }
-    reservationId = reconciliation.output.reservation_id
-    progress.enter("dispatch_vehicle", "reconcile.confirmed_completed")
   }
   if (!reservationId) {
     progress.enter("failed", "effect.failed")
@@ -308,63 +330,117 @@ export async function runReferenceScenario(
   if (reserveEnvelope.result !== "uncertain") {
     progress.enter("dispatch_vehicle", "effect.settled")
   }
-  const dispatchEnvelope = await vehicle.dispatch.issue(context(kernel, 2, 3, 3, 2), {
-    vehicle_id: input.vehicle_id,
-    route: input.route,
-    pickup: input.pickup,
-    destination: input.destination_id,
-  })
-  if (!["accepted", "completed"].includes(dispatchEnvelope.result)) {
-    progress.enter(
-      dispatchEnvelope.result === "uncertain" ? "reconcile_vehicle" : "failed",
-      dispatchEnvelope.result === "uncertain" ? "effect.uncertain" : "effect.failed",
-    )
-    return report(
-      options,
-      input,
-      faultSchedule,
-      mission,
-      "failed",
-      "reconcile_vehicle",
-      kernel,
-      snapshots(),
-    )
-  }
-  progress.enter(
-    "await_pickup",
-    dispatchEnvelope.result === "accepted" ? "effect.acknowledged" : "effect.settled",
-  )
-  await kernel.runNext()
-  if (kernel.observations("vehicle.pickup_confirmed").length !== 1) {
-    progress.enter("reconcile_vehicle", "observation.timeout")
-    return report(
-      options,
-      input,
-      faultSchedule,
-      mission,
-      "failed",
-      "reconcile_vehicle",
-      kernel,
-      snapshots(),
-    )
-  }
-  progress.enter("await_arrival", "observation.received")
-  await kernel.runUntil(() => kernel.observations("vehicle.arrived").length > 0)
-  if (kernel.observations("vehicle.arrived").length !== 1) {
-    progress.enter("reconcile_vehicle", "observation.timeout")
-    return report(
-      options,
-      input,
-      faultSchedule,
-      mission,
-      "failed",
-      "reconcile_vehicle",
-      kernel,
-      snapshots(),
-    )
+  type VehicleMissionState =
+    | "dispatch_vehicle"
+    | "reconcile_vehicle"
+    | "await_pickup"
+    | "await_arrival"
+    | "open_destination"
+  let vehicleState: VehicleMissionState = "dispatch_vehicle"
+  let dispatchAttempt = 3
+  let vehicleTransitions = 0
+  while (vehicleState !== "open_destination") {
+    vehicleTransitions += 1
+    if (vehicleTransitions > 12) {
+      throw new SimulationError(
+        "SCENARIO_INVARIANT_FAILED",
+        "Vehicle recovery exceeded its bounded transition count",
+      )
+    }
+    if (vehicleState === "dispatch_vehicle") {
+      const dispatchEnvelope = await vehicle.dispatch.issue(
+        context(kernel, 2, 3, dispatchAttempt, 2),
+        {
+          vehicle_id: input.vehicle_id,
+          route: input.route,
+          pickup: input.pickup,
+          destination: input.destination_id,
+        },
+      )
+      dispatchAttempt += 1
+      if (dispatchEnvelope.result === "accepted" || dispatchEnvelope.result === "completed") {
+        progress.enter(
+          "await_pickup",
+          dispatchEnvelope.result === "accepted" ? "effect.acknowledged" : "effect.settled",
+        )
+        vehicleState = "await_pickup"
+      } else if (dispatchEnvelope.result === "uncertain") {
+        progress.enter("reconcile_vehicle", "effect.uncertain")
+        vehicleState = "reconcile_vehicle"
+      } else {
+        progress.enter("failed", "effect.failed")
+        return report(
+          options,
+          input,
+          faultSchedule,
+          mission,
+          "failed",
+          "failed",
+          kernel,
+          snapshots(),
+        )
+      }
+      continue
+    }
+    if (vehicleState === "reconcile_vehicle") {
+      const reconciliation = await vehicle.dispatch.reconcile?.(
+        context(kernel, 2, 4, 20 + vehicleTransitions, 2),
+        { vehicle_id: input.vehicle_id },
+      )
+      if (reconciliation?.result === "confirmed_completed") {
+        progress.enter("open_destination", "reconcile.confirmed_completed")
+        vehicleState = "open_destination"
+      } else if (reconciliation?.result === "confirmed_not_applied") {
+        progress.enter("dispatch_vehicle", "reconcile.confirmed_not_applied")
+        vehicleState = "dispatch_vehicle"
+      } else if (reconciliation?.result === "confirmed_in_progress") {
+        progress.enter("await_arrival", "reconcile.confirmed_in_progress")
+        vehicleState = "await_arrival"
+      } else {
+        const trigger =
+          reconciliation?.result === "conflicting_state"
+            ? "reconcile.conflicting_state"
+            : "reconcile.unknown"
+        progress.enter("unresolved", trigger)
+        return report(
+          options,
+          input,
+          faultSchedule,
+          mission,
+          "failed",
+          "unresolved",
+          kernel,
+          snapshots(),
+        )
+      }
+      continue
+    }
+    if (vehicleState === "await_pickup") {
+      const observed = await waitForObservation(
+        kernel,
+        mission,
+        "await_pickup",
+        "vehicle.pickup_confirmed",
+      )
+      if (observed) {
+        progress.enter("await_arrival", "observation.received")
+        vehicleState = "await_arrival"
+      } else {
+        progress.enter("reconcile_vehicle", "observation.timeout")
+        vehicleState = "reconcile_vehicle"
+      }
+      continue
+    }
+    const observed = await waitForObservation(kernel, mission, "await_arrival", "vehicle.arrived")
+    if (observed) {
+      progress.enter("open_destination", "observation.received")
+      vehicleState = "open_destination"
+    } else {
+      progress.enter("reconcile_vehicle", "observation.timeout")
+      vehicleState = "reconcile_vehicle"
+    }
   }
 
-  progress.enter("open_destination", "observation.received")
   const accessEnvelope = await access.open.issue(context(kernel, 3, 4, 4, 3), {
     access_point_id: input.destination_id,
     subject: input.access_subject,
@@ -382,7 +458,10 @@ export async function runReferenceScenario(
       snapshots(),
     )
   }
-  completedOutput(accessEnvelope, "access.open")
+  if (accessEnvelope.result !== "completed") {
+    progress.enter("failed", "effect.failed")
+    return report(options, input, faultSchedule, mission, "failed", "failed", kernel, snapshots())
+  }
   progress.enter("await_open", "effect.settled")
   kernel.schedule(
     {
@@ -404,30 +483,35 @@ export async function runReferenceScenario(
       })
     },
   )
-  await kernel.runNext()
-  if (kernel.observations("access.opened").length !== 1) {
+  const accessObserved = await waitForObservation(kernel, mission, "await_open", "access.opened")
+  if (!accessObserved) {
     progress.enter("await_operator", "observation.timeout")
     return report(
       options,
       input,
       faultSchedule,
       mission,
-      "failed",
+      "awaiting_operator",
       "await_operator",
       kernel,
       snapshots(),
     )
   }
   progress.enter("await_handoff", "observation.received")
-  await kernel.runUntil(() => kernel.observations("delivery.handoff_confirmed").length > 0)
-  if (kernel.observations("delivery.handoff_confirmed").length !== 1) {
+  const handoffObserved = await waitForObservation(
+    kernel,
+    mission,
+    "await_handoff",
+    "delivery.handoff_confirmed",
+  )
+  if (!handoffObserved) {
     progress.enter("await_operator", "observation.timeout")
     return report(
       options,
       input,
       faultSchedule,
       mission,
-      "failed",
+      "awaiting_operator",
       "await_operator",
       kernel,
       snapshots(),
@@ -439,7 +523,22 @@ export async function runReferenceScenario(
     resource_id: input.destination_id,
     reservation_id: reservationId,
   })
-  completedOutput(releaseEnvelope, "resource.release")
+  if (releaseEnvelope.result !== "completed") {
+    progress.enter(
+      releaseEnvelope.result === "uncertain" ? "reconcile_release" : "failed",
+      releaseEnvelope.result === "uncertain" ? "effect.uncertain" : "effect.failed",
+    )
+    return report(
+      options,
+      input,
+      faultSchedule,
+      mission,
+      "failed",
+      releaseEnvelope.result === "uncertain" ? "reconcile_release" : "failed",
+      kernel,
+      snapshots(),
+    )
+  }
   progress.enter("complete", "effect.settled")
   return report(
     options,
