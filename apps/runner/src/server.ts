@@ -530,6 +530,24 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     return receipt
   })
 
+  app.get("/api/missions/:runId/context", async (request) => {
+    authenticated(request, access)
+    const params = object(request.params)
+    const selectedRunId = runId(field(params, "runId"))
+    const context = options.store.missionContext(selectedRunId)
+    if (!options.mission_executor?.executionStatus) {
+      return context
+    }
+    try {
+      return { ...context, execution: options.mission_executor.executionStatus(selectedRunId) }
+    } catch (error) {
+      if (error instanceof TransportError) {
+        return context
+      }
+      throw error
+    }
+  })
+
   app.get("/api/missions/:runId/execution", async (request) => {
     authenticated(request, access)
     const params = object(request.params)

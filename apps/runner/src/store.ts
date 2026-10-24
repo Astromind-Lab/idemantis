@@ -10,7 +10,12 @@ import {
   type SourceId,
   sha256Digest,
 } from "@idemantis/contracts"
-import { type MissionRuntimeDefinition, reduceMission, replayMission } from "@idemantis/engine"
+import {
+  evaluateExpression,
+  type MissionRuntimeDefinition,
+  reduceMission,
+  replayMission,
+} from "@idemantis/engine"
 import {
   JournalError,
   type SqliteJournal,
@@ -32,7 +37,10 @@ import {
   type InterventionDescriptor,
   type InterventionReceipt,
   type InterventionReceiptPage,
+  type MissionContext,
+  type MissionContextEffect,
   type MissionDetail,
+  type MissionNextStep,
   type MissionListPage,
   type MissionListQuery,
   MissionListQuerySchema,
@@ -60,6 +68,27 @@ import {
 } from "@idemantis/transport"
 import Schema from "typebox/schema"
 import { ulid } from "ulid"
+
+const donePhases = new Set(["settled", "observed", "cancelled", "compensated"])
+const uncertainPhases = new Set(["uncertain", "fenced"])
+const failedPhases = new Set(["rejected", "failed", "compensation_failed"])
+const resultEventTypes = new Set([
+  "effect.issue_result_recorded",
+  "effect.reconciliation_result_recorded",
+])
+
+function effectPhase(status: string): MissionContextEffect["phase"] {
+  if (donePhases.has(status)) {
+    return "done"
+  }
+  if (uncertainPhases.has(status)) {
+    return "uncertain"
+  }
+  if (failedPhases.has(status)) {
+    return "failed"
+  }
+  return "in_flight"
+}
 
 const terminalStatuses = new Set(["completed", "cancelled", "compensated", "failed", "unresolved"])
 const effectIdField = "effect_id"
@@ -598,6 +627,78 @@ export class RunnerStore {
     }
   }
 
+  missionContext(runId: RunId): MissionContext {
+    const mission = this.mission(runId)
+    const records = this.#journal.listStoredEvents(runId)
+    const results = new Map<string, JsonObject>()
+    const firstSeen = new Map<string, number>()
+    for (const { event } of records) {
+      const { effect_id: effectId } = event.payload
+      if (typeof effectId === "string" && !firstSeen.has(effectId)) {
+        firstSeen.set(effectId, event.sequence)
+      }
+      if (resultEventTypes.has(event.type) && typeof effectId === "string") {
+        results.set(effectId, event.payload)
+      }
+    }
+    const ordered = this.#journal
+      .listEffects(runId)
+      .sort(
+        (left, right) =>
+          (firstSeen.get(left.effect_id) ?? Number.MAX_SAFE_INTEGER) -
+            (firstSeen.get(right.effect_id) ?? Number.MAX_SAFE_INTEGER) ||
+          left.effect_id.localeCompare(right.effect_id),
+      )
+    const effects = ordered.map((effect): MissionContextEffect => {
+      const recorded = results.get(effect.effect_id) ?? {}
+      const { output, external_reference: reference, evidence } = recorded
+      return {
+        effect_id: effect.effect_id,
+        state_name: effect.state_name,
+        operation: effect.operation,
+        status: effect.status,
+        phase: effectPhase(effect.status),
+        issue_count: effect.issue_count,
+        ...(output === undefined ? {} : { output: structuredClone(output) }),
+        ...(typeof reference === "string" ? { external_reference: reference } : {}),
+        ...(evidence && typeof evidence === "object" && !Array.isArray(evidence)
+          ? { evidence: structuredClone(evidence) }
+          : {}),
+      }
+    })
+    const current = mission.runtime.manifest.states[mission.state.current_state]
+    if (!current) {
+      throw new TransportError("INCOMPATIBLE_SCHEMA", "Mission state is unavailable", 500)
+    }
+    const summary = this.summary(mission)
+    const deadline = this.#journal
+      .listTimers(runId)
+      .filter((timer) => timer.status === "scheduled")
+      .map((timer) => timer.due_at)
+      .sort()[0]
+    return {
+      schema_version: ApiSchemaVersion,
+      run_id: runId,
+      definition_id: mission.runtime.manifest.definition_id,
+      definition_version: mission.runtime.manifest.definition_version,
+      status: mission.state.status,
+      current_state: mission.state.current_state,
+      state_kind: current.kind,
+      terminal_outcome: mission.state.terminal_outcome,
+      sequence: mission.state.current_sequence,
+      state_digest: mission.state_digest,
+      input: structuredClone(mission.state.input),
+      ...(summary.attention_reason ? { attention_reason: summary.attention_reason } : {}),
+      effects,
+      next: this.nextStep(mission, deadline),
+      recent_events: records.slice(-20).map(({ event }) => ({
+        sequence: event.sequence,
+        event_type: event.type,
+        recorded_at: event.recorded_at,
+      })),
+    }
+  }
+
   timeline(runId: RunId, cursor?: string, limit = 100): TimelinePage {
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
       throw new TransportError("INVALID_REQUEST", "Timeline limit must be from 1 through 100", 422)
@@ -768,7 +869,10 @@ export class RunnerStore {
       if (error instanceof TransportError) {
         throw error
       }
-      if (!(error instanceof JournalError) || error.code !== "INTERVENTION_INVALID") {
+      if (
+        !(error instanceof JournalError) ||
+        (error.code !== "INTERVENTION_INVALID" && error.code !== "INTERVENTION_NOT_FOUND")
+      ) {
         throw this.interventionError(error, runId)
       }
     }
@@ -1050,6 +1154,9 @@ export class RunnerStore {
       if (error.code === "RUN_NOT_FOUND") {
         return new TransportError("RUN_NOT_FOUND", `Mission ${runId} does not exist`, 404)
       }
+      if (error.code === "INTERVENTION_NOT_FOUND") {
+        return new TransportError("INVALID_REQUEST", "Intervention does not exist", 404)
+      }
       if (error.code === "INTERVENTION_COLLISION" || error.code === "PENDING_INPUT_COLLISION") {
         return new TransportError(
           "CLIENT_REQUEST_ID_COLLISION",
@@ -1150,6 +1257,49 @@ export class RunnerStore {
       }
     }
     throw new TransportError("RUNNER_UNAVAILABLE", "Mission list changed during read", 503)
+  }
+
+  private nextStep(mission: StoredMission, deadline: string | undefined): MissionNextStep {
+    const current = mission.runtime.manifest.states[mission.state.current_state]
+    const activeEffect = mission.state.active_effect_id ?? undefined
+    if (mission.state.terminal_outcome || !current || current.kind === "final") {
+      return {
+        actor: "none",
+        summary: `Mission finished as ${mission.state.terminal_outcome ?? mission.state.status}`,
+      }
+    }
+    if (current.kind === "observation_wait") {
+      const subject =
+        current.correlation.kind === "subject"
+          ? evaluateExpression(current.correlation.subject, mission.state.input)
+          : undefined
+      return {
+        actor: "observation",
+        summary: `Waiting for a ${current.observation_type} observation`,
+        observation_type: current.observation_type,
+        ...(activeEffect ? { effect_id: activeEffect } : {}),
+        ...(subject === undefined ? {} : { subject }),
+        ...(deadline ? { deadline } : {}),
+      }
+    }
+    if (current.kind === "operator_wait") {
+      return {
+        actor: "operator",
+        summary: current.reason,
+        actions: current.actions.map((action) => action.action_code),
+        ...(deadline ? { deadline } : {}),
+      }
+    }
+    return {
+      actor: "runner",
+      summary:
+        current.kind === "reconcile"
+          ? `Runner is reconciling ${current.operation} before deciding the next step`
+          : `Runner is executing ${current.operation}`,
+      operation: current.operation,
+      ...(activeEffect ? { effect_id: activeEffect } : {}),
+      ...(deadline ? { deadline } : {}),
+    }
   }
 
   private summary(mission: StoredMission): MissionSummary {

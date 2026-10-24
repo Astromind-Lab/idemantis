@@ -461,6 +461,49 @@ describe("command dispatcher", () => {
     expect(journal.getMission(runId).state.status).toBe("completed")
     expect(receivedAttempt).toBe(journal.listAttempts(runId)[0]?.attempt_id)
     expect(receivedEffect).toBe(journal.listEffects(runId)[0]?.effect_id)
+    expect(
+      journal.listEvents(runId).find((event) => event.type === "effect.issue_result_recorded")
+        ?.payload,
+    ).toMatchObject({ result: "completed", output: { dispatch: "dispatch-7" } })
+  })
+
+  it("journals adapter output and evidence within the size limits", async () => {
+    const journal = open(twoStepRuntime)
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: {
+        issue: vi.fn(),
+        reconcile: vi.fn(),
+        invokeIssue: vi
+          .fn()
+          .mockResolvedValueOnce({
+            result: "completed",
+            output: { dispatch: "x".repeat(70_000) },
+            external_reference: "provider-42",
+            evidence: { provider: "fleet" },
+          })
+          .mockResolvedValueOnce({ result: "completed", output: { dispatch: "d-2" } }),
+      },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:00:02Z"),
+      identities: identities(),
+    })
+
+    await dispatcher.dispatchNext(runId)
+    await dispatcher.dispatchNext(runId)
+    const results = journal
+      .listEvents(runId)
+      .filter((event) => event.type === "effect.issue_result_recorded")
+      .map((event) => event.payload)
+
+    expect(results[0]).not.toHaveProperty("output")
+    expect(results[0]).toMatchObject({
+      external_reference: "provider-42",
+      evidence: { provider: "fleet", output_omitted: expect.any(String) },
+    })
+    expect(results[1]).toMatchObject({ output: { dispatch: "d-2" } })
+    expect(journal.verifyRun(runId).state_digest).toBe(journal.getMission(runId).state_digest)
   })
 })
 

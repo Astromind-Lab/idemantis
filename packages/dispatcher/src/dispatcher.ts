@@ -1,10 +1,15 @@
-import type {
-  EventId,
-  IssueResult,
-  ProposedEvent,
-  ReconciliationResult,
-  RunId,
+import {
+  canonicalJson,
+  type EventId,
+  type IssueResult,
+  type JsonObject,
+  type JsonValue,
+  JsonValueSchema,
+  type ProposedEvent,
+  type ReconciliationResult,
+  type RunId,
 } from "@idemantis/contracts"
+import Schema from "typebox/schema"
 import { JournalError, type ClaimedCommand, type SqliteJournal } from "@idemantis/journal-sqlite"
 import { SecureIdentityFactory } from "./identity.js"
 import { SystemClock } from "./clock.js"
@@ -13,11 +18,56 @@ import type {
   CommandDispatcherOptions,
   DispatchOutcome,
   EffectExecutor,
+  ExecutionReport,
   IdentityFactory,
   InterruptedDispatchRecovery,
   TimerDispatcherOptions,
   TimerDispatchOutcome,
 } from "./types.js"
+
+const maximumOutputBytes = 65_536
+const maximumEvidenceBytes = 16_384
+
+function boundedJson(value: unknown, limit: number): JsonValue | undefined {
+  if (!Schema.Check(JsonValueSchema, value)) {
+    return undefined
+  }
+  return Buffer.byteLength(canonicalJson(value as JsonValue)) <= limit
+    ? structuredClone(value as JsonValue)
+    : undefined
+}
+
+function reportDetails(
+  report: ExecutionReport<IssueResult | ReconciliationResult>,
+): Record<string, JsonValue> {
+  const output =
+    report.output === undefined ? undefined : boundedJson(report.output, maximumOutputBytes)
+  const outputOmitted = report.output !== undefined && output === undefined
+  const reference =
+    typeof report.external_reference === "string" &&
+    report.external_reference.length >= 1 &&
+    report.external_reference.length <= 256
+      ? report.external_reference
+      : undefined
+  const evidence =
+    report.evidence === undefined ? undefined : boundedJson(report.evidence, maximumEvidenceBytes)
+  const evidenceObject: JsonObject | undefined =
+    evidence && typeof evidence === "object" && !Array.isArray(evidence) ? evidence : undefined
+  return {
+    ...(output === undefined ? {} : { output }),
+    ...(reference ? { external_reference: reference } : {}),
+    ...(evidenceObject || outputOmitted
+      ? {
+          evidence: {
+            ...(evidenceObject ?? {}),
+            ...(outputOmitted
+              ? { output_omitted: "output exceeded the journal size limit or was not JSON" }
+              : {}),
+          },
+        }
+      : {}),
+  }
+}
 
 export class CommandDispatcher {
   readonly #journal: SqliteJournal
@@ -65,16 +115,17 @@ export class CommandDispatcher {
         claim.command.causing_event_id,
       ),
     )
-    let result: IssueResult | ReconciliationResult
+    let report: ExecutionReport<IssueResult | ReconciliationResult>
     try {
       this.#journal.assertDispatchable(claim.attempt.attempt_id, this.#clock.now().toISOString())
-      result = await this.execute(claim)
+      report = await this.execute(claim)
     } catch (error) {
       if (!(error instanceof JournalError) || error.code !== "COMMAND_OWNERSHIP_STALE") {
         throw error
       }
-      result = claim.command.kind === "effect.issue" ? "not_sent" : "unknown"
+      report = { result: claim.command.kind === "effect.issue" ? "not_sent" : "unknown" }
     }
+    const { result } = report
     const resultType =
       claim.command.kind === "effect.issue"
         ? "effect.issue_result_recorded"
@@ -88,6 +139,7 @@ export class CommandDispatcher {
           command_id: claim.command.command_id,
           effect_id: claim.attempt.effect_id,
           result,
+          ...reportDetails(report),
         },
         dispatchStarted.acceptance.event_id,
       ),
@@ -150,23 +202,25 @@ export class CommandDispatcher {
     return recovered
   }
 
-  private async execute(claim: ClaimedCommand): Promise<IssueResult | ReconciliationResult> {
+  private async execute(
+    claim: ClaimedCommand,
+  ): Promise<ExecutionReport<IssueResult | ReconciliationResult>> {
+    const command = structuredClone(claim.command)
+    const attempt = structuredClone(claim.attempt)
     try {
       if (claim.command.kind === "effect.issue") {
-        return await this.#executor.issue(
-          structuredClone(claim.command),
-          structuredClone(claim.attempt),
-        )
+        return this.#executor.invokeIssue
+          ? await this.#executor.invokeIssue(command, attempt)
+          : { result: await this.#executor.issue(command, attempt) }
       }
       if (claim.command.kind === "effect.reconcile") {
-        return await this.#executor.reconcile(
-          structuredClone(claim.command),
-          structuredClone(claim.attempt),
-        )
+        return this.#executor.invokeReconciliation
+          ? await this.#executor.invokeReconciliation(command, attempt)
+          : { result: await this.#executor.reconcile(command, attempt) }
       }
       throw new TypeError(`Command ${claim.command.command_id} is not dispatchable`)
     } catch {
-      return claim.command.kind === "effect.issue" ? "uncertain" : "unknown"
+      return { result: claim.command.kind === "effect.issue" ? "uncertain" : "unknown" }
     }
   }
 

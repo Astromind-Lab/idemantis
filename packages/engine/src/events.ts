@@ -48,6 +48,9 @@ export const EffectIssueResultPayloadSchema = Type.Object(
     command_id: CommandIdSchema,
     effect_id: EffectIdSchema,
     result: IssueResultSchema,
+    output: Type.Optional(JsonValueSchema),
+    external_reference: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    evidence: Type.Optional(JsonObjectSchema),
   },
   { additionalProperties: false },
 )
@@ -58,6 +61,9 @@ export const EffectReconciliationResultPayloadSchema = Type.Object(
     command_id: CommandIdSchema,
     effect_id: EffectIdSchema,
     result: ReconciliationResultSchema,
+    output: Type.Optional(JsonValueSchema),
+    external_reference: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    evidence: Type.Optional(JsonObjectSchema),
   },
   { additionalProperties: false },
 )

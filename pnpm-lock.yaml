@@ -293,6 +293,31 @@ importers:
         specifier: workspace:*
         version: link:../sdk
 
+  packages/client:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/engine":
+        specifier: workspace:*
+        version: link:../engine
+      "@idemantis/transport":
+        specifier: workspace:*
+        version: link:../transport
+    devDependencies:
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
+      "@idemantis/runner":
+        specifier: workspace:*
+        version: link:../../apps/runner
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
   packages/contracts:
     dependencies:
       canonicalize:
@@ -389,6 +414,31 @@ importers:
       "@idemantis/edge-agent":
         specifier: workspace:*
         version: link:../edge-agent
+
+  packages/mcp:
+    dependencies:
+      "@idemantis/client":
+        specifier: workspace:*
+        version: link:../client
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/transport":
+        specifier: workspace:*
+        version: link:../transport
+    devDependencies:
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
+      "@idemantis/runner":
+        specifier: workspace:*
+        version: link:../../apps/runner
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
 
   packages/sdk:
     dependencies:

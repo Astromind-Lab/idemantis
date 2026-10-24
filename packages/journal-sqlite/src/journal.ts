@@ -1975,7 +1975,7 @@ export class SqliteJournal {
       .get(clientRequestId) as Row | undefined
     if (!row && required) {
       throw new JournalError(
-        "INTERVENTION_INVALID",
+        "INTERVENTION_NOT_FOUND",
         `Intervention ${clientRequestId} does not exist`,
       )
     }

@@ -29,9 +29,24 @@ export interface IdentityFactory {
   eventId(): EventId
 }
 
+export interface ExecutionReport<Result> {
+  result: Result
+  output?: unknown
+  external_reference?: string
+  evidence?: unknown
+}
+
 export interface EffectExecutor {
   issue(command: CommandRecord, attempt: AttemptRecord): Promise<IssueResult>
   reconcile(command: CommandRecord, attempt: AttemptRecord): Promise<ReconciliationResult>
+  invokeIssue?(
+    command: CommandRecord,
+    attempt: AttemptRecord,
+  ): Promise<ExecutionReport<IssueResult>>
+  invokeReconciliation?(
+    command: CommandRecord,
+    attempt: AttemptRecord,
+  ): Promise<ExecutionReport<ReconciliationResult>>
 }
 
 export interface HandoffEffect {
