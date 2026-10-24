@@ -182,6 +182,7 @@ export const MissionListPageSchema = Type.Object(
     list_revision: RevisionSchema,
     filter: QueueFilterSchema,
     query: Type.String({ maxLength: 256 }),
+    total_count: Type.Integer({ minimum: 0 }),
     items: Type.Array(MissionSummarySchema, { maxItems: 50 }),
     next_cursor: Type.Optional(CursorSchema),
   },

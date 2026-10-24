@@ -101,6 +101,7 @@ import type {
   ClaimedCommand,
   CommandClaimOptions,
   JournalOptions,
+  MissionListChange,
   MissionSnapshot,
   OwnershipState,
   PendingInputKind,
@@ -1134,6 +1135,29 @@ export class SqliteJournal {
     return integer(row, "revision")
   }
 
+  listMissionChanges(afterRevision: number, limit = 1000): MissionListChange[] {
+    this.#database.assertOpen()
+    if (!Number.isSafeInteger(afterRevision) || afterRevision < 1) {
+      throw new RangeError("Mission list revision must be a positive safe integer")
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RangeError("Mission list change limit must be from 1 through 1000")
+    }
+    return this.connection
+      .prepare(
+        `SELECT rowid + 1 AS revision, run_id
+         FROM mission_events
+         WHERE rowid + 1 > ?
+         ORDER BY rowid
+         LIMIT ?`,
+      )
+      .all(afterRevision, limit)
+      .map((raw) => {
+        const row = raw as Row
+        return { revision: integer(row, "revision"), run_id: text(row, "run_id") as RunId }
+      })
+  }
+
   listEvents(runId: RunId): AcceptedEvent[] {
     this.#database.assertOpen()
     this.runRow(runId, true)
@@ -1148,6 +1172,24 @@ export class SqliteJournal {
       proposal_digest: parseDigest(column(row, "proposal_digest"), "Event proposal digest"),
       state_digest: parseDigest(column(row, "state_digest"), "Event state digest"),
     }))
+  }
+
+  listStoredEventsAfter(runId: RunId, afterSequence: number, limit = 1000): StoredEvent[] {
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    if (!Number.isSafeInteger(afterSequence) || afterSequence < 0) {
+      throw new RangeError("Event sequence must be a non-negative safe integer")
+    }
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1000) {
+      throw new RangeError("Stored event limit must be from 1 through 1000")
+    }
+    return this.eventRows(runId, afterSequence)
+      .slice(0, limit)
+      .map((row) => ({
+        event: parseAcceptedEvent(text(row, "event_json")),
+        proposal_digest: parseDigest(column(row, "proposal_digest"), "Event proposal digest"),
+        state_digest: parseDigest(column(row, "state_digest"), "Event state digest"),
+      }))
   }
 
   listCommands(runId: RunId): CommandRecord[] {
