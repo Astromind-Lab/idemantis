@@ -313,6 +313,66 @@ CREATE INDEX edge_merge_quarantine_run_idx
 ON edge_merge_quarantine(run_id, quarantine_id);
 `
 
+const interventionsSql = `
+CREATE TABLE intervention_intents (
+  intent_sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  client_request_id TEXT NOT NULL UNIQUE,
+  actor_id TEXT NOT NULL,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  expected_sequence INTEGER NOT NULL CHECK (expected_sequence >= 1),
+  action_code TEXT NOT NULL,
+  target TEXT NOT NULL,
+  normalized_input_json TEXT NOT NULL CHECK (json_valid(normalized_input_json)),
+  reason TEXT,
+  proposal_event_id TEXT NOT NULL UNIQUE,
+  proposal_digest TEXT NOT NULL,
+  proposal_json TEXT NOT NULL CHECK (json_valid(proposal_json)),
+  state TEXT NOT NULL CHECK (state IN ('prepared', 'submitted', 'discarded', 'expired')),
+  compatibility TEXT NOT NULL CHECK (compatibility IN ('compatible', 'incompatible')),
+  prepared_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  submitted_at TEXT,
+  terminal_at TEXT,
+  outcome TEXT CHECK (
+    outcome IS NULL OR outcome IN ('queued', 'accepted', 'rejected_stale', 'rejected_invalid')
+  ),
+  accepted_sequence INTEGER CHECK (accepted_sequence IS NULL OR accepted_sequence >= 1),
+  received_at TEXT,
+  resolved_at TEXT,
+  receipt_revision INTEGER UNIQUE CHECK (receipt_revision IS NULL OR receipt_revision >= 1),
+  CHECK (
+    (state = 'prepared' AND submitted_at IS NULL AND terminal_at IS NULL AND outcome IS NULL)
+    OR (state IN ('discarded', 'expired') AND submitted_at IS NULL AND terminal_at IS NOT NULL AND outcome IS NULL)
+    OR (state = 'submitted' AND submitted_at IS NOT NULL AND terminal_at IS NULL AND outcome IS NOT NULL)
+  ),
+  CHECK (
+    outcome IS NULL
+    OR (outcome = 'queued' AND accepted_sequence IS NULL AND received_at IS NOT NULL AND resolved_at IS NULL)
+    OR (outcome = 'accepted' AND accepted_sequence IS NOT NULL AND received_at IS NOT NULL AND resolved_at IS NOT NULL)
+    OR (outcome IN ('rejected_stale', 'rejected_invalid')
+        AND accepted_sequence IS NULL AND received_at IS NOT NULL AND resolved_at IS NOT NULL)
+  )
+) STRICT;
+
+CREATE INDEX intervention_intents_run_actor_sequence_idx
+ON intervention_intents(run_id, actor_id, intent_sequence);
+
+CREATE INDEX intervention_intents_run_receipt_revision_idx
+ON intervention_intents(run_id, receipt_revision);
+
+CREATE TABLE intervention_receipt_updates (
+  revision INTEGER PRIMARY KEY,
+  run_id TEXT NOT NULL REFERENCES mission_runs(run_id),
+  client_request_id TEXT NOT NULL REFERENCES intervention_intents(client_request_id),
+  receipt_json TEXT NOT NULL CHECK (json_valid(receipt_json)),
+  recorded_at TEXT NOT NULL,
+  UNIQUE (client_request_id, revision)
+) STRICT;
+
+CREATE INDEX intervention_receipt_updates_run_revision_idx
+ON intervention_receipt_updates(run_id, revision);
+`
+
 function migration(version: number, name: string, sql: string): Migration {
   return {
     version,
@@ -327,4 +387,5 @@ export const migrations = [
   migration(2, "dispatch_and_timers", dispatchAndTimersSql),
   migration(3, "ownership_epochs", ownershipEpochsSql),
   migration(4, "edge_reconciliation", edgeReconciliationSql),
+  migration(5, "interventions", interventionsSql),
 ] as const

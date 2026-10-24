@@ -27,6 +27,9 @@ export type JournalErrorCode =
   | "EDGE_MERGE_INVALID"
   | "EDGE_MERGE_CONFLICT"
   | "EDGE_MERGE_ID_COLLISION"
+  | "INTERVENTION_INVALID"
+  | "INTERVENTION_COLLISION"
+  | "INTERVENTION_STATE_INVALID"
 
 export class JournalError extends Error {
   override readonly name = "JournalError"

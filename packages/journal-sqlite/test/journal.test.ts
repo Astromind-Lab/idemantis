@@ -9,6 +9,7 @@ import {
   mapFields,
   reconcileState,
   safeRetry,
+  waitForOperator,
   waitForObservation,
 } from "@idemantis/sdk"
 import { chmodSync, mkdtempSync, rmSync, statSync } from "node:fs"
@@ -104,6 +105,43 @@ const runtime: MissionRuntimeDefinition = {
   execution_binding_digest: `sha256:${"b".repeat(64)}`,
 }
 
+const operatorMission = defineMission({
+  id: "journal-operator-review",
+  version: "1.0.0",
+  input: Type.Object({ release: Type.String() }, { additionalProperties: false }),
+  initial: "review",
+  states: {
+    review: waitForOperator({
+      reason: "Release requires approval",
+      actions: [
+        {
+          code: "approve",
+          consequence: "irreversible",
+          confirmationRequired: true,
+          input: Type.Object(
+            { evidence: Type.String({ minLength: 3 }) },
+            { additionalProperties: false },
+          ),
+          presentationHints: [
+            { path: "evidence", control: "textarea", label: "Evidence", order: 0 },
+          ],
+          evidenceRequired: true,
+          reasonRequired: true,
+          expectedOutcomeLabel: "Release is approved",
+          onAccepted: "complete",
+        },
+      ],
+    }),
+    complete: finalState("completed"),
+  },
+})
+
+const operatorRuntime: MissionRuntimeDefinition = {
+  manifest: operatorMission.manifest,
+  definition_digest: operatorMission.definitionDigest,
+  execution_binding_digest: `sha256:${"d".repeat(64)}`,
+}
+
 const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
 const attemptId = "att_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
 const secondAttemptId = "att_01ARZ3NDEKTSV4RRFFQ69G5FAW" as const
@@ -157,6 +195,31 @@ function admission(): ProposedEvent {
     execution_binding_digest: runtime.execution_binding_digest,
     input: { route: "north", vehicle: "vehicle-7" },
   })
+}
+
+function operatorAdmission(): ProposedEvent {
+  return proposal(1, "mission.admitted", {
+    definition_digest: operatorRuntime.definition_digest,
+    execution_binding_digest: operatorRuntime.execution_binding_digest,
+    input: { release: "release-47" },
+  })
+}
+
+function operatorIntervention(): ProposedEvent {
+  return proposal(
+    2,
+    "operator.intervention_submitted",
+    {
+      client_request_id: "journal-intervention-0001",
+      expected_sequence: 1,
+      action_code: "approve",
+      target: `mission:${runId}`,
+      input: { evidence: "Reviewed deployment record" },
+      reason: "Evidence matches the release",
+    },
+    "operator-1",
+    "operator",
+  )
 }
 
 function admitted(journal: SqliteJournal) {
@@ -255,7 +318,7 @@ describe("SQLite journal", () => {
     const journal = open(path)
 
     expect(journal.storageInfo()).toEqual({
-      schema_version: 4,
+      schema_version: 5,
       journal_mode: "wal",
       foreign_keys: true,
     })
@@ -290,7 +353,7 @@ describe("SQLite journal", () => {
 
     const journal = open(path)
 
-    expect(journal.storageInfo().schema_version).toBe(4)
+    expect(journal.storageInfo().schema_version).toBe(5)
     expect(() => admitted(journal)).not.toThrow()
   })
 
@@ -347,6 +410,114 @@ describe("SQLite journal", () => {
     )
     expect(journal.listEvents(runId)).toHaveLength(1)
     expect(journal.listCommands(runId)).toHaveLength(1)
+  })
+
+  it("persists prepared interventions and accepted receipts across restart", () => {
+    const path = journalPath()
+    const journalClock = clock()
+    const first = open(path, journalClock)
+    first.admit(operatorRuntime, operatorAdmission())
+    const prepared = first.prepareIntervention(operatorIntervention(), "2026-01-01T00:15:00.000Z")
+    expect(() => first.append(operatorIntervention())).toThrowError(
+      expect.objectContaining({ code: "DISPATCH_EVENT_INVALID" }),
+    )
+    const reservedCollision = {
+      ...operatorIntervention(),
+      type: "observation.recorded",
+      source: { kind: "adapter" as const, source_id: "adapter-1" },
+      payload: {
+        observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        observation_type: "release.reviewed",
+        payload: { result: "approved" },
+      },
+    }
+    expect(() => first.append(reservedCollision)).toThrowError(
+      expect.objectContaining({ code: "EVENT_ID_COLLISION" }),
+    )
+    first.close()
+
+    const restarted = open(path, journalClock)
+    expect(restarted.getPreparedIntervention(runId, prepared.client_request_id)).toEqual(prepared)
+    const result = restarted.submitIntervention(
+      runId,
+      prepared.client_request_id,
+      prepared.proposal_digest,
+    )
+    if (result.status !== "receipt") {
+      throw new Error("Expected a durable intervention receipt")
+    }
+
+    expect(result.receipt).toMatchObject({ outcome: "accepted", accepted_sequence: 2 })
+    expect(
+      restarted.submitIntervention(runId, prepared.client_request_id, prepared.proposal_digest),
+    ).toEqual(result)
+    expect(restarted.getMission(runId).state).toMatchObject({
+      status: "completed",
+      current_state: "complete",
+      current_sequence: 2,
+    })
+    expect(restarted.listReceiptUpdatesAfter(runId, "operator-1", 0)).toEqual([
+      expect.objectContaining({
+        revision: result.receipt.revision,
+        receipt: result.receipt,
+      }),
+    ])
+    expect(restarted.interventionReceiptRevision(runId, "operator-2")).toBe(0)
+    expect(
+      restarted.listInterventionReceipts(runId, "operator-2", result.receipt.revision),
+    ).toEqual([])
+    expect(restarted.listReceiptUpdatesAfter(runId, "operator-2", 0)).toEqual([])
+  })
+
+  it("records a stale intervention without appending its proposal", () => {
+    const journal = open(journalPath())
+    journal.admit(operatorRuntime, operatorAdmission())
+    const prepared = journal.prepareIntervention(operatorIntervention(), "2026-01-01T00:15:00.000Z")
+    journal.registerOwnershipLease({
+      ...proposal(3, "ownership.lease_registered", {
+        lease: {
+          lease_id: "lse_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          run_id: runId,
+          owner_mode: "runner",
+          owner_id: "runner-1",
+          ownership_epoch: 1,
+          branch_anchor_sequence: 1,
+          not_before: "2026-01-01T00:00:00.000Z",
+          not_after: "2026-01-01T01:00:00.000Z",
+          maximum_offline_duration_ms: 60_000,
+          allowed_clock_uncertainty_ms: 1_000,
+          delegation_digest: `sha256:${"e".repeat(64)}`,
+        },
+      }),
+      source: { kind: "runner", source_id: "runner-1" },
+    })
+
+    const result = journal.submitIntervention(
+      runId,
+      prepared.client_request_id,
+      prepared.proposal_digest,
+    )
+
+    expect(result).toMatchObject({ status: "receipt", receipt: { outcome: "rejected_stale" } })
+    expect(journal.listEvents(runId).map((event) => event.type)).toEqual([
+      "mission.admitted",
+      "ownership.lease_registered",
+    ])
+  })
+
+  it("expires an unsubmitted intervention without producing a receipt", () => {
+    let now = new Date("2026-01-01T00:00:00.000Z")
+    const journal = open(journalPath(), () => now)
+    journal.admit(operatorRuntime, operatorAdmission())
+    const prepared = journal.prepareIntervention(operatorIntervention(), "2026-01-01T00:15:00.000Z")
+    now = new Date("2026-01-01T00:15:00.000Z")
+
+    expect(journal.getPreparedIntervention(runId, prepared.client_request_id).state).toBe("expired")
+    expect(
+      journal.submitIntervention(runId, prepared.client_request_id, prepared.proposal_digest),
+    ).toMatchObject({ status: "expired", prepared: { state: "expired" } })
+    expect(journal.interventionReceiptRevision(runId, "operator-1")).toBe(0)
+    expect(journal.listEvents(runId)).toHaveLength(1)
   })
 
   it("claims a command and records its dispatch lifecycle atomically", () => {

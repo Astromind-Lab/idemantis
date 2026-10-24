@@ -8,13 +8,14 @@ import type {
   Digest,
   EdgeMergeRequest,
   EventAcceptance,
-  IngressOutcome,
-  MergeId,
-  ProposedEvent,
   FenceProof,
   EffectId,
+  IngressOutcome,
+  JsonObject,
+  MergeId,
   OwnershipHandoffRecord,
   OwnershipLease,
+  ProposedEvent,
   RunId,
   SourceId,
   TimerId,
@@ -101,6 +102,56 @@ export interface StorageInfo {
   journal_mode: string
   foreign_keys: boolean
 }
+
+export type PreparedInterventionState = "prepared" | "submitted" | "discarded" | "expired"
+
+export interface StoredPreparedIntervention {
+  intent_sequence: number
+  client_request_id: ClientRequestId
+  actor_id: SourceId
+  run_id: RunId
+  expected_sequence: number
+  action_code: string
+  target: string
+  normalized_input: JsonObject
+  reason?: string
+  proposal_digest: Digest
+  proposal: ProposedEvent
+  prepared_at: string
+  expires_at: string
+  state: PreparedInterventionState
+  compatibility: "compatible" | "incompatible"
+}
+
+export type StoredInterventionOutcome =
+  | "queued"
+  | "accepted"
+  | "rejected_stale"
+  | "rejected_invalid"
+
+export interface StoredInterventionReceipt {
+  client_request_id: ClientRequestId
+  proposal_digest: Digest
+  run_id: RunId
+  expected_sequence: number
+  outcome: StoredInterventionOutcome
+  accepted_sequence?: number
+  received_at: string
+  resolved_at?: string
+  revision: number
+}
+
+export interface StoredReceiptUpdate {
+  revision: number
+  run_id: RunId
+  client_request_id: ClientRequestId
+  receipt: StoredInterventionReceipt
+  recorded_at: string
+}
+
+export type SubmitInterventionResult =
+  | { status: "receipt"; receipt: StoredInterventionReceipt }
+  | { status: "expired"; prepared: StoredPreparedIntervention }
 
 export interface ReplayVerification {
   run_id: RunId
