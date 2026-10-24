@@ -256,6 +256,10 @@ export class RunnerStore {
   readonly #interventionLifetimeMs: number
   readonly #summaries = new Map<string, MissionSummary>()
   readonly #summaryKeys = new Map<string, string>()
+  #operationsBatches: { revision: number; batches: Map<string, StreamEnvelope[]> } = {
+    revision: 0,
+    batches: new Map(),
+  }
 
   constructor(options: RunnerStoreOptions) {
     this.#journal = options.journal
@@ -344,7 +348,28 @@ export class RunnerStore {
   }
 
   operationsStreamBatch(afterRevision: number, limit = 1000): StreamEnvelope[] {
-    this.assertStreamPosition(afterRevision, this.listRevision, "Operations revision", 1)
+    const revision = this.listRevision
+    const key = `${afterRevision}:${limit}`
+    if (this.#operationsBatches.revision !== revision) {
+      this.#operationsBatches = { revision, batches: new Map() }
+    }
+    const cached = this.#operationsBatches.batches.get(key)
+    if (cached) {
+      return structuredClone(cached)
+    }
+    const batch = this.computeOperationsBatch(afterRevision, revision, limit)
+    if (this.#operationsBatches.batches.size < 1_000) {
+      this.#operationsBatches.batches.set(key, batch)
+    }
+    return structuredClone(batch)
+  }
+
+  private computeOperationsBatch(
+    afterRevision: number,
+    revision: number,
+    limit: number,
+  ): StreamEnvelope[] {
+    this.assertStreamPosition(afterRevision, revision, "Operations revision", 1)
     const changes = this.#journal.listMissionChanges(afterRevision, limit)
     const last = changes.at(-1)
     if (!last) {
