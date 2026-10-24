@@ -258,6 +258,60 @@ describe("durable agent tools", () => {
     expect(toolLedger.list()).toHaveLength(1)
   })
 
+  it("waits for an in-flight call before answering a reconciliation", async () => {
+    let release: () => void = () => {}
+    const gate = new Promise<void>((resolvePromise) => {
+      release = resolvePromise
+    })
+    const slow = defineTool({
+      name: "crm.slow",
+      input: Type.Object({ subject: Type.String() }, { additionalProperties: false }),
+      output: Type.Object({ ticket_id: Type.String() }, { additionalProperties: false }),
+      run: async () => {
+        await gate
+        return { ticket_id: "T-9" }
+      },
+    })
+    const operation = createToolAdapter({
+      adapter: "agent-tools",
+      version: "1.0.0",
+      tools: [slow],
+      ledger: ledger(),
+    }).operations[0]
+    if (!operation?.reconcile) {
+      throw new Error("Expected a reconcilable operation")
+    }
+    const context = (effect: string, signal = new AbortController().signal) =>
+      ({
+        adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        run_id: "run_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        command_id: "cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        attempt_id: "att_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        effect_id: effect,
+        ownership_epoch: 1,
+        deadline: new Date(Date.now() + 60_000).toISOString(),
+        source_id: "test",
+        signal,
+      }) as never
+
+    const issued = operation.issue(context("eff_01ARZ3NDEKTSV4RRFFQ69G5FAV"), { subject: "a" })
+    const impatient = new AbortController()
+    const giveUp = operation.reconcile(
+      context("eff_01ARZ3NDEKTSV4RRFFQ69G5FAV", impatient.signal),
+      "create",
+    )
+    impatient.abort()
+    const waited = operation.reconcile(context("eff_01ARZ3NDEKTSV4RRFFQ69G5FAV"), "create")
+    release()
+
+    expect(await giveUp).toMatchObject({ result: "confirmed_in_progress" })
+    expect(await waited).toMatchObject({
+      result: "confirmed_completed",
+      output: { ticket_id: "T-9" },
+    })
+    expect(await issued).toMatchObject({ result: "completed" })
+  })
+
   it("serves tools over HTTP to a separately running runner", async () => {
     const directory = mkdtempSync(join(tmpdir(), "idemantis-tools-"))
     cleanups.push(() => rmSync(directory, { recursive: true, force: true }))
