@@ -12,7 +12,9 @@ import {
   MissionExecutionStartSchema,
   MissionExecutionStatusSchema,
   MissionListPageSchema,
+  ObservationReceiptSchema,
   queueBucketFor,
+  RecordObservationRequestSchema,
   TransportError,
   validateInterventionInput,
   validateInterventionSchema,
@@ -125,6 +127,34 @@ describe("transport contracts", () => {
         activity: "failed",
         finished_at: "2026-10-24T00:00:01.000Z",
         failure_code: "EXECUTION_FAILED",
+      }),
+    ).toBe(true)
+  })
+
+  it("validates external observation requests and receipts", () => {
+    const request = {
+      observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      observation_type: "delivery.handoff_confirmed",
+      payload: { recipient: "payload-42" },
+      subject: "delivery-001",
+      observed_at: "2026-10-24T00:00:00.000Z",
+    }
+
+    expect(Schema.Check(RecordObservationRequestSchema, request)).toBe(true)
+    expect(
+      Schema.Check(RecordObservationRequestSchema, { ...request, observation_type: "Handoff" }),
+    ).toBe(false)
+    expect(Schema.Check(RecordObservationRequestSchema, { ...request, source: "operator" })).toBe(
+      false,
+    )
+    expect(
+      Schema.Check(ObservationReceiptSchema, {
+        schema_version: 1,
+        run_id: runId,
+        observation_id: request.observation_id,
+        event_id: "evt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        sequence: 4,
+        disposition: "duplicate",
       }),
     ).toBe(true)
   })
