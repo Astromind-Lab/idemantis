@@ -1,4 +1,5 @@
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto"
+import type { SourceId } from "@idemantis/contracts"
 import {
   ApiSchemaVersion,
   StreamSchemaVersion,
@@ -116,8 +117,9 @@ export class SessionAuthority {
     return this.document(record)
   }
 
-  assertActive(cookieToken: string | undefined): void {
+  assertActive(cookieToken: string | undefined): SourceId {
     this.record(cookieToken)
+    return "local-operator"
   }
 
   assertCsrf(cookieToken: string | undefined, csrfToken: string | undefined): void {

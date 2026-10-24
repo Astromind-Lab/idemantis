@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import type { OperationCapabilities, RunId } from "@idemantis/contracts"
+import type { OperationCapabilities, RunId, SourceId } from "@idemantis/contracts"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import {
@@ -16,8 +16,12 @@ import {
 import {
   EffectDetailSchema,
   EffectPageSchema,
+  InterventionReceiptPageSchema,
+  InterventionReceiptSchema,
   MissionDetailSchema,
   MissionListPageSchema,
+  PreparedInterventionPageSchema,
+  PreparedInterventionSchema,
   ReplayResultSchema,
   StreamEnvelopeSchema,
   TimelinePageSchema,
@@ -28,6 +32,7 @@ import Type from "typebox"
 import Schema from "typebox/schema"
 import { afterEach, describe, expect, it } from "vitest"
 import { RunnerStore } from "../src/index.js"
+import { InterventionRuntime } from "./fixture.js"
 
 const capabilities = {
   duplicate_safety: "native_idempotency",
@@ -86,6 +91,8 @@ const runtime: MissionRuntimeDefinition = {
 const runA = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as RunId
 const runB = "run_01ARZ3NDEKTSV4RRFFQ69G5FAW" as RunId
 const runC = "run_01ARZ3NDEKTSV4RRFFQ69G5FAX" as RunId
+const operatorId = "local-operator" as SourceId
+const clientRequestId = "operator-request-0001"
 const temporaryDirectories: string[] = []
 const journals: SqliteJournal[] = []
 
@@ -125,6 +132,7 @@ function store(): RunnerStore {
     },
   })
   runner.registerDefinition(runtime, { subject_reference_keys: ["shipment"] })
+  runner.registerDefinition(InterventionRuntime, { subject_reference_keys: ["subject"] })
   return runner
 }
 
@@ -134,6 +142,25 @@ function admit(runner: RunnerStore, run_id: RunId, shipment: string) {
     run_id,
     input: { destination: "north", shipment },
   })
+}
+
+function admitIntervention(runner: RunnerStore, run_id: RunId = runA) {
+  return runner.admitMission({
+    definition_digest: InterventionRuntime.definition_digest,
+    run_id,
+    input: { subject: "release-47" },
+  })
+}
+
+function interventionRequest(run_id: RunId = runA) {
+  return {
+    client_request_id: clientRequestId,
+    expected_sequence: 1,
+    action_code: "approve_release",
+    target: `mission:${run_id}`,
+    input: { evidence: "Reviewed deployment record" },
+    reason: "Evidence matches the release",
+  }
 }
 
 afterEach(() => {
@@ -298,5 +325,127 @@ describe("runner store", () => {
     ).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }))
     expect(() => runner.listMissions({ limit: 0 })).toThrowError(TransportError)
     expect(runner.listMissions({ bucket: "all" }).items).toEqual([])
+  })
+
+  it("prepares, submits, retries, and streams an operator intervention", () => {
+    const runner = store()
+    const admitted = admitIntervention(runner)
+    const descriptor = admitted.valid_interventions[0]
+
+    expect(admitted.summary.queue_bucket).toBe("needs_attention")
+    expect(admitted.projection.status).toBe("paused")
+    expect(descriptor).toMatchObject({
+      action_code: "approve_release",
+      target: `mission:${runA}`,
+      consequence: "irreversible",
+      confirmation_required: true,
+      evidence_required: true,
+      reason_required: true,
+    })
+
+    const request = interventionRequest()
+    const prepared = runner.prepareIntervention(runA, operatorId, request)
+    const repeatedPreparation = runner.prepareIntervention(
+      runA,
+      operatorId,
+      structuredClone(request),
+    )
+
+    expect(Schema.Check(PreparedInterventionSchema, prepared)).toBe(true)
+    expect(repeatedPreparation).toEqual(prepared)
+    expect(runner.missionDetail(runA).projection.current_sequence).toBe(1)
+    expect(() =>
+      runner.prepareIntervention(runA, operatorId, {
+        ...request,
+        reason: "Different content",
+      }),
+    ).toThrowError(expect.objectContaining({ code: "CLIENT_REQUEST_ID_COLLISION" }))
+
+    const receiptPosition = runner.receiptStreamPosition(runA, operatorId, 0)
+    const submission = {
+      client_request_id: prepared.client_request_id,
+      proposal_digest: prepared.proposal_digest,
+    }
+    const receipt = runner.submitIntervention(runA, operatorId, submission)
+    const repeatedReceipt = runner.submitIntervention(runA, operatorId, submission)
+
+    expect(Schema.Check(InterventionReceiptSchema, receipt)).toBe(true)
+    expect(receipt).toMatchObject({ outcome: "accepted", accepted_sequence: 2 })
+    expect(repeatedReceipt).toEqual(receipt)
+    expect(runner.missionDetail(runA).projection).toMatchObject({
+      status: "completed",
+      current_state: "complete",
+      current_sequence: 2,
+    })
+    expect(runner.timeline(runA).items[1]).toMatchObject({
+      event_type: "operator.intervention_submitted",
+      source: { kind: "operator", source_id: operatorId },
+    })
+
+    const activity = runner.interventionActivity(runA, operatorId)
+    const receipts = runner.interventionReceipts(runA, operatorId)
+    expect(Schema.Check(PreparedInterventionPageSchema, activity)).toBe(true)
+    expect(Schema.Check(InterventionReceiptPageSchema, receipts)).toBe(true)
+    expect(activity.items).toEqual([expect.objectContaining({ state: "submitted" })])
+    expect(receipts.items).toEqual([receipt])
+    expect(runner.interventionReceiptById(runA, operatorId, clientRequestId)).toEqual(receipt)
+
+    const updates = runner.receiptStreamBatch(runA, operatorId, receiptPosition)
+    expect(updates).toHaveLength(1)
+    expect(updates[0]).toMatchObject({
+      kind: "receipt",
+      body: { run_id: runA, client_request_id: clientRequestId, receipt },
+    })
+    const cursor = updates[0]?.resume_cursor
+    if (!cursor) {
+      throw new Error("Expected a receipt resume cursor")
+    }
+    expect(runner.receiptStreamPosition(runA, operatorId, undefined, cursor)).toBe(receipt.revision)
+    expect(runner.receiptStreamBatch(runA, operatorId, receipt.revision)).toEqual([])
+    const otherOperator = "other-operator" as SourceId
+    expect(runner.receiptStreamPosition(runA, otherOperator, 0)).toBe(0)
+    expect(runner.receiptStreamBatch(runA, otherOperator, 0)).toEqual([])
+  })
+
+  it("rejects malformed actions and preserves discarded preparations", () => {
+    const runner = store()
+    admitIntervention(runner)
+    const request = interventionRequest()
+
+    expect(() =>
+      runner.prepareIntervention(runA, operatorId, {
+        ...request,
+        input: { evidence: "no", unexpected: true },
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }))
+    expect(() =>
+      runner.prepareIntervention(runA, operatorId, {
+        client_request_id: request.client_request_id,
+        expected_sequence: request.expected_sequence,
+        action_code: request.action_code,
+        target: request.target,
+        input: request.input,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "INVALID_REQUEST" }))
+    expect(() =>
+      runner.prepareIntervention(runA, operatorId, {
+        ...request,
+        target: `mission:${runB}`,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "ACTION_FORBIDDEN" }))
+
+    const prepared = runner.prepareIntervention(runA, operatorId, request)
+    const submission = {
+      client_request_id: prepared.client_request_id,
+      proposal_digest: prepared.proposal_digest,
+    }
+    const discarded = runner.discardIntervention(runA, operatorId, submission)
+
+    expect(discarded.state).toBe("discarded")
+    expect(runner.discardIntervention(runA, operatorId, submission)).toEqual(discarded)
+    expect(() => runner.submitIntervention(runA, operatorId, submission)).toThrowError(
+      expect.objectContaining({ code: "INVALID_REQUEST" }),
+    )
+    expect(runner.missionDetail(runA).projection.current_sequence).toBe(1)
   })
 })

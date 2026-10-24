@@ -1,8 +1,12 @@
 import { createServer } from "node:net"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import {
+  InterventionReceiptPageSchema,
+  InterventionReceiptSchema,
   MissionDetailSchema,
   MissionListPageSchema,
+  PreparedInterventionPageSchema,
+  PreparedInterventionSchema,
   SessionDocumentSchema,
   StreamEnvelopeSchema,
   type StreamEnvelope,
@@ -12,7 +16,7 @@ import { afterEach, describe, expect, it } from "vitest"
 import { createRunnerServer } from "../src/server.js"
 import { SessionAuthority } from "../src/session.js"
 import { RunnerStore } from "../src/store.js"
-import { VerificationRuntime } from "./fixture.js"
+import { InterventionRuntime, VerificationRuntime } from "./fixture.js"
 
 const origin = "http://127.0.0.1:4317"
 const host = "127.0.0.1:4317"
@@ -28,6 +32,7 @@ async function setup(clock?: () => Date, configuredOrigin = origin) {
     ...(clock ? { clock } : {}),
   })
   store.registerDefinition(VerificationRuntime, { subject_reference_keys: ["subject"] })
+  store.registerDefinition(InterventionRuntime, { subject_reference_keys: ["subject"] })
   const sessions = new SessionAuthority({ ...(clock ? { clock } : {}) })
   const app = await createRunnerServer({
     store,
@@ -310,6 +315,102 @@ describe("runner HTTP boundary", () => {
     expect(queue.json().items[0].subject_references[0].value.value).toBe("release-47")
   })
 
+  it("prepares and submits an intervention through the authenticated boundary", async () => {
+    const { app, sessions } = await setup()
+    const session = await authenticate(app, sessions)
+    const headers = {
+      host,
+      origin,
+      cookie: session.cookie,
+      "x-idemantis-csrf": session.csrf,
+    }
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/missions",
+      headers,
+      payload: {
+        definition_digest: InterventionRuntime.definition_digest,
+        input: { subject: "release-47" },
+      },
+    })
+    const runId = created.json().summary.run_id as string
+    const request = {
+      client_request_id: "http-intervention-0001",
+      expected_sequence: 1,
+      action_code: "approve_release",
+      target: `mission:${runId}`,
+      input: { evidence: "Reviewed deployment record" },
+      reason: "Evidence matches the release",
+    }
+    const preparedResponse = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/interventions/prepare`,
+      headers,
+      payload: request,
+    })
+    const prepared = preparedResponse.json()
+
+    expect(preparedResponse.statusCode).toBe(201)
+    expect(Schema.Check(PreparedInterventionSchema, prepared)).toBe(true)
+    const repeatedPreparation = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/interventions/prepare`,
+      headers,
+      payload: request,
+    })
+    expect(repeatedPreparation.json()).toEqual(prepared)
+
+    const rejectedBoundary = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/interventions/prepare`,
+      headers,
+      payload: { ...request, actor_id: "forged-operator" },
+    })
+    expect(rejectedBoundary.statusCode).toBe(422)
+
+    const submission = {
+      client_request_id: prepared.client_request_id,
+      proposal_digest: prepared.proposal_digest,
+    }
+    const submittedResponse = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/interventions/submit`,
+      headers,
+      payload: submission,
+    })
+    const receipt = submittedResponse.json()
+
+    expect(submittedResponse.statusCode).toBe(200)
+    expect(Schema.Check(InterventionReceiptSchema, receipt)).toBe(true)
+    expect(receipt).toMatchObject({ outcome: "accepted", accepted_sequence: 2 })
+    const repeatedSubmission = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/interventions/submit`,
+      headers,
+      payload: submission,
+    })
+    expect(repeatedSubmission.json()).toEqual(receipt)
+
+    const activity = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}/interventions`,
+      headers: { host, cookie: session.cookie },
+    })
+    const receipts = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}/intervention-receipts`,
+      headers: { host, cookie: session.cookie },
+    })
+    const receiptLookup = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}/interventions/${request.client_request_id}/receipt`,
+      headers: { host, cookie: session.cookie },
+    })
+    expect(Schema.Check(PreparedInterventionPageSchema, activity.json())).toBe(true)
+    expect(Schema.Check(InterventionReceiptPageSchema, receipts.json())).toBe(true)
+    expect(receiptLookup.json()).toEqual(receipt)
+  })
+
   it("returns bounded error envelopes for invalid routes and oversized requests", async () => {
     const { app } = await setup()
     const missing = await app.inject({
@@ -439,5 +540,55 @@ describe("runner HTTP boundary", () => {
     })
     expect(wrongNamespace.statusCode).toBe(400)
     expect(wrongNamespace.json().error.code).toBe("CURSOR_INVALID")
+  })
+
+  it("streams intervention receipts and resumes without duplicates", async () => {
+    const local = await availableOrigin()
+    const { app, sessions, store } = await setup(undefined, local.origin)
+    await app.listen({ host: "127.0.0.1", port: local.port })
+    const session = await authenticate(app, sessions, local.origin)
+    const created = store.admitMission({
+      definition_digest: InterventionRuntime.definition_digest,
+      input: { subject: "release-48" },
+    })
+    const runId = created.summary.run_id
+    const abort = new AbortController()
+    const response = await fetch(
+      `${local.origin}/api/missions/${runId}/receipts/stream?after_revision=0`,
+      { headers: { cookie: session.cookie }, signal: abort.signal },
+    )
+    const nextReceipt = sseReader(response)
+    expect(await nextReceipt()).toMatchObject({ kind: "heartbeat" })
+
+    const prepared = store.prepareIntervention(runId, "local-operator", {
+      client_request_id: "stream-intervention-0001",
+      expected_sequence: 1,
+      action_code: "approve_release",
+      target: `mission:${runId}`,
+      input: { evidence: "Reviewed live stream record" },
+      reason: "Evidence matches the release",
+    })
+    store.submitIntervention(runId, "local-operator", {
+      client_request_id: prepared.client_request_id,
+      proposal_digest: prepared.proposal_digest,
+    })
+    const receipt = await nextReceipt()
+    expect(receipt).toMatchObject({
+      kind: "receipt",
+      body: {
+        run_id: runId,
+        client_request_id: prepared.client_request_id,
+        receipt: { outcome: "accepted", accepted_sequence: 2 },
+      },
+    })
+    abort.abort()
+
+    const resumedAbort = new AbortController()
+    const resumed = await fetch(`${local.origin}/api/missions/${runId}/receipts/stream`, {
+      headers: { cookie: session.cookie, "last-event-id": receipt.resume_cursor },
+      signal: resumedAbort.signal,
+    })
+    expect(await sseReader(resumed)()).toMatchObject({ kind: "heartbeat" })
+    resumedAbort.abort()
   })
 })
