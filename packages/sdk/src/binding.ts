@@ -38,7 +38,7 @@ function sameCapabilities(
 
 /** Validates resolved operations and returns their canonical binding digest. */
 export function executionBindingDigest(
-  mission: CompiledMission,
+  mission: Pick<CompiledMission, "manifest" | "definitionDigest">,
   bindings: readonly ExecutionBinding[],
 ): Digest {
   const issues: ExecutionBindingIssue[] = []
