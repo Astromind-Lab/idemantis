@@ -14,6 +14,7 @@
     "format:check": "biome format .",
     "lint": "biome lint .",
     "proof:faults": "pnpm --silent --filter @idemantis/fault-suite... run build && pnpm --silent --filter @idemantis/fault-suite run proof",
+    "reference": "pnpm run build && pnpm --silent --filter @idemantis/runner run reference",
     "security:audit": "pnpm audit --audit-level high",
     "test": "pnpm --recursive --if-present run test",
     "typecheck": "pnpm --recursive --if-present run typecheck"

@@ -439,7 +439,7 @@ function reduceIssueResult(
       if (effectState.on_settled === state.current_state) {
         return []
       }
-      return enterState(definition, state, effectState.on_settled, event, null)
+      return enterState(definition, state, effectState.on_settled, event, effect.effect_id)
     case "uncertain":
       effect.retry_timer_id = null
       effect.status = "uncertain"
@@ -535,7 +535,7 @@ function reduceObservation(
     effect.retry_timer_id = null
     effect.status = "settled"
   }
-  return enterState(definition, state, waitState.on_observed, event, null)
+  return enterState(definition, state, waitState.on_observed, event, effectId ?? null)
 }
 
 function reduceTimer(

@@ -12,8 +12,8 @@ import {
   type StreamEnvelope,
 } from "@idemantis/transport"
 import Schema from "typebox/schema"
-import { afterEach, describe, expect, it } from "vitest"
-import { createRunnerServer } from "../src/server.js"
+import { afterEach, describe, expect, it, vi } from "vitest"
+import { createRunnerServer, type MissionExecutor } from "../src/server.js"
 import { SessionAuthority } from "../src/session.js"
 import { RunnerStore } from "../src/store.js"
 import { InterventionRuntime, VerificationRuntime } from "./fixture.js"
@@ -23,7 +23,11 @@ const host = "127.0.0.1:4317"
 const journals: SqliteJournal[] = []
 const servers: Awaited<ReturnType<typeof createRunnerServer>>[] = []
 
-async function setup(clock?: () => Date, configuredOrigin = origin) {
+async function setup(
+  clock?: () => Date,
+  configuredOrigin = origin,
+  missionExecutor?: MissionExecutor,
+) {
   const journal = new SqliteJournal({ path: ":memory:", ...(clock ? { clock } : {}) })
   journals.push(journal)
   const store = new RunnerStore({
@@ -38,6 +42,7 @@ async function setup(clock?: () => Date, configuredOrigin = origin) {
     store,
     sessions,
     exact_origin: configuredOrigin,
+    ...(missionExecutor ? { mission_executor: missionExecutor } : {}),
     stream_poll_interval_ms: 5,
     stream_heartbeat_interval_ms: 25,
   })
@@ -313,6 +318,70 @@ describe("runner HTTP boundary", () => {
     expect(Schema.Check(MissionListPageSchema, queue.json())).toBe(true)
     expect(queue.json().total_count).toBe(1)
     expect(queue.json().items[0].subject_references[0].value.value).toBe("release-47")
+  })
+
+  it("runs an admitted mission through the configured executor", async () => {
+    const run = vi.fn(async () => undefined)
+    const { app, sessions } = await setup(undefined, origin, { run })
+    const session = await authenticate(app, sessions)
+    const headers = {
+      host,
+      origin,
+      cookie: session.cookie,
+      "x-idemantis-csrf": session.csrf,
+    }
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/missions",
+      headers,
+      payload: {
+        definition_digest: VerificationRuntime.definition_digest,
+        input: { subject: "release-47", summary: "Verify the deployment record" },
+      },
+    })
+    const runId = created.json().summary.run_id
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/run`,
+      headers,
+    })
+
+    expect(response.statusCode).toBe(200)
+    expect(Schema.Check(MissionDetailSchema, response.json())).toBe(true)
+    expect(run).toHaveBeenCalledExactlyOnceWith(runId)
+  })
+
+  it("rejects execution when the server has no mission executor", async () => {
+    const { app, sessions } = await setup()
+    const session = await authenticate(app, sessions)
+    const headers = {
+      host,
+      origin,
+      cookie: session.cookie,
+      "x-idemantis-csrf": session.csrf,
+    }
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/missions",
+      headers,
+      payload: {
+        definition_digest: VerificationRuntime.definition_digest,
+        input: { subject: "release-47", summary: "Verify the deployment record" },
+      },
+    })
+
+    const response = await app.inject({
+      method: "POST",
+      url: `/api/missions/${created.json().summary.run_id}/run`,
+      headers,
+    })
+
+    expect(response.statusCode).toBe(503)
+    expect(response.json().error).toMatchObject({
+      code: "RUNNER_UNAVAILABLE",
+      message: "Mission execution is not configured",
+    })
   })
 
   it("prepares and submits an intervention through the authenticated boundary", async () => {

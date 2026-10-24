@@ -106,6 +106,50 @@ const runtime: MissionRuntimeDefinition = {
   execution_binding_digest: `sha256:${"b".repeat(64)}`,
 }
 
+const sequentialObservationMission = defineMission({
+  id: "vehicle-pickup-delivery",
+  version: "1.0.0",
+  input: Type.Object(
+    { route: Type.String(), vehicle: Type.String() },
+    { additionalProperties: false },
+  ),
+  initial: "dispatchVehicle",
+  states: {
+    dispatchVehicle: effectState({
+      operation: dispatch,
+      effectSlot: "dispatch",
+      input: mapFields({ route: fromInput("route") }),
+      retry: safeRetry({ attempts: 2, backoffMs: 100 }),
+      onAccepted: "waitForPickup",
+      onSettled: "waitForPickup",
+      onFailed: "failed",
+      onUncertain: "failed",
+    }),
+    waitForPickup: waitForObservation({
+      observationType: "vehicle.pickup_confirmed",
+      schemaVersion: 1,
+      correlation: { kind: "effect", effectState: "dispatchVehicle" },
+      timeout: { afterMs: 1_000, onTimeout: "failed" },
+      onObserved: "waitForArrival",
+    }),
+    waitForArrival: waitForObservation({
+      observationType: "vehicle.arrived",
+      schemaVersion: 1,
+      correlation: { kind: "effect", effectState: "dispatchVehicle" },
+      timeout: { afterMs: 1_000, onTimeout: "failed" },
+      onObserved: "complete",
+    }),
+    complete: finalState("completed"),
+    failed: finalState("failed"),
+  },
+})
+
+const sequentialObservationRuntime: MissionRuntimeDefinition = {
+  manifest: sequentialObservationMission.manifest,
+  definition_digest: sequentialObservationMission.definitionDigest,
+  execution_binding_digest: `sha256:${"d".repeat(64)}`,
+}
+
 const subjectMission = defineMission({
   id: "subject-wait",
   version: "1.0.0",
@@ -335,6 +379,81 @@ describe("deterministic reducer", () => {
     expect(lateAcknowledgement.state.status).toBe("completed")
     expect(lateAcknowledgement.state.current_sequence).toBe(3)
     expect(lateAcknowledgement.commands).toEqual([])
+  })
+
+  it("retains effect correlation across sequential observation waits", () => {
+    const first = reduceMission(
+      sequentialObservationRuntime,
+      null,
+      acceptedEvent(1, "mission.admitted", {
+        definition_digest: sequentialObservationRuntime.definition_digest,
+        execution_binding_digest: sequentialObservationRuntime.execution_binding_digest,
+        input: { route: "dock-a", vehicle: "vehicle-7" },
+      }),
+    )
+    const effectId = first.state.active_effect_id as string
+    const acknowledged = reduceMission(
+      sequentialObservationRuntime,
+      first.state,
+      issueResult(2, effectId, "accepted"),
+    )
+    const pickedUp = reduceMission(
+      sequentialObservationRuntime,
+      acknowledged.state,
+      acceptedEvent(3, "observation.recorded", {
+        observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FBA",
+        effect_id: effectId,
+        observation_type: "vehicle.pickup_confirmed",
+        payload: {},
+      }),
+    )
+    const arrived = reduceMission(
+      sequentialObservationRuntime,
+      pickedUp.state,
+      acceptedEvent(4, "observation.recorded", {
+        observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FBB",
+        effect_id: effectId,
+        observation_type: "vehicle.arrived",
+        payload: {},
+      }),
+    )
+
+    expect(pickedUp.state.current_state).toBe("waitForArrival")
+    expect(pickedUp.state.active_effect_id).toBe(effectId)
+    expect(arrived.state.current_state).toBe("complete")
+    expect(arrived.state.status).toBe("completed")
+  })
+
+  it("retains effect correlation when completion enters an observation wait", () => {
+    const first = reduceMission(
+      sequentialObservationRuntime,
+      null,
+      acceptedEvent(1, "mission.admitted", {
+        definition_digest: sequentialObservationRuntime.definition_digest,
+        execution_binding_digest: sequentialObservationRuntime.execution_binding_digest,
+        input: { route: "dock-a", vehicle: "vehicle-7" },
+      }),
+    )
+    const effectId = first.state.active_effect_id as string
+    const completed = reduceMission(
+      sequentialObservationRuntime,
+      first.state,
+      issueResult(2, effectId, "completed"),
+    )
+    const observed = reduceMission(
+      sequentialObservationRuntime,
+      completed.state,
+      acceptedEvent(3, "observation.recorded", {
+        observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FBC",
+        effect_id: effectId,
+        observation_type: "vehicle.pickup_confirmed",
+        payload: {},
+      }),
+    )
+
+    expect(completed.state.current_state).toBe("waitForPickup")
+    expect(completed.state.active_effect_id).toBe(effectId)
+    expect(observed.state.current_state).toBe("waitForArrival")
   })
 
   it("settles a subject-correlated wait without an effect identity", () => {

@@ -24,9 +24,14 @@ export interface RunnerServerOptions {
   store: RunnerStore
   sessions: SessionAuthority
   exact_origin: string
+  mission_executor?: MissionExecutor
   secure_cookie?: boolean
   stream_poll_interval_ms?: number
   stream_heartbeat_interval_ms?: number
+}
+
+export interface MissionExecutor {
+  run(runId: RunId): Promise<void>
 }
 
 type UnknownObject = Record<string, unknown>
@@ -381,6 +386,18 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     })
     reply.status(201)
     return detail
+  })
+
+  app.post("/api/missions/:runId/run", async (request) => {
+    requireMutation(request, options.sessions, options.exact_origin)
+    const params = object(request.params)
+    const selectedRunId = runId(field(params, "runId"))
+    options.store.missionDetail(selectedRunId)
+    if (!options.mission_executor) {
+      throw new TransportError("RUNNER_UNAVAILABLE", "Mission execution is not configured", 503)
+    }
+    await options.mission_executor.run(selectedRunId)
+    return options.store.missionDetail(selectedRunId)
   })
 
   app.get("/api/missions", async (request) => {

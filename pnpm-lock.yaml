@@ -231,9 +231,15 @@ importers:
       "@fastify/rate-limit":
         specifier: 11.2.1
         version: 11.2.1
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../../packages/adapter-kit
       "@idemantis/contracts":
         specifier: workspace:*
         version: link:../../packages/contracts
+      "@idemantis/dispatcher":
+        specifier: workspace:*
+        version: link:../../packages/dispatcher
       "@idemantis/engine":
         specifier: workspace:*
         version: link:../../packages/engine
@@ -243,6 +249,9 @@ importers:
       "@idemantis/sdk":
         specifier: workspace:*
         version: link:../../packages/sdk
+      "@idemantis/simulator":
+        specifier: workspace:*
+        version: link:../../packages/simulator
       "@idemantis/transport":
         specifier: workspace:*
         version: link:../../packages/transport
