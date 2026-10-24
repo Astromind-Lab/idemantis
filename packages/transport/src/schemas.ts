@@ -318,6 +318,73 @@ export const MissionDetailSchema = Type.Object(
   { additionalProperties: false },
 )
 
+export const MissionExecutionActivitySchema = Type.Union([
+  Type.Literal("idle"),
+  Type.Literal("running"),
+  Type.Literal("failed"),
+  Type.Literal("terminal"),
+])
+
+export const MissionExecutionStatusSchema = Type.Union([
+  Type.Object(
+    {
+      schema_version: Type.Literal(ApiSchemaVersion),
+      run_id: RunIdSchema,
+      activity: Type.Literal("idle"),
+      updated_at: TimestampSchema,
+      started_at: Type.Optional(TimestampSchema),
+      finished_at: Type.Optional(TimestampSchema),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      schema_version: Type.Literal(ApiSchemaVersion),
+      run_id: RunIdSchema,
+      activity: Type.Literal("running"),
+      updated_at: TimestampSchema,
+      started_at: TimestampSchema,
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      schema_version: Type.Literal(ApiSchemaVersion),
+      run_id: RunIdSchema,
+      activity: Type.Literal("failed"),
+      updated_at: TimestampSchema,
+      started_at: TimestampSchema,
+      finished_at: TimestampSchema,
+      failure_code: Type.Literal("EXECUTION_FAILED"),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      schema_version: Type.Literal(ApiSchemaVersion),
+      run_id: RunIdSchema,
+      activity: Type.Literal("terminal"),
+      updated_at: TimestampSchema,
+      started_at: Type.Optional(TimestampSchema),
+      finished_at: Type.Optional(TimestampSchema),
+    },
+    { additionalProperties: false },
+  ),
+])
+
+export const MissionExecutionStartSchema = Type.Object(
+  {
+    schema_version: Type.Literal(ApiSchemaVersion),
+    disposition: Type.Union([
+      Type.Literal("started"),
+      Type.Literal("already_running"),
+      Type.Literal("already_terminal"),
+    ]),
+    execution: MissionExecutionStatusSchema,
+  },
+  { additionalProperties: false },
+)
+
 export const TimelineEntrySchema = Type.Object(
   {
     sequence: Type.Integer({ minimum: 1 }),
@@ -601,6 +668,9 @@ export type GraphArtifact = Type.Static<typeof GraphArtifactSchema>
 export type MissionProjection = Type.Static<typeof MissionProjectionSchema>
 export type InterventionDescriptor = Type.Static<typeof InterventionDescriptorSchema>
 export type MissionDetail = Type.Static<typeof MissionDetailSchema>
+export type MissionExecutionActivity = Type.Static<typeof MissionExecutionActivitySchema>
+export type MissionExecutionStatus = Type.Static<typeof MissionExecutionStatusSchema>
+export type MissionExecutionStart = Type.Static<typeof MissionExecutionStartSchema>
 export type TimelineEntry = Type.Static<typeof TimelineEntrySchema>
 export type TimelinePage = Type.Static<typeof TimelinePageSchema>
 export type EffectSummary = Type.Static<typeof EffectSummarySchema>

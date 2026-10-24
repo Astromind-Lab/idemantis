@@ -34,7 +34,14 @@ import {
   type TargetSnapshot,
   VehicleSimulator,
 } from "@idemantis/simulator"
-import type { EffectPage, MissionDetail, TimelinePage } from "@idemantis/transport"
+import {
+  ApiSchemaVersion,
+  type EffectPage,
+  type MissionDetail,
+  type MissionExecutionStart,
+  type MissionExecutionStatus,
+  type TimelinePage,
+} from "@idemantis/transport"
 import Schema from "typebox/schema"
 import { ulid } from "ulid"
 import { RunnerExecution } from "./execution.js"
@@ -63,6 +70,15 @@ interface ReferenceSession {
   handoff_recorded: boolean
 }
 
+interface ReferenceExecutionJob {
+  activity: "running" | "idle" | "failed"
+  started_at: string
+  updated_at: string
+  promise: Promise<void>
+  finished_at?: string
+  failure_code?: "EXECUTION_FAILED"
+}
+
 export interface ReferenceMissionRunnerOptions {
   journal: SqliteJournal
   store: RunnerStore
@@ -70,6 +86,7 @@ export interface ReferenceMissionRunnerOptions {
   fault_schedule?: readonly FaultRule[]
   clock?: Clock
   maximum_steps?: number
+  transition_delay_ms?: number
 }
 
 export interface ReferenceRunReport {
@@ -120,6 +137,16 @@ function valueField(value: JsonObject, key: string): JsonValue | undefined {
 
 function equivalent(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
   return canonicalJson(left ?? null) === canonicalJson(right ?? null)
+}
+
+function defer(): Promise<void> {
+  return new Promise((resolvePromise) => setImmediate(resolvePromise))
+}
+
+function delay(duration: number): Promise<void> {
+  return duration === 0
+    ? Promise.resolve()
+    : new Promise((resolvePromise) => setTimeout(resolvePromise, duration))
 }
 
 class RecoveryClock implements Clock {
@@ -204,8 +231,10 @@ export class ReferenceMissionRunner {
   readonly #faultSchedule: readonly FaultRule[]
   readonly #clock: Clock
   readonly #maximumSteps: number
+  readonly #transitionDelayMs: number
   readonly #runtime: MissionRuntimeDefinition
   readonly #sessions = new Map<RunId, ReferenceSession>()
+  readonly #executions = new Map<RunId, ReferenceExecutionJob>()
   readonly #identities = new SecureIdentityFactory()
 
   constructor(options: ReferenceMissionRunnerOptions) {
@@ -215,8 +244,16 @@ export class ReferenceMissionRunner {
     this.#faultSchedule = structuredClone(options.fault_schedule ?? [])
     this.#clock = options.clock ?? new SystemClock()
     this.#maximumSteps = options.maximum_steps ?? 1_000
+    this.#transitionDelayMs = options.transition_delay_ms ?? 0
     if (!Number.isSafeInteger(this.#maximumSteps) || this.#maximumSteps < 1) {
       throw new RangeError("maximum_steps must be a positive safe integer")
+    }
+    if (
+      !Number.isSafeInteger(this.#transitionDelayMs) ||
+      this.#transitionDelayMs < 0 ||
+      this.#transitionDelayMs > 60_000
+    ) {
+      throw new RangeError("transition_delay_ms must be an integer from 0 through 60000")
     }
     const kernel = new SimulationKernel({
       seed: this.#seed,
@@ -246,7 +283,127 @@ export class ReferenceMissionRunner {
     }
   }
 
+  start(runId: RunId): MissionExecutionStart {
+    const mission = this.#journal.getMission(runId)
+    if (mission.state.terminal_outcome) {
+      return {
+        schema_version: ApiSchemaVersion,
+        disposition: "already_terminal",
+        execution: this.executionStatus(runId),
+      }
+    }
+    const current = this.#executions.get(runId)
+    if (current?.activity === "running") {
+      return {
+        schema_version: ApiSchemaVersion,
+        disposition: "already_running",
+        execution: this.executionStatus(runId),
+      }
+    }
+    const startedAt = this.#clock.now().toISOString()
+    const job: ReferenceExecutionJob = {
+      activity: "running",
+      started_at: startedAt,
+      updated_at: startedAt,
+      promise: Promise.resolve(),
+    }
+    const execution = defer().then(() => this.execute(runId))
+    job.promise = execution
+    this.#executions.set(runId, job)
+    void execution.then(
+      () => {
+        const finishedAt = this.#clock.now().toISOString()
+        job.activity = "idle"
+        job.updated_at = finishedAt
+        job.finished_at = finishedAt
+      },
+      () => {
+        const finishedAt = this.#clock.now().toISOString()
+        job.activity = "failed"
+        job.updated_at = finishedAt
+        job.finished_at = finishedAt
+        job.failure_code = "EXECUTION_FAILED"
+      },
+    )
+    return {
+      schema_version: ApiSchemaVersion,
+      disposition: "started",
+      execution: this.executionStatus(runId),
+    }
+  }
+
+  executionStatus(runId: RunId): MissionExecutionStatus {
+    const mission = this.#journal.getMission(runId)
+    const job = this.#executions.get(runId)
+    if (mission.state.terminal_outcome) {
+      return {
+        schema_version: ApiSchemaVersion,
+        run_id: runId,
+        activity: "terminal",
+        updated_at: mission.updated_at,
+        ...(job ? { started_at: job.started_at } : {}),
+        ...(job?.finished_at ? { finished_at: job.finished_at } : {}),
+      }
+    }
+    if (!job) {
+      return {
+        schema_version: ApiSchemaVersion,
+        run_id: runId,
+        activity: "idle",
+        updated_at: mission.updated_at,
+      }
+    }
+    if (job.activity === "running") {
+      return {
+        schema_version: ApiSchemaVersion,
+        run_id: runId,
+        activity: "running",
+        updated_at: job.updated_at,
+        started_at: job.started_at,
+      }
+    }
+    if (job.activity === "failed") {
+      if (!job.finished_at || !job.failure_code) {
+        throw new Error(`Execution state is incomplete for mission ${runId}`)
+      }
+      return {
+        schema_version: ApiSchemaVersion,
+        run_id: runId,
+        activity: "failed",
+        updated_at: job.updated_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
+        failure_code: job.failure_code,
+      }
+    }
+    return {
+      schema_version: ApiSchemaVersion,
+      run_id: runId,
+      activity: "idle",
+      updated_at: job.updated_at,
+      started_at: job.started_at,
+      ...(job.finished_at ? { finished_at: job.finished_at } : {}),
+    }
+  }
+
+  async waitForExecution(runId: RunId): Promise<void> {
+    await this.#executions.get(runId)?.promise
+  }
+
+  async waitForExecutions(): Promise<void> {
+    await Promise.all([...this.#executions.values()].map((execution) => execution.promise))
+  }
+
   async run(runId: RunId): Promise<void> {
+    const current = this.#executions.get(runId)
+    if (current?.activity === "running") {
+      return current.promise
+    }
+    this.#executions.delete(runId)
+    return this.execute(runId)
+  }
+
+  private async execute(runId: RunId): Promise<void> {
     const stored = this.#journal.getMission(runId)
     let session = this.#sessions.get(runId)
     if (!session) {
@@ -267,19 +424,25 @@ export class ReferenceMissionRunner {
       return
     }
     for (let step = 0; step < this.#maximumSteps; step += 1) {
-      await session.execution.drain(runId, this.#maximumSteps)
+      const drained = await session.execution.drain(runId, this.#maximumSteps)
       if (this.#journal.getMission(runId).state.terminal_outcome) {
         return
       }
+      if (drained.dispatches > 0 || drained.timers > 0) {
+        await delay(this.#transitionDelayMs)
+      }
       if (this.recordObservations(runId, session)) {
+        await delay(this.#transitionDelayMs)
         continue
       }
       const current = this.#journal.getMission(runId).state.current_state
       if (current === "await_handoff" && !session.handoff_recorded) {
         this.recordHandoff(runId, session)
+        await delay(this.#transitionDelayMs)
         continue
       }
       if (await session.kernel.runNext()) {
+        await delay(this.#transitionDelayMs)
         continue
       }
       return

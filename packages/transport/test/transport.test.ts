@@ -6,12 +6,14 @@ import Schema from "typebox/schema"
 import { describe, expect, it } from "vitest"
 import {
   CursorCodec,
-  GraphArtifactSchema,
-  MissionListPageSchema,
-  TransportError,
   compareMissionPriority,
+  GraphArtifactSchema,
   graphArtifact,
+  MissionExecutionStartSchema,
+  MissionExecutionStatusSchema,
+  MissionListPageSchema,
   queueBucketFor,
+  TransportError,
   validateInterventionInput,
   validateInterventionSchema,
   verifyGraphArtifact,
@@ -85,6 +87,46 @@ describe("transport contracts", () => {
     expect(Schema.Check(GraphArtifactSchema, first)).toBe(true)
     expect(verifyGraphArtifact(first)).toBe(true)
     expect(verifyGraphArtifact({ ...first, entry_state_id: "changed" })).toBe(false)
+  })
+
+  it("validates asynchronous execution lifecycle responses", () => {
+    const execution = {
+      schema_version: 1,
+      run_id: runId,
+      activity: "running",
+      updated_at: "2026-10-24T00:00:00.000Z",
+      started_at: "2026-10-24T00:00:00.000Z",
+    }
+
+    expect(Schema.Check(MissionExecutionStatusSchema, execution)).toBe(true)
+    expect(
+      Schema.Check(MissionExecutionStartSchema, {
+        schema_version: 1,
+        disposition: "started",
+        execution,
+      }),
+    ).toBe(true)
+    expect(
+      Schema.Check(MissionExecutionStatusSchema, {
+        ...execution,
+        failure_code: "EXECUTION_FAILED",
+      }),
+    ).toBe(false)
+    expect(
+      Schema.Check(MissionExecutionStatusSchema, {
+        ...execution,
+        activity: "failed",
+        failure_code: "provider_stack_trace",
+      }),
+    ).toBe(false)
+    expect(
+      Schema.Check(MissionExecutionStatusSchema, {
+        ...execution,
+        activity: "failed",
+        finished_at: "2026-10-24T00:00:01.000Z",
+        failure_code: "EXECUTION_FAILED",
+      }),
+    ).toBe(true)
   })
 
   it("enforces the bounded intervention form subset", () => {

@@ -1,15 +1,18 @@
 import { createServer } from "node:net"
+import type { RunId } from "@idemantis/contracts"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import {
   InterventionReceiptPageSchema,
   InterventionReceiptSchema,
   MissionDetailSchema,
+  MissionExecutionStartSchema,
+  MissionExecutionStatusSchema,
   MissionListPageSchema,
   PreparedInterventionPageSchema,
   PreparedInterventionSchema,
   SessionDocumentSchema,
-  StreamEnvelopeSchema,
   type StreamEnvelope,
+  StreamEnvelopeSchema,
 } from "@idemantis/transport"
 import Schema from "typebox/schema"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -352,7 +355,7 @@ describe("runner HTTP boundary", () => {
     expect(run).toHaveBeenCalledExactlyOnceWith(runId)
   })
 
-  it("rejects execution when the server has no mission executor", async () => {
+  it("rejects execution routes when the server has no mission executor", async () => {
     const { app, sessions } = await setup()
     const session = await authenticate(app, sessions)
     const headers = {
@@ -371,10 +374,21 @@ describe("runner HTTP boundary", () => {
       },
     })
 
+    const runId = created.json().summary.run_id
     const response = await app.inject({
       method: "POST",
-      url: `/api/missions/${created.json().summary.run_id}/run`,
+      url: `/api/missions/${runId}/run`,
       headers,
+    })
+    const started = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/start`,
+      headers,
+    })
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}/execution`,
+      headers: { host, cookie: session.cookie },
     })
 
     expect(response.statusCode).toBe(503)
@@ -382,6 +396,72 @@ describe("runner HTTP boundary", () => {
       code: "RUNNER_UNAVAILABLE",
       message: "Mission execution is not configured",
     })
+    expect(started.statusCode).toBe(503)
+    expect(started.json().error).toMatchObject({
+      code: "RUNNER_UNAVAILABLE",
+      message: "Asynchronous execution is not configured",
+    })
+    expect(status.statusCode).toBe(503)
+    expect(status.json().error).toMatchObject({
+      code: "RUNNER_UNAVAILABLE",
+      message: "Execution status is not configured",
+    })
+  })
+
+  it("starts execution asynchronously and exposes its status", async () => {
+    const statusFor = (runId: RunId) => ({
+      schema_version: 1 as const,
+      run_id: runId,
+      activity: "running" as const,
+      updated_at: "2026-10-24T00:00:00.000Z",
+      started_at: "2026-10-24T00:00:00.000Z",
+    })
+    const start = vi.fn((runId: RunId) => ({
+      schema_version: 1 as const,
+      disposition: "started" as const,
+      execution: statusFor(runId),
+    }))
+    const executionStatus = vi.fn((runId: RunId) => statusFor(runId))
+    const { app, sessions } = await setup(undefined, origin, {
+      run: vi.fn(async () => undefined),
+      start,
+      executionStatus,
+    })
+    const session = await authenticate(app, sessions)
+    const headers = {
+      host,
+      origin,
+      cookie: session.cookie,
+      "x-idemantis-csrf": session.csrf,
+    }
+    const created = await app.inject({
+      method: "POST",
+      url: "/api/missions",
+      headers,
+      payload: {
+        definition_digest: VerificationRuntime.definition_digest,
+        input: { subject: "release-47", summary: "Verify the deployment record" },
+      },
+    })
+    const runId = created.json().summary.run_id as string
+
+    const started = await app.inject({
+      method: "POST",
+      url: `/api/missions/${runId}/start`,
+      headers,
+    })
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}/execution`,
+      headers: { host, cookie: session.cookie },
+    })
+
+    expect(started.statusCode).toBe(202)
+    expect(Schema.Check(MissionExecutionStartSchema, started.json())).toBe(true)
+    expect(status.statusCode).toBe(200)
+    expect(Schema.Check(MissionExecutionStatusSchema, status.json())).toBe(true)
+    expect(start).toHaveBeenCalledExactlyOnceWith(runId)
+    expect(executionStatus).toHaveBeenCalledExactlyOnceWith(runId)
   })
 
   it("prepares and submits an intervention through the authenticated boundary", async () => {

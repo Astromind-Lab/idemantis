@@ -1,20 +1,22 @@
 import { randomUUID } from "node:crypto"
-import type { ClientRequestId, EffectId, JsonObject, RunId, SourceId } from "@idemantis/contracts"
-import { ClientRequestIdSchema, EffectIdSchema, RunIdSchema } from "@idemantis/contracts"
 import cookie from "@fastify/cookie"
 import helmet from "@fastify/helmet"
 import rateLimit from "@fastify/rate-limit"
-import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify"
-import Schema from "typebox/schema"
+import type { ClientRequestId, EffectId, JsonObject, RunId, SourceId } from "@idemantis/contracts"
+import { ClientRequestIdSchema, EffectIdSchema, RunIdSchema } from "@idemantis/contracts"
+import type { MissionRuntimeDefinition } from "@idemantis/engine"
 import {
   ApiSchemaVersion,
   type DiscardInterventionRequest,
+  type MissionExecutionStart,
+  type MissionExecutionStatus,
   type PrepareInterventionRequest,
   type StreamEnvelope,
   type SubmitInterventionRequest,
   TransportError,
 } from "@idemantis/transport"
-import type { MissionRuntimeDefinition } from "@idemantis/engine"
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify"
+import Schema from "typebox/schema"
 import type { SessionAuthority } from "./session.js"
 import type { RunnerStore } from "./store.js"
 
@@ -32,6 +34,8 @@ export interface RunnerServerOptions {
 
 export interface MissionExecutor {
   run(runId: RunId): Promise<void>
+  start?(runId: RunId): MissionExecutionStart
+  executionStatus?(runId: RunId): MissionExecutionStatus
 }
 
 type UnknownObject = Record<string, unknown>
@@ -398,6 +402,34 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     }
     await options.mission_executor.run(selectedRunId)
     return options.store.missionDetail(selectedRunId)
+  })
+
+  app.post("/api/missions/:runId/start", async (request, reply) => {
+    requireMutation(request, options.sessions, options.exact_origin)
+    const params = object(request.params)
+    const selectedRunId = runId(field(params, "runId"))
+    options.store.missionDetail(selectedRunId)
+    if (!options.mission_executor?.start) {
+      throw new TransportError(
+        "RUNNER_UNAVAILABLE",
+        "Asynchronous execution is not configured",
+        503,
+      )
+    }
+    const started = options.mission_executor.start(selectedRunId)
+    reply.status(started.disposition === "started" ? 202 : 200)
+    return started
+  })
+
+  app.get("/api/missions/:runId/execution", async (request) => {
+    authenticated(request, options.sessions)
+    const params = object(request.params)
+    const selectedRunId = runId(field(params, "runId"))
+    options.store.missionDetail(selectedRunId)
+    if (!options.mission_executor?.executionStatus) {
+      throw new TransportError("RUNNER_UNAVAILABLE", "Execution status is not configured", 503)
+    }
+    return options.mission_executor.executionStatus(selectedRunId)
   })
 
   app.get("/api/missions", async (request) => {
