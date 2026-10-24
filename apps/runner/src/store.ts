@@ -1,10 +1,13 @@
 import { randomBytes } from "node:crypto"
 import {
   DigestSchema,
+  canonicalJson,
+  type ClientRequestId,
   type EffectId,
   type JsonObject,
   type JsonValue,
   type RunId,
+  type SourceId,
   sha256Digest,
 } from "@idemantis/contracts"
 import { type MissionRuntimeDefinition, reduceMission, replayMission } from "@idemantis/engine"
@@ -20,16 +23,25 @@ import {
   type AttentionReason,
   CursorCodec,
   compareMissionPriority,
+  type DiscardInterventionRequest,
+  DiscardInterventionRequestSchema,
   type EffectDetail,
   type EffectPage,
   type EffectSummary,
   graphArtifact,
+  type InterventionDescriptor,
+  type InterventionReceipt,
+  type InterventionReceiptPage,
   type MissionDetail,
   type MissionListPage,
   type MissionListQuery,
   MissionListQuerySchema,
   type MissionProjection,
   type MissionSummary,
+  type PrepareInterventionRequest,
+  PrepareInterventionRequestSchema,
+  type PreparedIntervention,
+  type PreparedInterventionPage,
   type ProtectedValue,
   queueBucketFor,
   type ReplayResult,
@@ -38,6 +50,10 @@ import {
   type TimelineEntry,
   type TimelinePage,
   TransportError,
+  type SubmitInterventionRequest,
+  SubmitInterventionRequestSchema,
+  validateInterventionInput,
+  validateInterventionSchema,
 } from "@idemantis/transport"
 import Schema from "typebox/schema"
 import { ulid } from "ulid"
@@ -64,6 +80,7 @@ export interface RunnerStoreOptions {
   cursor_lifetime_ms?: number
   clock?: () => Date
   id?: () => string
+  intervention_lifetime_ms?: number
 }
 
 export interface RegisterDefinitionOptions {
@@ -89,6 +106,14 @@ function attentionReason(
   effects: ReturnType<SqliteJournal["listEffects"]>,
   ownership: ReturnType<SqliteJournal["getOwnership"]>,
 ): AttentionReason | undefined {
+  const current = mission.runtime.manifest.states[mission.state.current_state]
+  if (current?.kind === "operator_wait") {
+    return {
+      code: "OPERATOR_DECISION_REQUIRED",
+      label: current.reason,
+      severity: "warning",
+    }
+  }
   if (mission.state.status === "unresolved") {
     return { code: "MISSION_UNRESOLVED", label: "Mission outcome unresolved", severity: "danger" }
   }
@@ -180,12 +205,17 @@ export class RunnerStore {
   readonly #cursor: CursorCodec
   readonly #clock: () => Date
   readonly #id: () => string
+  readonly #interventionLifetimeMs: number
   readonly #definitions = new Map<string, DefinitionRegistration>()
 
   constructor(options: RunnerStoreOptions) {
     this.#journal = options.journal
     this.#clock = options.clock ?? (() => new Date())
     this.#id = options.id ?? ulid
+    this.#interventionLifetimeMs = options.intervention_lifetime_ms ?? 15 * 60_000
+    if (!Number.isSafeInteger(this.#interventionLifetimeMs) || this.#interventionLifetimeMs < 1) {
+      throw new RangeError("Intervention lifetime must be a positive safe integer")
+    }
     this.#cursor = new CursorCodec({
       secret: options.cursor_secret ?? randomBytes(32),
       ...(options.cursor_lifetime_ms !== undefined
@@ -220,6 +250,23 @@ export class RunnerStore {
       cursor,
       "Operations revision",
       1,
+    )
+  }
+
+  receiptStreamPosition(
+    runId: RunId,
+    actorId: SourceId,
+    afterRevision: number | undefined,
+    cursor?: string,
+  ): number {
+    this.mission(runId)
+    return this.streamPosition(
+      `receipts:${runId}:${actorId}`,
+      { run_id: runId, actor_id: actorId },
+      this.#journal.interventionReceiptRevision(runId, actorId),
+      afterRevision,
+      cursor,
+      "Receipt revision",
     )
   }
 
@@ -269,6 +316,41 @@ export class RunnerStore {
     ]
   }
 
+  receiptStreamBatch(
+    runId: RunId,
+    actorId: SourceId,
+    afterRevision: number,
+    limit = 100,
+  ): StreamEnvelope[] {
+    const current = this.#journal.interventionReceiptRevision(runId, actorId)
+    this.assertStreamPosition(afterRevision, current, "Receipt revision")
+    return this.#journal
+      .listReceiptUpdatesAfter(runId, actorId, afterRevision, limit)
+      .map((update) => {
+        const receipt: InterventionReceipt = {
+          schema_version: ApiSchemaVersion,
+          ...update.receipt,
+        }
+        const body = {
+          run_id: runId,
+          client_request_id: update.client_request_id,
+          receipt_revision: update.revision,
+          receipt,
+        }
+        return {
+          stream_event_id: streamEventId({ kind: "receipt", ...body }),
+          schema_version: StreamSchemaVersion,
+          resume_cursor: this.streamCursor(
+            `receipts:${runId}:${actorId}`,
+            { run_id: runId, actor_id: actorId },
+            update.revision,
+          ),
+          kind: "receipt" as const,
+          body,
+        }
+      })
+  }
+
   missionStreamHeartbeat(runId: RunId, sequence: number): StreamEnvelope {
     this.assertStreamPosition(
       sequence,
@@ -283,6 +365,19 @@ export class RunnerStore {
     return this.heartbeat("operations", {}, revision)
   }
 
+  receiptStreamHeartbeat(runId: RunId, actorId: SourceId, revision: number): StreamEnvelope {
+    this.assertStreamPosition(
+      revision,
+      this.#journal.interventionReceiptRevision(runId, actorId),
+      "Receipt revision",
+    )
+    return this.heartbeat(
+      `receipts:${runId}:${actorId}`,
+      { run_id: runId, actor_id: actorId },
+      revision,
+    )
+  }
+
   registerDefinition(
     runtime: MissionRuntimeDefinition,
     options: RegisterDefinitionOptions = {},
@@ -294,6 +389,14 @@ export class RunnerStore {
       sha256Digest(runtime.manifest as unknown as JsonObject) !== runtime.definition_digest
     ) {
       throw new TransportError("INVALID_REQUEST", "Mission definition is invalid", 422)
+    }
+    for (const state of Object.values(runtime.manifest.states)) {
+      if (state.kind !== "operator_wait") {
+        continue
+      }
+      for (const action of state.actions) {
+        validateInterventionSchema(action.input_schema)
+      }
     }
     const keys = [...new Set(options.subject_reference_keys ?? [])]
     if (keys.length > 16 || keys.some((key) => key.length < 1 || key.length > 64)) {
@@ -405,7 +508,7 @@ export class RunnerStore {
       ...(timers[0] ? { deadline: timers[0].due_at } : {}),
       definition_digest: mission.runtime.definition_digest,
       execution_binding_digest: mission.runtime.execution_binding_digest,
-      valid_interventions: [],
+      valid_interventions: this.interventionDescriptors(mission),
       graph: graphArtifact(mission.runtime.manifest, mission.runtime.definition_digest),
     }
   }
@@ -551,6 +654,345 @@ export class RunnerStore {
     }
   }
 
+  prepareIntervention(
+    runId: RunId,
+    actorId: SourceId,
+    request: PrepareInterventionRequest,
+  ): PreparedIntervention {
+    if (!Schema.Check(PrepareInterventionRequestSchema, request)) {
+      throw new TransportError("INVALID_REQUEST", "Intervention request is invalid", 422)
+    }
+    try {
+      const existing = this.#journal.getPreparedIntervention(runId, request.client_request_id)
+      if (
+        existing.actor_id !== actorId ||
+        existing.expected_sequence !== request.expected_sequence ||
+        existing.action_code !== request.action_code ||
+        existing.target !== request.target ||
+        canonicalJson(existing.normalized_input) !== canonicalJson(request.input) ||
+        existing.reason !== request.reason
+      ) {
+        throw new TransportError(
+          "CLIENT_REQUEST_ID_COLLISION",
+          "Client request ID is bound to different intervention content",
+          409,
+        )
+      }
+      return this.preparedIntervention(existing)
+    } catch (error) {
+      if (error instanceof TransportError) {
+        throw error
+      }
+      if (!(error instanceof JournalError) || error.code !== "INTERVENTION_INVALID") {
+        throw this.interventionError(error, runId)
+      }
+    }
+    const mission = this.mission(runId)
+    if (request.expected_sequence !== mission.state.current_sequence) {
+      throw new TransportError(
+        "STALE_SEQUENCE",
+        "Mission changed before intervention review",
+        409,
+        {
+          expected_sequence: request.expected_sequence,
+          current_sequence: mission.state.current_sequence,
+        },
+      )
+    }
+    const descriptor = this.interventionDescriptors(mission).find(
+      (candidate) =>
+        candidate.action_code === request.action_code && candidate.target === request.target,
+    )
+    if (!descriptor) {
+      throw new TransportError(
+        "ACTION_FORBIDDEN",
+        "Intervention is not available for the current mission state",
+        403,
+      )
+    }
+    validateInterventionInput(descriptor.input_schema, request.input)
+    if (descriptor.reason_required && !request.reason) {
+      throw new TransportError("INVALID_REQUEST", "Intervention reason is required", 422)
+    }
+    const event = {
+      event_id: `evt_${this.#id()}` as const,
+      run_id: runId,
+      type: "operator.intervention_submitted" as const,
+      schema_version: 1,
+      source: { kind: "operator" as const, source_id: actorId },
+      ownership_epoch: mission.state.ownership_epoch,
+      payload: {
+        client_request_id: request.client_request_id,
+        expected_sequence: request.expected_sequence,
+        action_code: request.action_code,
+        target: request.target,
+        input: structuredClone(request.input),
+        ...(request.reason ? { reason: request.reason } : {}),
+      },
+    }
+    try {
+      return this.preparedIntervention(
+        this.#journal.prepareIntervention(
+          event,
+          new Date(this.#clock().getTime() + this.#interventionLifetimeMs).toISOString(),
+        ),
+      )
+    } catch (error) {
+      throw this.interventionError(error, runId, request.expected_sequence)
+    }
+  }
+
+  submitIntervention(
+    runId: RunId,
+    actorId: SourceId,
+    request: SubmitInterventionRequest,
+  ): InterventionReceipt {
+    if (!Schema.Check(SubmitInterventionRequestSchema, request)) {
+      throw new TransportError("INVALID_REQUEST", "Intervention submission is invalid", 422)
+    }
+    this.assertInterventionActor(runId, request.client_request_id, actorId)
+    try {
+      const result = this.#journal.submitIntervention(
+        runId,
+        request.client_request_id,
+        request.proposal_digest,
+      )
+      if (result.status === "expired") {
+        throw new TransportError("INVALID_REQUEST", "Prepared intervention has expired", 409)
+      }
+      return { schema_version: ApiSchemaVersion, ...result.receipt }
+    } catch (error) {
+      if (error instanceof TransportError) {
+        throw error
+      }
+      throw this.interventionError(error, runId)
+    }
+  }
+
+  discardIntervention(
+    runId: RunId,
+    actorId: SourceId,
+    request: DiscardInterventionRequest,
+  ): PreparedIntervention {
+    if (!Schema.Check(DiscardInterventionRequestSchema, request)) {
+      throw new TransportError("INVALID_REQUEST", "Intervention discard request is invalid", 422)
+    }
+    this.assertInterventionActor(runId, request.client_request_id, actorId)
+    try {
+      return this.preparedIntervention(
+        this.#journal.discardIntervention(
+          runId,
+          request.client_request_id,
+          request.proposal_digest,
+        ),
+      )
+    } catch (error) {
+      throw this.interventionError(error, runId)
+    }
+  }
+
+  preparedInterventionById(
+    runId: RunId,
+    actorId: SourceId,
+    clientRequestId: ClientRequestId,
+  ): PreparedIntervention {
+    this.assertInterventionActor(runId, clientRequestId, actorId)
+    try {
+      return this.preparedIntervention(
+        this.#journal.getPreparedIntervention(runId, clientRequestId),
+      )
+    } catch (error) {
+      throw this.interventionError(error, runId)
+    }
+  }
+
+  interventionReceiptById(
+    runId: RunId,
+    actorId: SourceId,
+    clientRequestId: ClientRequestId,
+  ): InterventionReceipt {
+    this.assertInterventionActor(runId, clientRequestId, actorId)
+    try {
+      return {
+        schema_version: ApiSchemaVersion,
+        ...this.#journal.getInterventionReceipt(runId, clientRequestId),
+      }
+    } catch (error) {
+      throw this.interventionError(error, runId)
+    }
+  }
+
+  interventionActivity(
+    runId: RunId,
+    actorId: SourceId,
+    cursor?: string,
+    limit = 100,
+  ): PreparedInterventionPage {
+    this.assertPageLimit(limit)
+    this.mission(runId)
+    const revision = this.#journal.interventionIntentRevision(runId, actorId)
+    const query = { run_id: runId, actor_id: actorId }
+    const position = pagePosition(
+      this.#cursor,
+      cursor,
+      `intervention-activity:${runId}:${actorId}`,
+      revision,
+      query,
+    )
+    const cutoff = this.#clock().getTime() - 24 * 60 * 60_000
+    const items = this.#journal
+      .listPreparedInterventions(runId, actorId, revision)
+      .filter((record) => Date.parse(record.prepared_at) >= cutoff)
+      .map((record) => this.preparedIntervention(record))
+    const selected = items.slice(position, position + limit)
+    const nextPosition = position + selected.length
+    return {
+      schema_version: ApiSchemaVersion,
+      run_id: runId,
+      activity_revision: revision,
+      items: selected,
+      ...(nextPosition < items.length
+        ? {
+            next_cursor: this.#cursor.encode(
+              {
+                namespace: `intervention-activity:${runId}:${actorId}`,
+                revision,
+                query,
+              },
+              nextPosition,
+            ),
+          }
+        : {}),
+    }
+  }
+
+  interventionReceipts(
+    runId: RunId,
+    actorId: SourceId,
+    cursor?: string,
+    limit = 100,
+  ): InterventionReceiptPage {
+    this.assertPageLimit(limit)
+    this.mission(runId)
+    const revision = this.#journal.interventionReceiptRevision(runId, actorId)
+    const query = { run_id: runId, actor_id: actorId }
+    const position = pagePosition(
+      this.#cursor,
+      cursor,
+      `intervention-receipts:${runId}:${actorId}`,
+      revision,
+      query,
+    )
+    const items = this.#journal
+      .listInterventionReceipts(runId, actorId, revision)
+      .map((receipt) => ({ schema_version: ApiSchemaVersion, ...receipt }))
+    const selected = items.slice(position, position + limit)
+    const nextPosition = position + selected.length
+    return {
+      schema_version: ApiSchemaVersion,
+      run_id: runId,
+      receipt_revision: revision,
+      items: selected,
+      ...(nextPosition < items.length
+        ? {
+            next_cursor: this.#cursor.encode(
+              {
+                namespace: `intervention-receipts:${runId}:${actorId}`,
+                revision,
+                query,
+              },
+              nextPosition,
+            ),
+          }
+        : {}),
+    }
+  }
+
+  private preparedIntervention(
+    record: ReturnType<SqliteJournal["getPreparedIntervention"]>,
+  ): PreparedIntervention {
+    return {
+      schema_version: ApiSchemaVersion,
+      client_request_id: record.client_request_id,
+      actor_id: record.actor_id,
+      run_id: record.run_id,
+      expected_sequence: record.expected_sequence,
+      action_code: record.action_code,
+      target: record.target,
+      normalized_input: structuredClone(record.normalized_input),
+      ...(record.reason ? { reason: record.reason } : {}),
+      proposal_digest: record.proposal_digest,
+      prepared_at: record.prepared_at,
+      expires_at: record.expires_at,
+      state: record.state,
+      compatibility: record.compatibility,
+    }
+  }
+
+  private assertInterventionActor(
+    runId: RunId,
+    clientRequestId: ClientRequestId,
+    actorId: SourceId,
+  ): void {
+    try {
+      const prepared = this.#journal.getPreparedIntervention(runId, clientRequestId)
+      if (prepared.actor_id !== actorId) {
+        throw new TransportError("ACTION_FORBIDDEN", "Intervention is not available", 403)
+      }
+    } catch (error) {
+      if (error instanceof TransportError) {
+        throw error
+      }
+      throw this.interventionError(error, runId)
+    }
+  }
+
+  private assertPageLimit(limit: number): void {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+      throw new TransportError("INVALID_REQUEST", "Page limit must be from 1 through 100", 422)
+    }
+  }
+
+  private interventionError(
+    error: unknown,
+    runId: RunId,
+    expectedSequence?: number,
+  ): TransportError {
+    if (error instanceof TransportError) {
+      return error
+    }
+    if (error instanceof JournalError) {
+      if (error.code === "RUN_NOT_FOUND") {
+        return new TransportError("RUN_NOT_FOUND", `Mission ${runId} does not exist`, 404)
+      }
+      if (error.code === "INTERVENTION_COLLISION" || error.code === "PENDING_INPUT_COLLISION") {
+        return new TransportError(
+          "CLIENT_REQUEST_ID_COLLISION",
+          "Client request ID is bound to different intervention content",
+          409,
+        )
+      }
+      if (error.code === "INTERVENTION_INVALID" && expectedSequence !== undefined) {
+        const currentSequence = this.mission(runId).state.current_sequence
+        if (currentSequence !== expectedSequence) {
+          return new TransportError(
+            "STALE_SEQUENCE",
+            "Mission changed before intervention review",
+            409,
+            {
+              expected_sequence: expectedSequence,
+              current_sequence: currentSequence,
+            },
+          )
+        }
+      }
+      if (error.code === "INTERVENTION_INVALID" || error.code === "INTERVENTION_STATE_INVALID") {
+        return new TransportError("INVALID_REQUEST", error.message, 409)
+      }
+    }
+    return new TransportError("RUNNER_UNAVAILABLE", "Runner could not persist intervention", 500)
+  }
+
   private streamPosition(
     namespace: string,
     query: JsonObject,
@@ -635,7 +1077,10 @@ export class RunnerStore {
     const queueBucket = queueBucketFor({
       attention: reason !== undefined,
       terminal: terminal(mission.state.status),
-      waiting: current?.kind === "observation_wait" || mission.state.status === "waiting",
+      waiting:
+        current?.kind === "observation_wait" ||
+        current?.kind === "operator_wait" ||
+        mission.state.status === "waiting",
     })
     const registration = this.#definitions.get(mission.runtime.definition_digest)
     const subjectReferences = (registration?.subject_reference_keys ?? []).flatMap((key) => {
@@ -685,6 +1130,25 @@ export class RunnerStore {
     return [summary.run_id, summary.definition_id, summary.current_state, ...references].some(
       (value) => value.toLocaleLowerCase().includes(search),
     )
+  }
+
+  private interventionDescriptors(mission: StoredMission): InterventionDescriptor[] {
+    const state = mission.runtime.manifest.states[mission.state.current_state]
+    if (state?.kind !== "operator_wait") {
+      return []
+    }
+    return state.actions.map((action) => ({
+      action_code: action.action_code,
+      target: `mission:${mission.state.run_id}`,
+      consequence: action.consequence,
+      confirmation_required: action.confirmation_required,
+      form_schema_version: 1,
+      input_schema: structuredClone(action.input_schema),
+      presentation_hints: structuredClone(action.presentation_hints),
+      evidence_required: action.evidence_required,
+      reason_required: action.reason_required,
+      expected_outcome_label: action.expected_outcome_label,
+    }))
   }
 
   private timelineEntries(mission: StoredMission, records: StoredEvent[]): TimelineEntry[] {

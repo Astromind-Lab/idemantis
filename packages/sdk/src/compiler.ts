@@ -1,4 +1,5 @@
 import {
+  ConsequenceLevelSchema,
   DefinitionIdSchema,
   DefinitionVersionSchema,
   EventTypeSchema,
@@ -26,6 +27,7 @@ import type {
   ObservationWaitStateDefinition,
   OperationDefinition,
   OperationManifest,
+  OperatorWaitStateDefinition,
   ReconcileStateDefinition,
   RetryPolicyManifest,
   StateDefinition,
@@ -490,11 +492,86 @@ function transitionTargets(state: StateDefinition): Array<[string, StateName]> {
         ["onConflictingState", state.onConflictingState],
         ["onUnknown", state.onUnknown],
       ]
+    case "operator_wait":
+      return state.actions.map((action, index) => [
+        `actions.${index}.onAccepted`,
+        action.onAccepted,
+      ])
     case "final":
       return []
   }
 
   return []
+}
+
+function validateOperatorWait(
+  stateName: string,
+  state: OperatorWaitStateDefinition,
+  issues: MissionDefinitionIssue[],
+): void {
+  const path = `states.${stateName}`
+  const codes = new Set<string>()
+  if (
+    typeof state.reason !== "string" ||
+    state.reason.length < 1 ||
+    state.reason.length > 256 ||
+    !Array.isArray(state.actions) ||
+    state.actions.length < 1 ||
+    state.actions.length > 32
+  ) {
+    issues.push(
+      issue(
+        "INVALID_STATE",
+        path,
+        "Operator wait state metadata is invalid",
+        "Provide a bounded reason and between one and 32 typed actions",
+      ),
+    )
+    return
+  }
+  for (const [index, action] of state.actions.entries()) {
+    const actionPath = `${path}.actions.${index}`
+    const hints = action.presentationHints ?? []
+    const valid =
+      Schema.Check(OperationNameSchema, action.code) &&
+      !codes.has(action.code) &&
+      Schema.Check(ConsequenceLevelSchema, action.consequence) &&
+      typeof action.confirmationRequired === "boolean" &&
+      (action.evidenceRequired === undefined || typeof action.evidenceRequired === "boolean") &&
+      (action.reasonRequired === undefined || typeof action.reasonRequired === "boolean") &&
+      typeof action.expectedOutcomeLabel === "string" &&
+      action.expectedOutcomeLabel.length >= 1 &&
+      action.expectedOutcomeLabel.length <= 256 &&
+      validateSchema(action.input) &&
+      Array.isArray(hints) &&
+      hints.length <= 64 &&
+      hints.every(
+        (hint) =>
+          typeof hint.path === "string" &&
+          hint.path.length >= 1 &&
+          hint.path.length <= 512 &&
+          ["text", "textarea", "select", "checkbox", "date-time"].includes(hint.control) &&
+          (hint.label === undefined ||
+            (typeof hint.label === "string" &&
+              hint.label.length >= 1 &&
+              hint.label.length <= 128)) &&
+          (hint.help === undefined ||
+            (typeof hint.help === "string" && hint.help.length >= 1 && hint.help.length <= 512)) &&
+          (hint.order === undefined ||
+            (Number.isSafeInteger(hint.order) && hint.order >= 0 && hint.order <= 1024)),
+      )
+    if (!valid) {
+      issues.push(
+        issue(
+          "INVALID_STATE",
+          actionPath,
+          `Operator action ${action.code} is invalid or duplicated`,
+          "Use a unique stable code, bounded presentation metadata, and a serializable input schema",
+        ),
+      )
+    }
+    codes.add(action.code)
+  }
 }
 
 function validateGraph(definition: MissionDefinition): MissionDefinitionIssue[] {
@@ -569,6 +646,8 @@ function validateGraph(definition: MissionDefinition): MissionDefinitionIssue[] 
       validateObservationWait(stateName, state, definition.states, issues)
     } else if (state.kind === "reconcile") {
       validateReconcileState(stateName, state, definition.states, issues)
+    } else if (state.kind === "operator_wait") {
+      validateOperatorWait(stateName, state, issues)
     } else if (
       state.kind !== "final" ||
       !["completed", "cancelled", "compensated", "failed", "unresolved"].includes(state.outcome)
@@ -578,7 +657,7 @@ function validateGraph(definition: MissionDefinition): MissionDefinitionIssue[] 
           "INVALID_STATE",
           `states.${stateName}`,
           `State ${stateName} has an invalid kind or terminal outcome`,
-          "Use effectState, waitForObservation, reconcileState, or finalState",
+          "Use effectState, waitForObservation, reconcileState, waitForOperator, or finalState",
         ),
       )
     }
@@ -718,6 +797,22 @@ function stateManifest(state: StateDefinition): StateManifest {
         on_conflicting_state: state.onConflictingState,
         on_unknown: state.onUnknown,
       }
+    case "operator_wait":
+      return {
+        kind: "operator_wait",
+        reason: state.reason,
+        actions: state.actions.map((action) => ({
+          action_code: action.code,
+          consequence: action.consequence,
+          confirmation_required: action.confirmationRequired,
+          input_schema: schemaObject(action.input),
+          presentation_hints: action.presentationHints ?? [],
+          evidence_required: action.evidenceRequired ?? false,
+          reason_required: action.reasonRequired ?? false,
+          expected_outcome_label: action.expectedOutcomeLabel,
+          on_accepted: action.onAccepted,
+        })),
+      }
     case "final":
       return { kind: "final", outcome: state.outcome }
   }
@@ -729,6 +824,8 @@ function graphNode(stateName: StateName, state: StateDefinition): MissionGraphNo
     case "reconcile":
       return { id: stateName, kind: state.kind, operation: state.operation.key }
     case "observation_wait":
+      return { id: stateName, kind: state.kind }
+    case "operator_wait":
       return { id: stateName, kind: state.kind }
     case "final":
       return { id: stateName, kind: state.kind, outcome: state.outcome }
@@ -800,6 +897,12 @@ function graphEdges(stateName: StateName, state: StateDefinition): MissionGraphE
         },
         { from: stateName, to: state.onUnknown, trigger: "reconcile.unknown" },
       ]
+    case "operator_wait":
+      return state.actions.map((action) => ({
+        from: stateName,
+        to: action.onAccepted,
+        trigger: `operator.${action.code}`,
+      }))
     case "final":
       return []
   }

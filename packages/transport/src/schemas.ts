@@ -206,6 +206,7 @@ export const GraphNodeSchema = Type.Object(
       Type.Literal("effect"),
       Type.Literal("observation_wait"),
       Type.Literal("reconcile"),
+      Type.Literal("operator_wait"),
       Type.Literal("final"),
     ]),
     display_code: Type.String({ minLength: 1, maxLength: 128 }),
@@ -446,6 +447,14 @@ export const SubmitInterventionRequestSchema = Type.Object(
   { additionalProperties: false },
 )
 
+export const DiscardInterventionRequestSchema = Type.Object(
+  {
+    client_request_id: ClientRequestIdSchema,
+    proposal_digest: DigestSchema,
+  },
+  { additionalProperties: false },
+)
+
 export const InterventionOutcomeSchema = Type.Union([
   Type.Literal("queued"),
   Type.Literal("accepted"),
@@ -465,6 +474,28 @@ export const InterventionReceiptSchema = Type.Object(
     received_at: TimestampSchema,
     resolved_at: Type.Optional(TimestampSchema),
     revision: RevisionSchema,
+  },
+  { additionalProperties: false },
+)
+
+export const PreparedInterventionPageSchema = Type.Object(
+  {
+    schema_version: Type.Literal(ApiSchemaVersion),
+    run_id: RunIdSchema,
+    activity_revision: Type.Integer({ minimum: 0 }),
+    items: Type.Array(PreparedInterventionSchema, { maxItems: 100 }),
+    next_cursor: Type.Optional(CursorSchema),
+  },
+  { additionalProperties: false },
+)
+
+export const InterventionReceiptPageSchema = Type.Object(
+  {
+    schema_version: Type.Literal(ApiSchemaVersion),
+    run_id: RunIdSchema,
+    receipt_revision: Type.Integer({ minimum: 0 }),
+    items: Type.Array(InterventionReceiptSchema, { maxItems: 100 }),
+    next_cursor: Type.Optional(CursorSchema),
   },
   { additionalProperties: false },
 )
@@ -578,7 +609,10 @@ export type EffectPage = Type.Static<typeof EffectPageSchema>
 export type PreparedIntervention = Type.Static<typeof PreparedInterventionSchema>
 export type PrepareInterventionRequest = Type.Static<typeof PrepareInterventionRequestSchema>
 export type SubmitInterventionRequest = Type.Static<typeof SubmitInterventionRequestSchema>
+export type DiscardInterventionRequest = Type.Static<typeof DiscardInterventionRequestSchema>
 export type InterventionReceipt = Type.Static<typeof InterventionReceiptSchema>
+export type PreparedInterventionPage = Type.Static<typeof PreparedInterventionPageSchema>
+export type InterventionReceiptPage = Type.Static<typeof InterventionReceiptPageSchema>
 export type ReplayResult = Type.Static<typeof ReplayResultSchema>
 export type SessionDocument = Type.Static<typeof SessionDocumentSchema>
 export type StreamEnvelope = Type.Static<typeof StreamEnvelopeSchema>

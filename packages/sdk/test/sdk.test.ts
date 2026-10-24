@@ -17,6 +17,7 @@ import {
   reconcileBeforeRetry,
   reconcileState,
   safeRetry,
+  waitForOperator,
   waitForObservation,
   type ExecutionBinding,
   type MissionDefinition,
@@ -281,6 +282,61 @@ describe("mission compilation", () => {
       trigger: "observation.timeout",
     })
     expect(graph.edges.filter((edge) => edge.from === "complete")).toEqual([])
+  })
+
+  it("compiles operator waitpoints into inspectable actions and graph transitions", () => {
+    const definition = defineMission({
+      id: "release-review",
+      version: "1.0.0",
+      input: Type.Object({ release: Type.String() }, { additionalProperties: false }),
+      initial: "review",
+      states: {
+        review: waitForOperator({
+          reason: "Release requires approval",
+          actions: [
+            {
+              code: "approve",
+              consequence: "irreversible",
+              confirmationRequired: true,
+              input: Type.Object(
+                { evidence: Type.String({ minLength: 3 }) },
+                { additionalProperties: false },
+              ),
+              presentationHints: [
+                { path: "evidence", control: "textarea", label: "Evidence", order: 0 },
+              ],
+              evidenceRequired: true,
+              reasonRequired: true,
+              expectedOutcomeLabel: "Release is approved",
+              onAccepted: "complete",
+            },
+          ],
+        }),
+        complete: finalState("completed"),
+      },
+    })
+
+    expect(definition.manifest.states[definition.manifest.initial]).toMatchObject({
+      kind: "operator_wait",
+      reason: "Release requires approval",
+      actions: [
+        {
+          action_code: "approve",
+          consequence: "irreversible",
+          confirmation_required: true,
+          evidence_required: true,
+          reason_required: true,
+          on_accepted: "complete",
+        },
+      ],
+    })
+    expect(definition.manifest.graph.nodes).toContainEqual({ id: "review", kind: "operator_wait" })
+    expect(definition.manifest.graph.edges).toContainEqual({
+      from: "review",
+      to: "complete",
+      trigger: "operator.approve",
+    })
+    expect(Schema.Check(MissionManifestSchema, definition.manifest)).toBe(true)
   })
 
   it("does not freeze the caller's input schema", () => {

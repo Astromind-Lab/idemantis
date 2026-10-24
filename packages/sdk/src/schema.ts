@@ -169,6 +169,47 @@ const ReconcileStateManifestSchema = Type.Object(
   { additionalProperties: false },
 )
 
+const InterventionPresentationHintSchema = Type.Object(
+  {
+    path: Type.String({ minLength: 1, maxLength: 512 }),
+    control: Type.Union([
+      Type.Literal("text"),
+      Type.Literal("textarea"),
+      Type.Literal("select"),
+      Type.Literal("checkbox"),
+      Type.Literal("date-time"),
+    ]),
+    label: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    help: Type.Optional(Type.String({ minLength: 1, maxLength: 512 })),
+    order: Type.Optional(Type.Integer({ minimum: 0, maximum: 1024 })),
+  },
+  { additionalProperties: false },
+)
+
+const OperatorActionManifestSchema = Type.Object(
+  {
+    action_code: OperationNameSchema,
+    consequence: ConsequenceLevelSchema,
+    confirmation_required: Type.Boolean(),
+    input_schema: JsonObjectSchema,
+    presentation_hints: Type.Array(InterventionPresentationHintSchema, { maxItems: 64 }),
+    evidence_required: Type.Boolean(),
+    reason_required: Type.Boolean(),
+    expected_outcome_label: Type.String({ minLength: 1, maxLength: 256 }),
+    on_accepted: StateNameSchema,
+  },
+  { additionalProperties: false },
+)
+
+const OperatorWaitStateManifestSchema = Type.Object(
+  {
+    kind: Type.Literal("operator_wait"),
+    reason: Type.String({ minLength: 1, maxLength: 256 }),
+    actions: Type.Array(OperatorActionManifestSchema, { minItems: 1, maxItems: 32 }),
+  },
+  { additionalProperties: false },
+)
+
 const FinalStateManifestSchema = Type.Object(
   {
     kind: Type.Literal("final"),
@@ -187,6 +228,7 @@ const StateManifestSchema = Type.Union([
   EffectStateManifestSchema,
   ObservationWaitStateManifestSchema,
   ReconcileStateManifestSchema,
+  OperatorWaitStateManifestSchema,
   FinalStateManifestSchema,
 ])
 
@@ -202,7 +244,7 @@ const MissionGraphNodeSchema = Type.Union([
   Type.Object(
     {
       id: StateNameSchema,
-      kind: Type.Literal("observation_wait"),
+      kind: Type.Union([Type.Literal("observation_wait"), Type.Literal("operator_wait")]),
     },
     { additionalProperties: false },
   ),

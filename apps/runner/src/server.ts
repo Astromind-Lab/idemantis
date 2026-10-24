@@ -1,12 +1,19 @@
 import { randomUUID } from "node:crypto"
-import type { EffectId, JsonObject, RunId } from "@idemantis/contracts"
-import { EffectIdSchema, RunIdSchema } from "@idemantis/contracts"
+import type { ClientRequestId, EffectId, JsonObject, RunId, SourceId } from "@idemantis/contracts"
+import { ClientRequestIdSchema, EffectIdSchema, RunIdSchema } from "@idemantis/contracts"
 import cookie from "@fastify/cookie"
 import helmet from "@fastify/helmet"
 import rateLimit from "@fastify/rate-limit"
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify"
 import Schema from "typebox/schema"
-import { ApiSchemaVersion, type StreamEnvelope, TransportError } from "@idemantis/transport"
+import {
+  ApiSchemaVersion,
+  type DiscardInterventionRequest,
+  type PrepareInterventionRequest,
+  type StreamEnvelope,
+  type SubmitInterventionRequest,
+  TransportError,
+} from "@idemantis/transport"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
 import type { SessionAuthority } from "./session.js"
 import type { RunnerStore } from "./store.js"
@@ -62,9 +69,10 @@ function requireMutation(
   request: FastifyRequest,
   sessions: SessionAuthority,
   exactOrigin: string,
-): void {
+): SourceId {
   assertOrigin(request, exactOrigin)
   sessions.assertCsrf(cookieToken(request), header(request, "x-idemantis-csrf"))
+  return sessions.assertActive(cookieToken(request))
 }
 
 function apiError(request: FastifyRequest, error: TransportError) {
@@ -116,8 +124,15 @@ function effectId(value: unknown): EffectId {
   return value as EffectId
 }
 
-function authenticated(request: FastifyRequest, sessions: SessionAuthority): void {
-  sessions.assertActive(cookieToken(request))
+function clientRequestId(value: unknown): ClientRequestId {
+  if (!Schema.Check(ClientRequestIdSchema, value)) {
+    throw new TransportError("INVALID_REQUEST", "Client request ID is invalid", 422)
+  }
+  return value as ClientRequestId
+}
+
+function authenticated(request: FastifyRequest, sessions: SessionAuthority): SourceId {
+  return sessions.assertActive(cookieToken(request))
 }
 
 function streamPosition(envelope: StreamEnvelope): number {
@@ -126,6 +141,9 @@ function streamPosition(envelope: StreamEnvelope): number {
   }
   if (envelope.kind === "operations") {
     return envelope.body.list_revision
+  }
+  if (envelope.kind === "receipt") {
+    return envelope.body.receipt_revision
   }
   throw new TypeError("A heartbeat does not advance a stream")
 }
@@ -424,6 +442,82 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     return options.store.replay(runId(field(params, "runId")), sequence)
   })
 
+  app.post("/api/missions/:runId/interventions/prepare", async (request, reply) => {
+    const actorId = requireMutation(request, options.sessions, options.exact_origin)
+    const params = object(request.params)
+    const prepared = options.store.prepareIntervention(
+      runId(field(params, "runId")),
+      actorId,
+      object(request.body) as unknown as PrepareInterventionRequest,
+    )
+    reply.status(201)
+    return prepared
+  })
+
+  app.post("/api/missions/:runId/interventions/submit", async (request) => {
+    const actorId = requireMutation(request, options.sessions, options.exact_origin)
+    const params = object(request.params)
+    return options.store.submitIntervention(
+      runId(field(params, "runId")),
+      actorId,
+      object(request.body) as unknown as SubmitInterventionRequest,
+    )
+  })
+
+  app.post("/api/missions/:runId/interventions/discard", async (request) => {
+    const actorId = requireMutation(request, options.sessions, options.exact_origin)
+    const params = object(request.params)
+    return options.store.discardIntervention(
+      runId(field(params, "runId")),
+      actorId,
+      object(request.body) as unknown as DiscardInterventionRequest,
+    )
+  })
+
+  app.get("/api/missions/:runId/interventions", async (request) => {
+    const actorId = authenticated(request, options.sessions)
+    const params = object(request.params)
+    const query = object(request.query)
+    return options.store.interventionActivity(
+      runId(field(params, "runId")),
+      actorId,
+      queryValue(field(query, "cursor")),
+      numericQuery(field(query, "limit")) ?? 100,
+    )
+  })
+
+  app.get("/api/missions/:runId/interventions/:clientRequestId", async (request) => {
+    const actorId = authenticated(request, options.sessions)
+    const params = object(request.params)
+    return options.store.preparedInterventionById(
+      runId(field(params, "runId")),
+      actorId,
+      clientRequestId(field(params, "clientRequestId")),
+    )
+  })
+
+  app.get("/api/missions/:runId/interventions/:clientRequestId/receipt", async (request) => {
+    const actorId = authenticated(request, options.sessions)
+    const params = object(request.params)
+    return options.store.interventionReceiptById(
+      runId(field(params, "runId")),
+      actorId,
+      clientRequestId(field(params, "clientRequestId")),
+    )
+  })
+
+  app.get("/api/missions/:runId/intervention-receipts", async (request) => {
+    const actorId = authenticated(request, options.sessions)
+    const params = object(request.params)
+    const query = object(request.query)
+    return options.store.interventionReceipts(
+      runId(field(params, "runId")),
+      actorId,
+      queryValue(field(query, "cursor")),
+      numericQuery(field(query, "limit")) ?? 100,
+    )
+  })
+
   app.get("/api/streams/operations", async (request, reply) => {
     authenticated(request, options.sessions)
     const query = object(request.query)
@@ -463,6 +557,28 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
       heartbeat_interval_ms: streamHeartbeatInterval,
       read: (current) => options.store.missionStreamBatch(selectedRunId, current),
       heartbeat: (current) => options.store.missionStreamHeartbeat(selectedRunId, current),
+    })
+  })
+
+  app.get("/api/missions/:runId/receipts/stream", async (request, reply) => {
+    const actorId = authenticated(request, options.sessions)
+    const params = object(request.params)
+    const selectedRunId = runId(field(params, "runId"))
+    const query = object(request.query)
+    const headerCursor = header(request, "last-event-id")
+    const queryCursor = queryValue(field(query, "cursor"))
+    const cursor = headerCursor || queryCursor
+    const initial = cursor ? undefined : numericQuery(field(query, "after_revision"))
+    const position = options.store.receiptStreamPosition(selectedRunId, actorId, initial, cursor)
+    return openEventStream({
+      request,
+      reply,
+      sessions: options.sessions,
+      initial_position: position,
+      poll_interval_ms: streamPollInterval,
+      heartbeat_interval_ms: streamHeartbeatInterval,
+      read: (current) => options.store.receiptStreamBatch(selectedRunId, actorId, current),
+      heartbeat: (current) => options.store.receiptStreamHeartbeat(selectedRunId, actorId, current),
     })
   })
 

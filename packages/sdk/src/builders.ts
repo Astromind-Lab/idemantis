@@ -4,6 +4,7 @@ import type {
   FinalOutcome,
   FinalStateDefinition,
   ObservationWaitStateDefinition,
+  OperatorWaitStateDefinition,
   OperationDefinition,
   ReconcileStateDefinition,
   RetryPolicy,
@@ -89,6 +90,12 @@ export function reconcileState(
     Partial<Pick<ReconcileStateDefinition, "execution">>,
 ): ReconcileStateDefinition {
   return { ...options, kind: "reconcile", execution: options.execution ?? "runner" }
+}
+
+export function waitForOperator(
+  options: Omit<OperatorWaitStateDefinition, "kind">,
+): OperatorWaitStateDefinition {
+  return { ...options, kind: "operator_wait" }
 }
 
 /** Declares an immutable terminal mission outcome. */

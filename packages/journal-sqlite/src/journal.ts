@@ -2,10 +2,12 @@ import {
   AttemptIdSchema,
   ClientRequestIdSchema,
   CommandIdSchema,
+  DigestSchema,
   EdgeMergeRequestSchema,
   EdgeMergeResultSchema,
   EffectIdSchema,
   EventIdSchema,
+  RunIdSchema,
   SourceIdSchema,
   TimerIdSchema,
   TimestampSchema,
@@ -38,6 +40,7 @@ import {
   type OwnershipLease,
   type ProposedEvent,
   type RunId,
+  type SourceId,
   type TimerId,
   type TimerRecord,
 } from "@idemantis/contracts"
@@ -51,6 +54,7 @@ import {
   OwnershipHandoffBlockedPayloadSchema,
   OwnershipHandoffRequestedPayloadSchema,
   OwnershipLeaseRegisteredPayloadSchema,
+  OperatorInterventionSubmittedPayloadSchema,
   OwnershipReleasedPayloadSchema,
   ReductionError,
   TimerFiredPayloadSchema,
@@ -69,6 +73,7 @@ import {
   type OwnershipHandoffRequestedPayload,
   type OwnershipLeaseRegisteredPayload,
   type OwnershipReleasedPayload,
+  type OperatorInterventionSubmittedPayload,
   type ReductionResult,
 } from "@idemantis/engine"
 import type { DatabaseSync } from "node:sqlite"
@@ -111,8 +116,12 @@ import type {
   QueuePendingInputOptions,
   ReplayVerification,
   StorageInfo,
+  StoredInterventionReceipt,
+  StoredPreparedIntervention,
+  StoredReceiptUpdate,
   StoredEvent,
   StoredMission,
+  SubmitInterventionResult,
   StoredOwnershipLease,
   TimerFireOptions,
   TimerFireResult,
@@ -145,6 +154,7 @@ const guardedEventTypes = new Set([
   "ownership.fence_activated",
   "ownership.effect_cancelled",
   "ownership.activated",
+  "operator.intervention_submitted",
 ])
 
 const pendingFactTypes = new Set([
@@ -865,6 +875,13 @@ export class SqliteJournal {
 
   queuePendingInput(proposal: ProposedEvent, options: QueuePendingInputOptions): IngressReceipt {
     const event = parseProposedEvent(proposal)
+    if (event.type === "operator.intervention_submitted") {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        "Operator interventions require the prepared submission lifecycle",
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
     if (!Schema.Check(ClientRequestIdSchema, options.client_request_id)) {
       throw new TypeError("client_request_id must satisfy ClientRequestId")
     }
@@ -872,80 +889,355 @@ export class SqliteJournal {
     const expectedSequence = this.pendingExpectedSequence(event, kind, options.client_request_id)
     const digest = proposalDigest(event)
 
+    return this.#database.transaction(() =>
+      this.queuePendingInputInTransaction(
+        event,
+        options.client_request_id,
+        kind,
+        expectedSequence,
+        digest,
+        timestamp(this.#clock),
+      ),
+    )
+  }
+
+  prepareIntervention(proposal: ProposedEvent, expiresAt: string): StoredPreparedIntervention {
+    const event = parseProposedEvent(proposal)
+    if (
+      event.type !== "operator.intervention_submitted" ||
+      event.source.kind !== "operator" ||
+      !Schema.Check(OperatorInterventionSubmittedPayloadSchema, event.payload) ||
+      !Schema.Check(TimestampSchema, expiresAt)
+    ) {
+      throw new JournalError("INTERVENTION_INVALID", "Prepared intervention is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const payload = event.payload as unknown as OperatorInterventionSubmittedPayload
+    const digest = proposalDigest(event)
     return this.#database.transaction(() => {
-      const run = this.runRow(event.run_id, true)
-      const lease = this.activeLeaseRow(event.run_id)
-      if (!lease || text(lease, "owner_mode") !== "edge") {
-        throw new JournalError(
-          "PENDING_INPUT_INVALID",
-          `Run ${event.run_id} is not owned by an edge executor`,
-          { run_id: event.run_id, event_id: event.event_id },
-        )
-      }
-      if (event.ownership_epoch > integer(run, "ownership_epoch")) {
-        throw new JournalError(
-          "PENDING_INPUT_INVALID",
-          `Input ${event.event_id} targets a future ownership epoch`,
-          { run_id: event.run_id, event_id: event.event_id },
-        )
-      }
-      const existing = this.connection
-        .prepare(
-          `SELECT * FROM pending_inputs
-           WHERE run_id = ? AND (client_request_id = ? OR proposal_event_id = ?)
-           ORDER BY ingress_sequence LIMIT 1`,
-        )
-        .get(event.run_id, options.client_request_id, event.event_id) as Row | undefined
-      if (existing) {
-        if (
-          text(existing, "client_request_id") !== options.client_request_id ||
-          text(existing, "proposal_event_id") !== event.event_id ||
-          text(existing, "proposal_digest") !== digest
-        ) {
+      const duplicate = this.interventionIntentRow(payload.client_request_id, false)
+      if (duplicate) {
+        if (text(duplicate, "proposal_digest") !== digest) {
           throw new JournalError(
-            "PENDING_INPUT_COLLISION",
-            `Input identity conflicts with ingress ${integer(existing, "ingress_sequence")}`,
+            "INTERVENTION_COLLISION",
+            `Client request ${payload.client_request_id} is bound to different content`,
             { run_id: event.run_id, event_id: event.event_id },
           )
         }
-        return this.pendingReceipt(existing)
+        return this.preparedInterventionRecord(duplicate)
       }
-      const accepted = this.connection
-        .prepare(
-          `SELECT sequence, proposal_digest, recorded_at FROM mission_events
-           WHERE event_id = ?`,
-        )
-        .get(event.event_id) as Row | undefined
-      const receivedAt = timestamp(this.#clock)
-      if (accepted && text(accepted, "proposal_digest") !== digest) {
+      const run = this.runRow(event.run_id, true)
+      const preparedAt = timestamp(this.#clock)
+      if (
+        Date.parse(expiresAt) <= Date.parse(preparedAt) ||
+        payload.expected_sequence !== integer(run, "current_sequence") ||
+        event.ownership_epoch !== integer(run, "ownership_epoch") ||
+        payload.target !== `mission:${event.run_id}`
+      ) {
         throw new JournalError(
-          "PENDING_INPUT_COLLISION",
-          `Event ${event.event_id} already has different canonical content`,
+          "INTERVENTION_INVALID",
+          "Intervention does not match the current mission boundary",
           { run_id: event.run_id, event_id: event.event_id },
         )
       }
+      if (
+        this.connection
+          .prepare("SELECT event_id FROM mission_events WHERE event_id = ?")
+          .get(event.event_id)
+      ) {
+        throw new JournalError(
+          "INTERVENTION_COLLISION",
+          `Event ${event.event_id} is already canonical`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      try {
+        this.prepareAppend(event, digest, preparedAt)
+      } catch (error) {
+        if (error instanceof ReductionError || error instanceof JournalError) {
+          throw new JournalError(
+            "INTERVENTION_INVALID",
+            "Intervention is not valid for the current mission state",
+            { run_id: event.run_id, event_id: event.event_id },
+          )
+        }
+        throw error
+      }
       this.connection
         .prepare(
-          `INSERT INTO pending_inputs(
-            run_id, client_request_id, input_kind, proposal_event_id, proposal_digest,
-            proposal_json, expected_sequence, outcome, accepted_sequence, received_at, resolved_at
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO intervention_intents(
+            client_request_id, actor_id, run_id, expected_sequence, action_code, target,
+            normalized_input_json, reason, proposal_event_id, proposal_digest, proposal_json,
+            state, compatibility, prepared_at, expires_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'prepared', 'compatible', ?, ?)`,
         )
         .run(
+          payload.client_request_id,
+          event.source.source_id,
           event.run_id,
-          options.client_request_id,
-          kind,
+          payload.expected_sequence,
+          payload.action_code,
+          payload.target,
+          canonicalJson(payload.input),
+          payload.reason ?? null,
           event.event_id,
           digest,
           canonicalJson(event as unknown as JsonObject),
-          expectedSequence ?? null,
-          accepted ? "accepted" : "queued",
-          accepted ? integer(accepted, "sequence") : null,
-          receivedAt,
-          accepted ? text(accepted, "recorded_at") : null,
+          preparedAt,
+          expiresAt,
         )
-      return this.pendingReceipt(this.pendingInputRow(event.run_id, options.client_request_id))
+      return this.preparedInterventionRecord(
+        this.interventionIntentRow(payload.client_request_id, true),
+      )
     })
+  }
+
+  discardIntervention(
+    runId: RunId,
+    clientRequestId: ClientRequestId,
+    digest: Digest,
+  ): StoredPreparedIntervention {
+    return this.#database.transaction(() => {
+      const row = this.interventionIntentForRun(runId, clientRequestId)
+      this.assertInterventionDigest(row, digest)
+      this.expireInterventionRow(row)
+      const current = this.interventionIntentForRun(runId, clientRequestId)
+      const state = text(current, "state")
+      if (state === "discarded") {
+        return this.preparedInterventionRecord(current)
+      }
+      if (state !== "prepared") {
+        throw new JournalError(
+          "INTERVENTION_STATE_INVALID",
+          `Intervention ${clientRequestId} cannot be discarded from ${state}`,
+          { run_id: runId },
+        )
+      }
+      const discardedAt = timestamp(this.#clock)
+      const updated = this.connection
+        .prepare(
+          `UPDATE intervention_intents SET state = 'discarded', terminal_at = ?
+           WHERE client_request_id = ? AND state = 'prepared'`,
+        )
+        .run(discardedAt, clientRequestId)
+      if (updated.changes !== 1) {
+        throw new JournalError("INTERVENTION_STATE_INVALID", "Intervention state changed", {
+          run_id: runId,
+        })
+      }
+      return this.preparedInterventionRecord(this.interventionIntentForRun(runId, clientRequestId))
+    })
+  }
+
+  submitIntervention(
+    runId: RunId,
+    clientRequestId: ClientRequestId,
+    digest: Digest,
+  ): SubmitInterventionResult {
+    return this.#database.transaction(() => {
+      const row = this.interventionIntentForRun(runId, clientRequestId)
+      this.assertInterventionDigest(row, digest)
+      this.expireInterventionRow(row)
+      const current = this.interventionIntentForRun(runId, clientRequestId)
+      const state = text(current, "state")
+      if (state === "submitted") {
+        return { status: "receipt", receipt: this.interventionReceipt(current) }
+      }
+      if (state === "expired") {
+        return { status: "expired", prepared: this.preparedInterventionRecord(current) }
+      }
+      if (state !== "prepared") {
+        throw new JournalError(
+          "INTERVENTION_STATE_INVALID",
+          `Intervention ${clientRequestId} cannot be submitted from ${state}`,
+          { run_id: runId },
+        )
+      }
+      const proposal = this.preparedInterventionRecord(current).proposal
+      const receivedAt = timestamp(this.#clock)
+      const run = this.runRow(runId, true)
+      const expectedSequence = integer(current, "expected_sequence")
+      if (expectedSequence !== integer(run, "current_sequence")) {
+        return {
+          status: "receipt",
+          receipt: this.recordInterventionReceipt(
+            current,
+            "rejected_stale",
+            receivedAt,
+            receivedAt,
+          ),
+        }
+      }
+      const lease = this.activeLeaseRow(runId)
+      if (lease && text(lease, "owner_mode") === "edge") {
+        this.queuePendingInputInTransaction(
+          proposal,
+          clientRequestId,
+          "intent",
+          expectedSequence,
+          digest,
+          receivedAt,
+        )
+        return {
+          status: "receipt",
+          receipt: this.recordInterventionReceipt(current, "queued", receivedAt),
+        }
+      }
+      this.connection.exec("SAVEPOINT submit_intervention")
+      try {
+        const pending = this.prepareAppend(proposal, digest, receivedAt)
+        this.storeAppend(pending)
+        this.connection.exec("RELEASE submit_intervention")
+        return {
+          status: "receipt",
+          receipt: this.recordInterventionReceipt(
+            current,
+            "accepted",
+            receivedAt,
+            receivedAt,
+            pending.accepted.sequence,
+          ),
+        }
+      } catch (error) {
+        this.connection.exec("ROLLBACK TO submit_intervention")
+        this.connection.exec("RELEASE submit_intervention")
+        if (!(error instanceof JournalError) && !(error instanceof ReductionError)) {
+          throw error
+        }
+        return {
+          status: "receipt",
+          receipt: this.recordInterventionReceipt(
+            current,
+            "rejected_invalid",
+            receivedAt,
+            receivedAt,
+          ),
+        }
+      }
+    })
+  }
+
+  getPreparedIntervention(
+    runId: RunId,
+    clientRequestId: ClientRequestId,
+  ): StoredPreparedIntervention {
+    return this.#database.transaction(() => {
+      const row = this.interventionIntentForRun(runId, clientRequestId)
+      this.expireInterventionRow(row)
+      return this.preparedInterventionRecord(this.interventionIntentForRun(runId, clientRequestId))
+    })
+  }
+
+  getInterventionReceipt(
+    runId: RunId,
+    clientRequestId: ClientRequestId,
+  ): StoredInterventionReceipt {
+    this.#database.assertOpen()
+    return this.interventionReceipt(this.interventionIntentForRun(runId, clientRequestId))
+  }
+
+  interventionIntentRevision(runId: RunId, actorId: SourceId): number {
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    const row = asRow(
+      this.connection
+        .prepare(
+          `SELECT COALESCE(MAX(intent_sequence), 0) AS revision
+           FROM intervention_intents WHERE run_id = ? AND actor_id = ?`,
+        )
+        .get(runId, actorId),
+      "intervention intent revision",
+    )
+    return integer(row, "revision")
+  }
+
+  listPreparedInterventions(
+    runId: RunId,
+    actorId: SourceId,
+    revision: number,
+  ): StoredPreparedIntervention[] {
+    return this.#database.transaction(() => {
+      this.runRow(runId, true)
+      const expiredAt = timestamp(this.#clock)
+      this.connection
+        .prepare(
+          `UPDATE intervention_intents SET state = 'expired', terminal_at = ?
+           WHERE run_id = ? AND actor_id = ? AND state = 'prepared' AND expires_at <= ?`,
+        )
+        .run(expiredAt, runId, actorId, expiredAt)
+      return this.connection
+        .prepare(
+          `SELECT * FROM intervention_intents
+           WHERE run_id = ? AND actor_id = ? AND intent_sequence <= ?
+           ORDER BY intent_sequence DESC`,
+        )
+        .all(runId, actorId, revision)
+        .map((raw) => this.preparedInterventionRecord(raw as Row))
+    })
+  }
+
+  interventionReceiptRevision(runId: RunId, actorId: SourceId): number {
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    const row = asRow(
+      this.connection
+        .prepare(
+          `SELECT COALESCE(MAX(receipt_revision), 0) AS revision
+           FROM intervention_intents WHERE run_id = ? AND actor_id = ?`,
+        )
+        .get(runId, actorId),
+      "intervention receipt revision",
+    )
+    return integer(row, "revision")
+  }
+
+  listInterventionReceipts(
+    runId: RunId,
+    actorId: SourceId,
+    revision: number,
+  ): StoredInterventionReceipt[] {
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    return this.connection
+      .prepare(
+        `SELECT * FROM intervention_intents
+         WHERE run_id = ? AND actor_id = ?
+           AND receipt_revision IS NOT NULL AND receipt_revision <= ?
+         ORDER BY receipt_revision DESC`,
+      )
+      .all(runId, actorId, revision)
+      .map((raw) => this.interventionReceipt(raw as Row))
+  }
+
+  listReceiptUpdatesAfter(
+    runId: RunId,
+    actorId: SourceId,
+    revision: number,
+    limit = 100,
+  ): StoredReceiptUpdate[] {
+    if (
+      !Number.isSafeInteger(revision) ||
+      revision < 0 ||
+      !Number.isSafeInteger(limit) ||
+      limit < 1 ||
+      limit > 1_000
+    ) {
+      throw new RangeError("Receipt update bounds are invalid")
+    }
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    return this.connection
+      .prepare(
+        `SELECT updates.* FROM intervention_receipt_updates AS updates
+         JOIN intervention_intents AS intents
+           ON intents.client_request_id = updates.client_request_id
+         WHERE updates.run_id = ? AND intents.actor_id = ? AND updates.revision > ?
+         ORDER BY updates.revision LIMIT ?`,
+      )
+      .all(runId, actorId, revision, limit)
+      .map((raw) => this.receiptUpdateRecord(raw as Row))
   }
 
   listPendingInputs(runId: RunId): PendingInputRecord[] {
@@ -1608,6 +1900,440 @@ export class SqliteJournal {
     this.close()
   }
 
+  private interventionIntentRow(clientRequestId: ClientRequestId, required: true): Row
+  private interventionIntentRow(clientRequestId: ClientRequestId, required: false): Row | undefined
+  private interventionIntentRow(
+    clientRequestId: ClientRequestId,
+    required: boolean,
+  ): Row | undefined {
+    const row = this.connection
+      .prepare("SELECT * FROM intervention_intents WHERE client_request_id = ?")
+      .get(clientRequestId) as Row | undefined
+    if (!row && required) {
+      throw new JournalError(
+        "INTERVENTION_INVALID",
+        `Intervention ${clientRequestId} does not exist`,
+      )
+    }
+    return row
+  }
+
+  private interventionIntentForRun(runId: RunId, clientRequestId: ClientRequestId): Row {
+    const row = this.interventionIntentRow(clientRequestId, true)
+    if (text(row, "run_id") !== runId) {
+      throw new JournalError(
+        "INTERVENTION_INVALID",
+        `Intervention ${clientRequestId} does not belong to ${runId}`,
+        { run_id: runId },
+      )
+    }
+    return row
+  }
+
+  private assertInterventionDigest(row: Row, digest: Digest): void {
+    if (text(row, "proposal_digest") !== digest) {
+      throw new JournalError(
+        "INTERVENTION_COLLISION",
+        `Client request ${text(row, "client_request_id")} is bound to a different proposal`,
+        { run_id: text(row, "run_id") as RunId },
+      )
+    }
+  }
+
+  private expireInterventionRow(row: Row): void {
+    if (
+      text(row, "state") === "prepared" &&
+      Date.parse(text(row, "expires_at")) <= this.#clock().getTime()
+    ) {
+      this.connection
+        .prepare(
+          `UPDATE intervention_intents SET state = 'expired', terminal_at = ?
+           WHERE client_request_id = ? AND state = 'prepared'`,
+        )
+        .run(timestamp(this.#clock), text(row, "client_request_id"))
+    }
+  }
+
+  private preparedInterventionRecord(row: Row): StoredPreparedIntervention {
+    const proposal = parseProposedEvent(
+      storedJson(text(row, "proposal_json"), "Prepared intervention proposal"),
+    )
+    if (
+      proposal.type !== "operator.intervention_submitted" ||
+      proposal.source.kind !== "operator" ||
+      !Schema.Check(OperatorInterventionSubmittedPayloadSchema, proposal.payload)
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Prepared intervention proposal is invalid")
+    }
+    const payload = proposal.payload as unknown as OperatorInterventionSubmittedPayload
+    const state = text(row, "state")
+    const compatibility = text(row, "compatibility")
+    const reason = nullableText(row, "reason")
+    const digest = parseDigest(column(row, "proposal_digest"), "Intervention proposal digest")
+    if (
+      !["prepared", "submitted", "discarded", "expired"].includes(state) ||
+      !["compatible", "incompatible"].includes(compatibility) ||
+      !Schema.Check(ClientRequestIdSchema, text(row, "client_request_id")) ||
+      !Schema.Check(SourceIdSchema, text(row, "actor_id")) ||
+      !Schema.Check(TimestampSchema, text(row, "prepared_at")) ||
+      !Schema.Check(TimestampSchema, text(row, "expires_at")) ||
+      text(row, "client_request_id") !== payload.client_request_id ||
+      text(row, "actor_id") !== proposal.source.source_id ||
+      text(row, "run_id") !== proposal.run_id ||
+      integer(row, "expected_sequence") !== payload.expected_sequence ||
+      text(row, "action_code") !== payload.action_code ||
+      text(row, "target") !== payload.target ||
+      canonicalJson(
+        storedJson(text(row, "normalized_input_json"), "Intervention input") as JsonValue,
+      ) !== canonicalJson(payload.input) ||
+      reason !== payload.reason ||
+      text(row, "proposal_event_id") !== proposal.event_id ||
+      digest !== proposalDigest(proposal)
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Prepared intervention is invalid")
+    }
+    return {
+      intent_sequence: integer(row, "intent_sequence"),
+      client_request_id: payload.client_request_id,
+      actor_id: proposal.source.source_id,
+      run_id: proposal.run_id,
+      expected_sequence: payload.expected_sequence,
+      action_code: payload.action_code,
+      target: payload.target,
+      normalized_input: structuredClone(payload.input),
+      ...(reason ? { reason } : {}),
+      proposal_digest: digest,
+      proposal,
+      prepared_at: text(row, "prepared_at"),
+      expires_at: text(row, "expires_at"),
+      state: state as StoredPreparedIntervention["state"],
+      compatibility: compatibility as StoredPreparedIntervention["compatibility"],
+    }
+  }
+
+  private interventionReceipt(row: Row): StoredInterventionReceipt {
+    if (text(row, "state") !== "submitted") {
+      throw new JournalError(
+        "INTERVENTION_STATE_INVALID",
+        `Intervention ${text(row, "client_request_id")} has no receipt`,
+        { run_id: text(row, "run_id") as RunId },
+      )
+    }
+    const outcome = text(row, "outcome")
+    const acceptedSequence = column(row, "accepted_sequence")
+    const resolvedAt = nullableText(row, "resolved_at")
+    const receivedAt = nullableText(row, "received_at")
+    const revision = column(row, "receipt_revision")
+    const clientRequestId = text(row, "client_request_id")
+    const runId = text(row, "run_id")
+    const proposalEventId = text(row, "proposal_event_id")
+    const proposalDigest = parseDigest(column(row, "proposal_digest"), "Receipt proposal digest")
+    const canonical = this.connection
+      .prepare("SELECT run_id, sequence, proposal_digest FROM mission_events WHERE event_id = ?")
+      .get(proposalEventId) as Row | undefined
+    if (
+      !Schema.Check(ClientRequestIdSchema, clientRequestId) ||
+      !Schema.Check(RunIdSchema, runId) ||
+      !["queued", "accepted", "rejected_stale", "rejected_invalid"].includes(outcome) ||
+      !receivedAt ||
+      !Schema.Check(TimestampSchema, receivedAt) ||
+      (resolvedAt !== undefined && !Schema.Check(TimestampSchema, resolvedAt)) ||
+      typeof revision !== "number" ||
+      !Number.isSafeInteger(revision) ||
+      revision < 1 ||
+      (acceptedSequence !== null &&
+        (typeof acceptedSequence !== "number" ||
+          !Number.isSafeInteger(acceptedSequence) ||
+          acceptedSequence < 1)) ||
+      (outcome === "queued" && (acceptedSequence !== null || resolvedAt !== undefined)) ||
+      (outcome === "accepted" && (acceptedSequence === null || resolvedAt === undefined)) ||
+      (["rejected_stale", "rejected_invalid"].includes(outcome) &&
+        (acceptedSequence !== null || resolvedAt === undefined)) ||
+      (outcome === "accepted" &&
+        (!canonical ||
+          text(canonical, "run_id") !== runId ||
+          integer(canonical, "sequence") !== acceptedSequence ||
+          text(canonical, "proposal_digest") !== proposalDigest)) ||
+      (outcome !== "accepted" && canonical !== undefined)
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Intervention receipt is invalid")
+    }
+    return {
+      client_request_id: clientRequestId as ClientRequestId,
+      proposal_digest: proposalDigest,
+      run_id: runId as RunId,
+      expected_sequence: integer(row, "expected_sequence"),
+      outcome: outcome as StoredInterventionReceipt["outcome"],
+      ...(acceptedSequence === null ? {} : { accepted_sequence: acceptedSequence as number }),
+      received_at: receivedAt,
+      ...(resolvedAt ? { resolved_at: resolvedAt } : {}),
+      revision,
+    }
+  }
+
+  private nextReceiptRevision(): number {
+    return integer(
+      asRow(
+        this.connection
+          .prepare(
+            "SELECT COALESCE(MAX(revision), 0) + 1 AS revision FROM intervention_receipt_updates",
+          )
+          .get(),
+        "next receipt revision",
+      ),
+      "revision",
+    )
+  }
+
+  private insertReceiptUpdate(receipt: StoredInterventionReceipt, recordedAt: string): void {
+    this.connection
+      .prepare(
+        `INSERT INTO intervention_receipt_updates(
+          revision, run_id, client_request_id, receipt_json, recorded_at
+        ) VALUES (?, ?, ?, ?, ?)`,
+      )
+      .run(
+        receipt.revision,
+        receipt.run_id,
+        receipt.client_request_id,
+        canonicalJson(receipt as unknown as JsonObject),
+        recordedAt,
+      )
+  }
+
+  private recordInterventionReceipt(
+    row: Row,
+    outcome: StoredInterventionReceipt["outcome"],
+    receivedAt: string,
+    resolvedAt?: string,
+    acceptedSequence?: number,
+  ): StoredInterventionReceipt {
+    const revision = this.nextReceiptRevision()
+    const result = this.connection
+      .prepare(
+        `UPDATE intervention_intents
+         SET state = 'submitted', submitted_at = ?, outcome = ?, accepted_sequence = ?,
+             received_at = ?, resolved_at = ?, receipt_revision = ?
+         WHERE client_request_id = ? AND state = 'prepared'`,
+      )
+      .run(
+        receivedAt,
+        outcome,
+        acceptedSequence ?? null,
+        receivedAt,
+        resolvedAt ?? null,
+        revision,
+        text(row, "client_request_id"),
+      )
+    if (result.changes !== 1) {
+      throw new JournalError("INTERVENTION_STATE_INVALID", "Intervention state changed", {
+        run_id: text(row, "run_id") as RunId,
+      })
+    }
+    const receipt = this.interventionReceipt(
+      this.interventionIntentRow(text(row, "client_request_id") as ClientRequestId, true),
+    )
+    this.insertReceiptUpdate(receipt, resolvedAt ?? receivedAt)
+    return receipt
+  }
+
+  private resolveQueuedInterventionReceipt(
+    record: PendingInputRecord,
+    outcome: Exclude<StoredInterventionReceipt["outcome"], "queued">,
+    resolvedAt: string,
+    acceptedSequence?: number,
+  ): void {
+    const row = this.interventionIntentRow(record.client_request_id, false)
+    if (!row) {
+      return
+    }
+    if (
+      text(row, "run_id") !== record.run_id ||
+      text(row, "proposal_digest") !== record.proposal_digest ||
+      text(row, "state") !== "submitted" ||
+      text(row, "outcome") !== "queued"
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Queued intervention receipt is invalid", {
+        run_id: record.run_id,
+        event_id: record.proposal.event_id,
+      })
+    }
+    const revision = this.nextReceiptRevision()
+    const result = this.connection
+      .prepare(
+        `UPDATE intervention_intents
+         SET outcome = ?, accepted_sequence = ?, resolved_at = ?, receipt_revision = ?
+         WHERE client_request_id = ? AND outcome = 'queued'`,
+      )
+      .run(outcome, acceptedSequence ?? null, resolvedAt, revision, record.client_request_id)
+    if (result.changes !== 1) {
+      throw new JournalError("INTERVENTION_STATE_INVALID", "Queued intervention state changed", {
+        run_id: record.run_id,
+      })
+    }
+    const receipt = this.interventionReceipt(
+      this.interventionIntentRow(record.client_request_id, true),
+    )
+    this.insertReceiptUpdate(receipt, resolvedAt)
+  }
+
+  private assertQueuedInterventionProposal(event: ProposedEvent, digest: Digest): void {
+    if (!Schema.Check(OperatorInterventionSubmittedPayloadSchema, event.payload)) {
+      throw new JournalError("PENDING_INPUT_INVALID", "Queued intervention payload is invalid", {
+        run_id: event.run_id,
+        event_id: event.event_id,
+      })
+    }
+    const payload = event.payload as unknown as OperatorInterventionSubmittedPayload
+    const row = this.interventionIntentRow(payload.client_request_id, false)
+    if (
+      !row ||
+      text(row, "run_id") !== event.run_id ||
+      text(row, "proposal_event_id") !== event.event_id ||
+      text(row, "proposal_digest") !== digest ||
+      text(row, "state") !== "submitted" ||
+      text(row, "outcome") !== "queued"
+    ) {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        "Queued intervention does not match a submitted proposal",
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+  }
+
+  private receiptUpdateRecord(row: Row): StoredReceiptUpdate {
+    const value = storedJson(text(row, "receipt_json"), "Intervention receipt update")
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new JournalError("CORRUPT_RECORD", "Intervention receipt update is invalid")
+    }
+    const receipt = value as unknown as StoredInterventionReceipt
+    const acceptedSequence = receipt.accepted_sequence
+    const resolvedAt = receipt.resolved_at
+    const recordedAt = text(row, "recorded_at")
+    if (
+      !Schema.Check(ClientRequestIdSchema, receipt.client_request_id) ||
+      !Schema.Check(DigestSchema, receipt.proposal_digest) ||
+      !Schema.Check(RunIdSchema, receipt.run_id) ||
+      !Number.isSafeInteger(receipt.expected_sequence) ||
+      receipt.expected_sequence < 1 ||
+      !["queued", "accepted", "rejected_stale", "rejected_invalid"].includes(receipt.outcome) ||
+      !Schema.Check(TimestampSchema, receipt.received_at) ||
+      (resolvedAt !== undefined && !Schema.Check(TimestampSchema, resolvedAt)) ||
+      (acceptedSequence !== undefined &&
+        (!Number.isSafeInteger(acceptedSequence) || acceptedSequence < 1)) ||
+      (receipt.outcome === "queued" &&
+        (acceptedSequence !== undefined || resolvedAt !== undefined)) ||
+      (receipt.outcome === "accepted" &&
+        (acceptedSequence === undefined || resolvedAt === undefined)) ||
+      (["rejected_stale", "rejected_invalid"].includes(receipt.outcome) &&
+        (acceptedSequence !== undefined || resolvedAt === undefined)) ||
+      receipt.revision !== integer(row, "revision") ||
+      receipt.run_id !== text(row, "run_id") ||
+      receipt.client_request_id !== text(row, "client_request_id") ||
+      !Schema.Check(TimestampSchema, recordedAt)
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Intervention receipt update is invalid")
+    }
+    const intent = this.interventionIntentRow(receipt.client_request_id, false)
+    if (
+      !intent ||
+      receipt.run_id !== text(intent, "run_id") ||
+      receipt.expected_sequence !== integer(intent, "expected_sequence") ||
+      receipt.proposal_digest !== text(intent, "proposal_digest")
+    ) {
+      throw new JournalError("CORRUPT_RECORD", "Intervention receipt update is invalid")
+    }
+    return {
+      revision: receipt.revision,
+      run_id: receipt.run_id,
+      client_request_id: receipt.client_request_id,
+      receipt,
+      recorded_at: recordedAt,
+    }
+  }
+
+  private queuePendingInputInTransaction(
+    event: ProposedEvent,
+    clientRequestId: ClientRequestId,
+    kind: PendingInputKind,
+    expectedSequence: number | undefined,
+    digest: Digest,
+    receivedAt: string,
+  ): IngressReceipt {
+    const run = this.runRow(event.run_id, true)
+    const lease = this.activeLeaseRow(event.run_id)
+    if (!lease || text(lease, "owner_mode") !== "edge") {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        `Run ${event.run_id} is not owned by an edge executor`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    if (event.ownership_epoch > integer(run, "ownership_epoch")) {
+      throw new JournalError(
+        "PENDING_INPUT_INVALID",
+        `Input ${event.event_id} targets a future ownership epoch`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    const existing = this.connection
+      .prepare(
+        `SELECT * FROM pending_inputs
+         WHERE run_id = ? AND (client_request_id = ? OR proposal_event_id = ?)
+         ORDER BY ingress_sequence LIMIT 1`,
+      )
+      .get(event.run_id, clientRequestId, event.event_id) as Row | undefined
+    if (existing) {
+      if (
+        text(existing, "client_request_id") !== clientRequestId ||
+        text(existing, "proposal_event_id") !== event.event_id ||
+        text(existing, "proposal_digest") !== digest
+      ) {
+        throw new JournalError(
+          "PENDING_INPUT_COLLISION",
+          `Input identity conflicts with ingress ${integer(existing, "ingress_sequence")}`,
+          { run_id: event.run_id, event_id: event.event_id },
+        )
+      }
+      return this.pendingReceipt(existing)
+    }
+    const accepted = this.connection
+      .prepare(
+        `SELECT sequence, proposal_digest, recorded_at FROM mission_events
+         WHERE event_id = ?`,
+      )
+      .get(event.event_id) as Row | undefined
+    if (accepted && text(accepted, "proposal_digest") !== digest) {
+      throw new JournalError(
+        "PENDING_INPUT_COLLISION",
+        `Event ${event.event_id} already has different canonical content`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
+    this.connection
+      .prepare(
+        `INSERT INTO pending_inputs(
+          run_id, client_request_id, input_kind, proposal_event_id, proposal_digest,
+          proposal_json, expected_sequence, outcome, accepted_sequence, received_at, resolved_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        event.run_id,
+        clientRequestId,
+        kind,
+        event.event_id,
+        digest,
+        canonicalJson(event as unknown as JsonObject),
+        expectedSequence ?? null,
+        accepted ? "accepted" : "queued",
+        accepted ? integer(accepted, "sequence") : null,
+        receivedAt,
+        accepted ? text(accepted, "recorded_at") : null,
+      )
+    return this.pendingReceipt(this.pendingInputRow(event.run_id, clientRequestId))
+  }
+
   private pendingInputKind(event: ProposedEvent): PendingInputKind {
     if (event.source.kind === "edge") {
       throw new JournalError(
@@ -1826,6 +2552,9 @@ export class SqliteJournal {
         { run_id: record.run_id, event_id: record.proposal.event_id },
       )
     }
+    if (record.input_kind === "intent" && outcome !== "superseded") {
+      this.resolveQueuedInterventionReceipt(record, outcome, resolvedAt, acceptedSequence)
+    }
   }
 
   private resolvePendingTimer(record: PendingInputRecord): void {
@@ -1902,6 +2631,12 @@ export class SqliteJournal {
     }
     if (event.type === "effect.reconciliation_result_recorded") {
       return this.storeDispatchResultInTransaction(event, digest)
+    }
+    if (event.type === "operator.intervention_submitted") {
+      this.assertQueuedInterventionProposal(event, digest)
+      const pending = this.prepareAppend(event, digest)
+      this.storeAppend(pending)
+      return this.appendResult(event.event_id, false)
     }
     if (guardedEventTypes.has(event.type)) {
       throw new JournalError(
@@ -2946,6 +3681,20 @@ export class SqliteJournal {
   }
 
   private prepareAppend(event: ProposedEvent, digest: Digest, recordedAt?: string): PendingAppend {
+    const reserved = this.connection
+      .prepare("SELECT proposal_digest FROM intervention_intents WHERE proposal_event_id = ?")
+      .get(event.event_id) as Row | undefined
+    if (
+      reserved &&
+      (event.type !== "operator.intervention_submitted" ||
+        text(reserved, "proposal_digest") !== digest)
+    ) {
+      throw new JournalError(
+        "EVENT_ID_COLLISION",
+        `Event ${event.event_id} is reserved for a prepared intervention`,
+        { run_id: event.run_id, event_id: event.event_id },
+      )
+    }
     const run = this.runRow(event.run_id, true)
     const definition = this.runtimeFromRow(run)
     const previousState = parseState(text(run, "state_json"))

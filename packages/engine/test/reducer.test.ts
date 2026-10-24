@@ -8,6 +8,7 @@ import {
   mapFields,
   reconcileState,
   safeRetry,
+  waitForOperator,
   waitForObservation,
 } from "@idemantis/sdk"
 import Type from "typebox"
@@ -129,6 +130,43 @@ const subjectRuntime: MissionRuntimeDefinition = {
   execution_binding_digest: `sha256:${"c".repeat(64)}`,
 }
 
+const operatorMission = defineMission({
+  id: "operator-review",
+  version: "1.0.0",
+  input: Type.Object({ release: Type.String() }, { additionalProperties: false }),
+  initial: "review",
+  states: {
+    review: waitForOperator({
+      reason: "Release requires approval",
+      actions: [
+        {
+          code: "approve",
+          consequence: "irreversible",
+          confirmationRequired: true,
+          input: Type.Object(
+            { evidence: Type.String({ minLength: 3 }) },
+            { additionalProperties: false },
+          ),
+          presentationHints: [
+            { path: "evidence", control: "textarea", label: "Evidence", order: 0 },
+          ],
+          evidenceRequired: true,
+          reasonRequired: true,
+          expectedOutcomeLabel: "Release is approved",
+          onAccepted: "complete",
+        },
+      ],
+    }),
+    complete: finalState("completed"),
+  },
+})
+
+const operatorRuntime: MissionRuntimeDefinition = {
+  manifest: operatorMission.manifest,
+  definition_digest: operatorMission.definitionDigest,
+  execution_binding_digest: `sha256:${"d".repeat(64)}`,
+}
+
 const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
 const attemptId = "att_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
 const commandId = "cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
@@ -201,6 +239,50 @@ describe("deterministic reducer", () => {
     expect(result.state_digest).toMatch(/^sha256:[a-f0-9]{64}$/)
     expect(Object.isFrozen(result)).toBe(true)
     expect(Object.isFrozen(result.state)).toBe(true)
+  })
+
+  it("applies only a bound operator intervention at the current sequence", () => {
+    const first = reduceMission(operatorRuntime, null, {
+      ...admission(),
+      payload: {
+        definition_digest: operatorRuntime.definition_digest,
+        execution_binding_digest: operatorRuntime.execution_binding_digest,
+        input: { release: "release-47" },
+      },
+    })
+    expect(first.state).toMatchObject({ status: "paused", current_state: "review" })
+    const intervention = {
+      ...acceptedEvent(2, "operator.intervention_submitted", {
+        client_request_id: "engine-intervention-0001",
+        expected_sequence: 1,
+        action_code: "approve",
+        target: `mission:${runId}`,
+        input: { evidence: "Reviewed deployment record" },
+        reason: "Evidence matches the release",
+      }),
+      source: { kind: "operator" as const, source_id: "operator-1" },
+    }
+    const accepted = reduceMission(operatorRuntime, first.state, intervention)
+
+    expect(accepted.state).toMatchObject({
+      status: "completed",
+      current_state: "complete",
+      current_sequence: 2,
+      terminal_outcome: "completed",
+    })
+    expect(accepted.commands).toEqual([])
+    expect(() =>
+      reduceMission(operatorRuntime, first.state, {
+        ...intervention,
+        source: { kind: "system", source_id: "forged-operator" },
+      }),
+    ).toThrowError(ReductionError)
+    expect(() =>
+      reduceMission(operatorRuntime, first.state, {
+        ...intervention,
+        payload: { ...intervention.payload, expected_sequence: 2 },
+      }),
+    ).toThrowError(ReductionError)
   })
 
   it("separates acknowledgement from observed completion", () => {

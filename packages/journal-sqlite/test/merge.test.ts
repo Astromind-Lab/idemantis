@@ -19,6 +19,7 @@ import {
   fromInput,
   mapFields,
   safeRetry,
+  waitForOperator,
   waitForObservation,
 } from "@idemantis/sdk"
 import { chmodSync, mkdtempSync, rmSync } from "node:fs"
@@ -84,6 +85,43 @@ const runtime: MissionRuntimeDefinition = {
   manifest: mission.manifest,
   definition_digest: mission.definitionDigest,
   execution_binding_digest: `sha256:${"b".repeat(64)}`,
+}
+
+const operatorMission = defineMission({
+  id: "merge-operator-review",
+  version: "1.0.0",
+  input: Type.Object({ release: Type.String() }, { additionalProperties: false }),
+  initial: "review",
+  states: {
+    review: waitForOperator({
+      reason: "Release requires approval",
+      actions: [
+        {
+          code: "approve",
+          consequence: "irreversible",
+          confirmationRequired: true,
+          input: Type.Object(
+            { evidence: Type.String({ minLength: 3 }) },
+            { additionalProperties: false },
+          ),
+          presentationHints: [
+            { path: "evidence", control: "textarea", label: "Evidence", order: 0 },
+          ],
+          evidenceRequired: true,
+          reasonRequired: true,
+          expectedOutcomeLabel: "Release is approved",
+          onAccepted: "complete",
+        },
+      ],
+    }),
+    complete: finalState("completed"),
+  },
+})
+
+const operatorRuntime: MissionRuntimeDefinition = {
+  manifest: operatorMission.manifest,
+  definition_digest: operatorMission.definitionDigest,
+  execution_binding_digest: `sha256:${"d".repeat(64)}`,
 }
 
 const runId = "run_01ARZ3NDEKTSV4RRFFQ69G5FAV" as const
@@ -288,6 +326,87 @@ function setup() {
   return { journal, effect, request, runnerPath }
 }
 
+function setupOperatorEdge() {
+  const journal = new SqliteJournal({
+    path: temporaryPath("operator-runner.sqlite"),
+    clock: journalClock(),
+  })
+  journals.push(journal)
+  journal.admit(
+    operatorRuntime,
+    proposal(
+      eventIds.admission,
+      "mission.admitted",
+      {
+        definition_digest: operatorRuntime.definition_digest,
+        execution_binding_digest: operatorRuntime.execution_binding_digest,
+        input: { release: "release-47" },
+      },
+      { kind: "system", source_id: "merge-test" },
+    ),
+  )
+  const delegationValue: EdgeDelegation = {
+    lease: {
+      lease_id: leaseId,
+      run_id: runId,
+      owner_mode: "edge",
+      owner_id: edgeId,
+      ownership_epoch: 1,
+      branch_anchor_sequence: 1,
+      not_before: "2026-01-01T00:00:00.000Z",
+      not_after: "2026-01-01T01:00:00.000Z",
+      maximum_offline_duration_ms: 3_000_000,
+      allowed_clock_uncertainty_ms: 100,
+      delegation_digest: `sha256:${"a".repeat(64)}`,
+    },
+    definition_digest: operatorRuntime.definition_digest,
+    execution_binding_digest: operatorRuntime.execution_binding_digest,
+    allowed_actions: [
+      {
+        state: "review",
+        effect_class: "observation",
+        operation: "release.review",
+        adapter_instance_id: adapterId,
+        input_digests: [sha256Digest({ release: "release-47" })],
+      },
+    ],
+    allowed_event_types: ["observation.recorded"],
+    resource_limits: { maximum_branch_events: 20, maximum_dispatches: 10 },
+  }
+  const delegation: EdgeDelegation = {
+    ...delegationValue,
+    lease: {
+      ...delegationValue.lease,
+      delegation_digest: edgeDelegationDigest(delegationValue),
+    },
+  }
+  journal.registerOwnershipLease(
+    proposal(
+      eventIds.lease,
+      "ownership.lease_registered",
+      { lease: delegation.lease },
+      { kind: "edge", source_id: edgeId },
+    ),
+  )
+  const clock = new TestClock()
+  const store = new EdgeStore({
+    path: temporaryPath("operator-edge.sqlite"),
+    opened_at: "2026-01-01T00:00:00.000Z",
+  })
+  stores.push(store)
+  const agent = new EdgeAgent({
+    edge_id: edgeId,
+    boot_identity: "boot-operator-1",
+    clock,
+    store,
+  })
+  agent.activate(delegation, { measured_clock_uncertainty_ms: 50 })
+  return {
+    journal,
+    request: { merge_id: mergeId, upload: agent.reconnectUpload() } satisfies EdgeMergeRequest,
+  }
+}
+
 function observation(eventId: ProposedEvent["event_id"] = eventIds.observation): ProposedEvent {
   return proposal(
     eventId,
@@ -315,6 +434,63 @@ afterEach(() => {
 })
 
 describe("edge reconciliation merge", () => {
+  it("advances a queued operator receipt after an empty edge branch merges", () => {
+    const { journal, request } = setupOperatorEdge()
+    const intervention = proposal(
+      eventIds.intent,
+      "operator.intervention_submitted",
+      {
+        client_request_id: "merge-intervention-0001",
+        expected_sequence: 2,
+        action_code: "approve",
+        target: `mission:${runId}`,
+        input: { evidence: "Reviewed deployment record" },
+        reason: "Evidence matches the release",
+      },
+      { kind: "operator", source_id: "operator-1" },
+    )
+    const prepared = journal.prepareIntervention(intervention, "2026-01-01T00:15:00.000Z")
+    expect(() =>
+      journal.queuePendingInput(intervention, {
+        client_request_id: prepared.client_request_id,
+      }),
+    ).toThrowError(expect.objectContaining({ code: "PENDING_INPUT_INVALID" }))
+
+    const submitted = journal.submitIntervention(
+      runId,
+      prepared.client_request_id,
+      prepared.proposal_digest,
+    )
+    expect(submitted).toMatchObject({ status: "receipt", receipt: { outcome: "queued" } })
+    expect(journal.getMission(runId).state.current_sequence).toBe(2)
+
+    const merged = journal.mergeEdgeBranch(request)
+    expect(merged).toMatchObject({
+      final_sequence: 3,
+      edge_events: [],
+      pending_outcomes: [
+        {
+          client_request_id: prepared.client_request_id,
+          outcome: "accepted",
+          event_id: eventIds.intent,
+        },
+      ],
+    })
+    const receipt = journal.getInterventionReceipt(runId, prepared.client_request_id)
+    expect(receipt).toMatchObject({ outcome: "accepted", accepted_sequence: 3, revision: 2 })
+    expect(journal.listReceiptUpdatesAfter(runId, "operator-1", 0)).toEqual([
+      expect.objectContaining({
+        receipt: expect.objectContaining({ outcome: "queued", revision: 1 }),
+      }),
+      expect.objectContaining({ receipt }),
+    ])
+    expect(journal.getMission(runId).state).toMatchObject({
+      status: "completed",
+      current_state: "complete",
+      current_sequence: 3,
+    })
+  })
+
   it("orders edge events before the pending-input watermark and replays the result", () => {
     const { journal, effect, request } = setup()
     const observed = observation()
