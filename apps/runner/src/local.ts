@@ -13,6 +13,7 @@ export interface LocalRunnerOptions {
   state_directory?: string
   reference_seed?: number
   reference_maximum_steps?: number
+  reference_transition_delay_ms?: number
 }
 
 export interface StartedLocalRunner {
@@ -76,6 +77,7 @@ export async function startLocalRunner(
       ...(options.reference_maximum_steps !== undefined
         ? { maximum_steps: options.reference_maximum_steps }
         : {}),
+      transition_delay_ms: options.reference_transition_delay_ms ?? 350,
     })
     const sessions = new SessionAuthority()
     const bootstrap = sessions.issueBootstrap()
@@ -101,6 +103,7 @@ export async function startLocalRunner(
         closed = true
         try {
           await app?.close()
+          await runner.waitForExecutions()
         } finally {
           journal.close()
         }

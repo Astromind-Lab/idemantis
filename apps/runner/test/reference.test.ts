@@ -58,7 +58,7 @@ describe("reference mission runner", () => {
     expect(proof.replay.state_digest).toBe(proof.outcome.state_digest)
   })
 
-  it("admits and executes the reference mission through the operator API", async () => {
+  it("admits and starts the reference mission through the operator API", async () => {
     const { journal, store, runner } = setup()
     const sessions = new SessionAuthority()
     const origin = "http://127.0.0.1:4317"
@@ -94,10 +94,29 @@ describe("reference mission runner", () => {
     })
     const runId = admitted.json().summary.run_id
 
-    const executed = await app.inject({
+    const started = await app.inject({
       method: "POST",
-      url: `/api/missions/${runId}/run`,
+      url: `/api/missions/${runId}/start`,
       headers,
+    })
+    expect(started.statusCode).toBe(202)
+    expect(started.json()).toMatchObject({
+      disposition: "started",
+      execution: { activity: "running", run_id: runId },
+    })
+    expect(journal.getMission(runId).state.current_sequence).toBe(1)
+
+    await runner.waitForExecution(runId)
+
+    const status = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}/execution`,
+      headers: { host, cookie },
+    })
+    const executed = await app.inject({
+      method: "GET",
+      url: `/api/missions/${runId}`,
+      headers: { host, cookie },
     })
     const effects = await app.inject({
       method: "GET",
@@ -106,6 +125,8 @@ describe("reference mission runner", () => {
     })
 
     expect(admitted.statusCode).toBe(201)
+    expect(status.statusCode).toBe(200)
+    expect(status.json()).toMatchObject({ activity: "terminal", run_id: runId })
     expect(executed.statusCode).toBe(200)
     expect(executed.json().projection).toMatchObject({
       status: "completed",
@@ -159,6 +180,59 @@ describe("reference mission runner", () => {
     expect(metrics.reduce((total, metric) => total + metric.applied_effects, 0)).toBe(4)
     expect(verification.event_count).toBe(report.detail.projection.current_sequence)
     expect(verification.state_digest).toBe(report.detail.projection.state_digest)
+  })
+
+  it("starts once and reports asynchronous execution through completion", async () => {
+    const { journal, store, runner } = setup()
+    const admitted = store.admitMission({
+      definition_digest: runner.runtime.definition_digest,
+      input: runner.defaultInput() as JsonObject,
+    })
+    const runId = admitted.summary.run_id
+
+    const first = runner.start(runId)
+    const duplicate = runner.start(runId)
+
+    expect(first).toMatchObject({
+      disposition: "started",
+      execution: { activity: "running" },
+    })
+    expect(duplicate).toMatchObject({
+      disposition: "already_running",
+      execution: { activity: "running" },
+    })
+    expect(journal.getMission(runId).state.current_sequence).toBe(1)
+
+    await runner.waitForExecution(runId)
+
+    expect(runner.executionStatus(runId)).toMatchObject({
+      activity: "terminal",
+      run_id: runId,
+    })
+    expect(journal.getMission(runId).state.terminal_outcome).toBe("completed")
+    expect(runner.start(runId).disposition).toBe("already_terminal")
+  })
+
+  it("reports a failed asynchronous execution without losing the mission", async () => {
+    const journal = new SqliteJournal({ path: ":memory:" })
+    journals.push(journal)
+    const store = new RunnerStore({ journal })
+    const runner = new ReferenceMissionRunner({ journal, store, maximum_steps: 2 })
+    const admitted = store.admitMission({
+      definition_digest: runner.runtime.definition_digest,
+      input: runner.defaultInput() as JsonObject,
+    })
+
+    runner.start(admitted.summary.run_id)
+    await expect(runner.waitForExecution(admitted.summary.run_id)).rejects.toThrow(
+      "execution step limit",
+    )
+
+    expect(runner.executionStatus(admitted.summary.run_id)).toMatchObject({
+      activity: "failed",
+      failure_code: "EXECUTION_FAILED",
+    })
+    expect(journal.getMission(admitted.summary.run_id).state.current_sequence).toBe(5)
   })
 
   it("does not execute a completed mission twice", async () => {
@@ -245,6 +319,38 @@ describe("reference mission runner", () => {
     )
   })
 
+  it("finishes asynchronous execution before closing local state", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-local-close-"))
+    directories.push(directory)
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 1,
+    })
+    localRunners.push(local)
+    const session = await authenticate(local)
+    const admitted = await fetch(`${local.origin}/api/missions`, {
+      method: "POST",
+      headers: { ...session, "content-type": "application/json" },
+      body: JSON.stringify({
+        definition_digest: local.definition_digest,
+        input: local.reference_input,
+      }),
+    })
+    const runId = ((await admitted.json()) as { summary: { run_id: RunId } }).summary.run_id
+    const started = await fetch(`${local.origin}/api/missions/${runId}/start`, {
+      method: "POST",
+      headers: session,
+    })
+
+    expect(started.status).toBe(202)
+    await local.close()
+
+    const reopened = new SqliteJournal({ path: local.journal_path })
+    journals.push(reopened)
+    expect(reopened.getMission(runId).state.terminal_outcome).toBe("completed")
+  })
+
   it("serves and recovers a mission across local runner instances", async () => {
     const directory = mkdtempSync(join(tmpdir(), "idemantis-local-runner-"))
     directories.push(directory)
@@ -252,6 +358,7 @@ describe("reference mission runner", () => {
       port: 0,
       state_directory: directory,
       reference_maximum_steps: 2,
+      reference_transition_delay_ms: 0,
     })
     localRunners.push(first)
     const firstSession = await authenticate(first)
@@ -274,7 +381,11 @@ describe("reference mission runner", () => {
     expect(interrupted.status).toBe(500)
     await first.close()
 
-    const second = await startLocalRunner({ port: 0, state_directory: directory })
+    const second = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+    })
     localRunners.push(second)
     const secondSession = await authenticate(second)
     const recovered = await fetch(`${second.origin}/api/missions/${runId}/run`, {
