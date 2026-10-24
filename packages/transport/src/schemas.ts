@@ -559,6 +559,7 @@ export const StreamEnvelopeSchema = Type.Union([
 
 export type ApiError = Type.Static<typeof ApiErrorSchema>
 export type ProtectedValue = Type.Static<typeof ProtectedValueSchema>
+export type AttentionReason = Type.Static<typeof AttentionReasonSchema>
 export type MissionSummary = Type.Static<typeof MissionSummarySchema>
 export type MissionListQuery = Type.Static<typeof MissionListQuerySchema>
 export type MissionListPage = Type.Static<typeof MissionListPageSchema>
