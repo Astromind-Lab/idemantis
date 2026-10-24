@@ -51,16 +51,27 @@ class IdemantisClient:
             body["subject_reference_keys"] = subject_reference_keys
         return self._request("POST", "/api/plans", body)
 
-    def admit(self, definition_digest: str, input: Dict[str, Any]) -> Dict[str, Any]:
-        return self._request(
-            "POST", "/api/missions", {"definition_digest": definition_digest, "input": input}
-        )
+    def admit(
+        self,
+        definition_digest: str,
+        input: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {"definition_digest": definition_digest, "input": input}
+        if idempotency_key is not None:
+            body["client_request_id"] = client_request_id_for(f"admission:{idempotency_key}")
+        return self._request("POST", "/api/missions", body)
 
     def start(self, run_id: str) -> Dict[str, Any]:
         return self._request("POST", f"/api/missions/{self._id(run_id)}/start", {})
 
-    def launch(self, definition_digest: str, input: Dict[str, Any]) -> Dict[str, Any]:
-        admitted = self.admit(definition_digest, input)
+    def launch(
+        self,
+        definition_digest: str,
+        input: Dict[str, Any],
+        idempotency_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        admitted = self.admit(definition_digest, input, idempotency_key)
         self.start(admitted["summary"]["run_id"])
         return admitted
 

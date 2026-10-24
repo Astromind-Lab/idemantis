@@ -108,7 +108,9 @@ class RunnerIntegrationTest(unittest.TestCase):
         self.assertEqual(self.client.health()["status"], "ready")
         self.assertEqual(sorted(item["key"] for item in self.client.operations()), ["crm.open", "mail.send"])
         digest = self.register()
-        run_id = self.client.launch(digest, {"subject": "printer"})["summary"]["run_id"]
+        run_id = self.client.launch(digest, {"subject": "printer"}, "printer")["summary"]["run_id"]
+        again = self.client.launch(digest, {"subject": "printer"}, "printer")["summary"]["run_id"]
+        self.assertEqual(again, run_id)
         context = self.client.wait_for(run_id, timeout=10, interval=0.05)
         self.assertEqual(context["terminal_outcome"], "completed")
         self.assertEqual(
