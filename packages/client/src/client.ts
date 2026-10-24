@@ -146,16 +146,28 @@ export class IdemantisClient {
     return this.request("POST", "/api/plans", { plan, ...options })
   }
 
-  async admit(definitionDigest: string, input: JsonObject): Promise<MissionDetail> {
-    return this.request("POST", "/api/missions", { definition_digest: definitionDigest, input })
+  async admit(
+    definitionDigest: string,
+    input: JsonObject,
+    options: { client_request_id?: string } = {},
+  ): Promise<MissionDetail> {
+    return this.request("POST", "/api/missions", {
+      definition_digest: definitionDigest,
+      input,
+      ...options,
+    })
   }
 
   async start(runId: RunId): Promise<MissionExecutionStart> {
     return this.request("POST", `/api/missions/${this.id(runId)}/start`, {})
   }
 
-  async launch(definitionDigest: string, input: JsonObject): Promise<MissionDetail> {
-    const admitted = await this.admit(definitionDigest, input)
+  async launch(
+    definitionDigest: string,
+    input: JsonObject,
+    options: { client_request_id?: string } = {},
+  ): Promise<MissionDetail> {
+    const admitted = await this.admit(definitionDigest, input, options)
     await this.start(admitted.summary.run_id)
     return admitted
   }
