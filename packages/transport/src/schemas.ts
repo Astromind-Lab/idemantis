@@ -414,6 +414,83 @@ export const ObservationReceiptSchema = Type.Object(
   { additionalProperties: false },
 )
 
+export const MissionContextEffectSchema = Type.Object(
+  {
+    effect_id: EffectIdSchema,
+    state_name: Type.String({ minLength: 1, maxLength: 128 }),
+    operation: Type.String({ minLength: 1, maxLength: 128 }),
+    status: EffectStatusSchema,
+    phase: Type.Union([
+      Type.Literal("done"),
+      Type.Literal("in_flight"),
+      Type.Literal("uncertain"),
+      Type.Literal("failed"),
+    ]),
+    issue_count: Type.Integer({ minimum: 0 }),
+    output: Type.Optional(JsonValueSchema),
+    external_reference: Type.Optional(Type.String({ minLength: 1, maxLength: 256 })),
+    evidence: Type.Optional(JsonObjectSchema),
+  },
+  { additionalProperties: false },
+)
+
+export const MissionNextStepSchema = Type.Object(
+  {
+    actor: Type.Union([
+      Type.Literal("runner"),
+      Type.Literal("observation"),
+      Type.Literal("operator"),
+      Type.Literal("none"),
+    ]),
+    summary: Type.String({ minLength: 1, maxLength: 512 }),
+    operation: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    observation_type: Type.Optional(Type.String({ minLength: 1, maxLength: 128 })),
+    effect_id: Type.Optional(EffectIdSchema),
+    subject: Type.Optional(JsonValueSchema),
+    deadline: Type.Optional(TimestampSchema),
+    actions: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 128 }))),
+  },
+  { additionalProperties: false },
+)
+
+export const MissionContextSchema = Type.Object(
+  {
+    schema_version: Type.Literal(ApiSchemaVersion),
+    run_id: RunIdSchema,
+    definition_id: Type.String({ minLength: 1, maxLength: 128 }),
+    definition_version: Type.String({ minLength: 1, maxLength: 128 }),
+    status: MissionStatusSchema,
+    current_state: Type.String({ minLength: 1, maxLength: 128 }),
+    state_kind: Type.Union([
+      Type.Literal("effect"),
+      Type.Literal("observation_wait"),
+      Type.Literal("reconcile"),
+      Type.Literal("operator_wait"),
+      Type.Literal("final"),
+    ]),
+    terminal_outcome: Type.Union([Type.String({ minLength: 1, maxLength: 64 }), Type.Null()]),
+    sequence: Type.Integer({ minimum: 1 }),
+    state_digest: DigestSchema,
+    input: JsonObjectSchema,
+    attention_reason: Type.Optional(AttentionReasonSchema),
+    effects: Type.Array(MissionContextEffectSchema, { maxItems: 1000 }),
+    next: MissionNextStepSchema,
+    execution: Type.Optional(MissionExecutionStatusSchema),
+    recent_events: Type.Array(
+      Type.Object(
+        {
+          sequence: Type.Integer({ minimum: 1 }),
+          event_type: EventTypeSchema,
+          recorded_at: TimestampSchema,
+        },
+        { additionalProperties: false },
+      ),
+      { maxItems: 20 },
+    ),
+  },
+  { additionalProperties: false },
+)
+
 export const TimelineEntrySchema = Type.Object(
   {
     sequence: Type.Integer({ minimum: 1 }),
@@ -702,6 +779,9 @@ export type MissionExecutionStatus = Type.Static<typeof MissionExecutionStatusSc
 export type RecordObservationRequest = Type.Static<typeof RecordObservationRequestSchema>
 export type ObservationReceipt = Type.Static<typeof ObservationReceiptSchema>
 export type MissionExecutionStart = Type.Static<typeof MissionExecutionStartSchema>
+export type MissionContextEffect = Type.Static<typeof MissionContextEffectSchema>
+export type MissionNextStep = Type.Static<typeof MissionNextStepSchema>
+export type MissionContext = Type.Static<typeof MissionContextSchema>
 export type TimelineEntry = Type.Static<typeof TimelineEntrySchema>
 export type TimelinePage = Type.Static<typeof TimelinePageSchema>
 export type EffectSummary = Type.Static<typeof EffectSummarySchema>

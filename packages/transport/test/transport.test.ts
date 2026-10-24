@@ -12,6 +12,7 @@ import {
   MissionExecutionStartSchema,
   MissionExecutionStatusSchema,
   MissionListPageSchema,
+  MissionContextSchema,
   ObservationReceiptSchema,
   queueBucketFor,
   RecordObservationRequestSchema,
@@ -157,6 +158,53 @@ describe("transport contracts", () => {
         disposition: "duplicate",
       }),
     ).toBe(true)
+  })
+
+  it("validates the mission resume context", () => {
+    const context = {
+      schema_version: 1,
+      run_id: runId,
+      definition_id: "agent.research",
+      definition_version: "1.0.0",
+      status: "waiting",
+      current_state: "await_review",
+      state_kind: "observation_wait",
+      terminal_outcome: null,
+      sequence: 7,
+      state_digest: `sha256:${"a".repeat(64)}`,
+      input: { topic: "fleet charging" },
+      effects: [
+        {
+          effect_id: "eff_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+          state_name: "draft",
+          operation: "llm.draft",
+          status: "settled",
+          phase: "done",
+          issue_count: 1,
+          output: { draft: "..." },
+        },
+      ],
+      next: {
+        actor: "observation",
+        summary: "Waiting for review.approved",
+        observation_type: "review.approved",
+        effect_id: "eff_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        deadline: "2026-10-24T01:00:00.000Z",
+      },
+      recent_events: [
+        {
+          sequence: 7,
+          event_type: "effect.issue_result_recorded",
+          recorded_at: "2026-10-24T00:00:00.000Z",
+        },
+      ],
+    }
+
+    expect(Schema.Check(MissionContextSchema, context)).toBe(true)
+    expect(Schema.Check(MissionContextSchema, { ...context, state_kind: "sleeping" })).toBe(false)
+    expect(
+      Schema.Check(MissionContextSchema, { ...context, next: { actor: "agent", summary: "x" } }),
+    ).toBe(false)
   })
 
   it("enforces the bounded intervention form subset", () => {
