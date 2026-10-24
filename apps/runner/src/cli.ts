@@ -113,6 +113,9 @@ export async function runCli(
     write(`Runner ready: ${started.origin}\n`)
     write(`Operator bootstrap: ${started.bootstrap_url}\n`)
     write(`Journal: ${started.journal_path}\n`)
+    if (started.resumed.length > 0) {
+      write(`Resumed missions: ${started.resumed.length}\n`)
+    }
     await new Promise<void>((resolvePromise) => {
       process.once("SIGINT", resolvePromise)
       process.once("SIGTERM", resolvePromise)
