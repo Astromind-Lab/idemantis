@@ -378,18 +378,34 @@ describe("command dispatcher", () => {
       identities: identities(),
     })
 
-    expect(restarted.recoverInterrupted(runId)).toEqual([])
-    expect(stranger.recoverInterrupted(runId)).toEqual([])
+    expect(await restarted.recoverInterrupted(runId)).toEqual([])
+    expect(await stranger.recoverInterrupted(runId)).toEqual([])
     clock.advanceTo("2026-01-01T00:01:02Z")
-    const recovered = restarted.recoverInterrupted(runId)
+    const recovered = await restarted.recoverInterrupted(runId)
 
     expect(recovered).toMatchObject([{ run_id: runId, result: "uncertain" }])
     expect(recovered[0]?.result_recorded.acceptance.event_id).toBe("evt_01ARZ3NDEKTSV4RRFFQ69G5FB0")
-    expect(restarted.recoverInterrupted(runId)).toEqual([])
+    expect(await restarted.recoverInterrupted(runId)).toEqual([])
     expect(journal.getMission(runId).state.current_state).toBe("reconcileVehicle")
-    expect(await restarted.dispatchNext(runId)).toMatchObject({
-      status: "recorded",
-      result: "confirmed_completed",
+
+    const hung = new CommandDispatcher({
+      journal,
+      executor: { issue: vi.fn(), reconcile: vi.fn(() => new Promise<never>(() => {})) },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: new FixedIdentities(
+        ["att_01ARZ3NDEKTSV4RRFFQ69G5FB1"],
+        ["evt_01ARZ3NDEKTSV4RRFFQ69G5FB3"],
+      ),
+    })
+    void hung.dispatchNext(runId)
+    clock.advanceTo("2026-01-01T00:02:03Z")
+    const reconciled = await restarted.recoverInterrupted(runId)
+
+    expect(reconciled).toMatchObject([{ run_id: runId, result: "confirmed_completed" }])
+    expect(journal.listEvents(runId).at(-1)?.payload).toMatchObject({
+      evidence: { repeated_after_interruption: true },
     })
     expect(issue).toHaveBeenCalledOnce()
     expect(reconcile).toHaveBeenCalledOnce()

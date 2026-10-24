@@ -156,7 +156,7 @@ export class CommandDispatcher {
     }
   }
 
-  recoverInterrupted(runId: RunId): InterruptedDispatchRecovery[] {
+  async recoverInterrupted(runId: RunId): Promise<InterruptedDispatchRecovery[]> {
     const now = this.#clock.now().getTime()
     const commands = new Map(
       this.#journal.listCommands(runId).map((command) => [command.command_id, command]),
@@ -177,7 +177,10 @@ export class CommandDispatcher {
         continue
       }
       const issue = command.kind === "effect.issue"
-      const result = issue ? "uncertain" : "unknown"
+      const report: ExecutionReport<IssueResult | ReconciliationResult> = issue
+        ? { result: "uncertain", evidence: { interrupted: "dispatch did not report a result" } }
+        : await this.reconcileAgain(command, attempt, now)
+      const { result } = report
       const resultRecorded = this.#journal.recordDispatchResult(
         this.event(
           { command, attempt },
@@ -187,6 +190,7 @@ export class CommandDispatcher {
             command_id: command.command_id,
             effect_id: attempt.effect_id,
             result,
+            ...reportDetails(report),
           },
           attempt.started_event_id,
         ),
@@ -200,6 +204,23 @@ export class CommandDispatcher {
       })
     }
     return recovered
+  }
+
+  private async reconcileAgain(
+    command: ClaimedCommand["command"],
+    attempt: ClaimedCommand["attempt"],
+    now: number,
+  ): Promise<ExecutionReport<IssueResult | ReconciliationResult>> {
+    const deadline = new Date(now + this.#leaseDurationMs).toISOString()
+    const report = await this.execute({
+      command: { ...command, claim_deadline: deadline },
+      attempt: { ...attempt, claim_deadline: deadline },
+    })
+    const evidence =
+      report.evidence && typeof report.evidence === "object" && !Array.isArray(report.evidence)
+        ? report.evidence
+        : {}
+    return { ...report, evidence: { ...evidence, repeated_after_interruption: true } }
   }
 
   private async execute(
