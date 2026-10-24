@@ -706,6 +706,95 @@ describe("hosted mission runner", () => {
     })
     expect(issue).toHaveBeenCalledOnce()
   })
+
+  it("compiles, registers, and runs a plan an agent wrote in JSON", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-plan-"))
+    directories.push(directory)
+    const issue = vi.fn(async () => ({ result: "completed" as const, output: { delivered: true } }))
+    const operation = sendOperation(issue, vi.fn())
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+      adapters: [mailer(operation)],
+    })
+    localRunners.push(local)
+    const keys = new ApiKeyStore({ path: local.access_path })
+    const planner = keys.create("planner", ["view", "operate", "define"]).token
+    const worker = keys.create("worker", ["view", "operate"]).token
+    keys.close()
+    const call = async (token: string, path: string, body?: unknown) => {
+      const response = await fetch(`${local.origin}${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+      return { status: response.status, body: (await response.json()) as never }
+    }
+    const plan = {
+      id: "agent.notify",
+      version: "1.0.0",
+      input_schema: {
+        type: "object",
+        properties: { message_id: { type: "string" }, body: { type: "string" } },
+        required: ["message_id", "body"],
+        additionalProperties: false,
+      },
+      steps: [
+        {
+          name: "send",
+          operation: "mailer.send",
+          input: {
+            kind: "object",
+            fields: {
+              message_id: { kind: "input", path: ["message_id"] },
+              body: { kind: "input", path: ["body"] },
+            },
+          },
+        },
+      ],
+    }
+
+    const operations = await call(worker, "/api/operations")
+    const denied = await call(worker, "/api/plans", { plan })
+    const invalid = await call(planner, "/api/plans", {
+      plan: { ...plan, steps: [{ ...plan.steps[0], operation: "shell.exec" }] },
+    })
+    const registered = await call(planner, "/api/plans", { plan })
+    const digest = (registered.body as { definition_digest: string }).definition_digest
+    const admitted = await call(worker, "/api/missions", {
+      definition_digest: digest,
+      input: { message_id: "msg-20", body: "Planned by an agent" },
+    })
+    const runId = (admitted.body as { summary: { run_id: RunId } }).summary.run_id
+    await call(worker, `/api/missions/${runId}/start`, {})
+    await vi.waitFor(
+      async () =>
+        expect(
+          ((await call(worker, `/api/missions/${runId}/context`)).body as { status: string })
+            .status,
+        ).toBe("completed"),
+      { timeout: 2_000, interval: 20 },
+    )
+
+    expect(operations.body).toMatchObject({
+      items: [{ key: "mailer.send", duplicate_safety: "native_idempotency" }],
+    })
+    expect(denied.status).toBe(403)
+    expect(invalid.status).toBe(422)
+    expect(invalid.body).toMatchObject({
+      error: { message: expect.stringMatching(/not connected/) },
+    })
+    expect(registered.status).toBe(201)
+    expect(registered.body).toMatchObject({
+      definition_id: "agent.notify",
+      states: ["done", "failed", "send", "send_reconcile", "unresolved"],
+    })
+    expect(issue).toHaveBeenCalledOnce()
+  })
 })
 
 async function authenticate(runner: StartedLocalRunner) {
