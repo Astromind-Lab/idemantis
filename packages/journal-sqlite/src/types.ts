@@ -77,6 +77,17 @@ export interface StoredMission {
   updated_at: string
 }
 
+export interface StoredDefinition {
+  runtime: MissionRuntimeDefinition
+  subject_reference_keys: string[]
+  registered_at: string
+  updated_at: string
+}
+
+export interface RegisterDefinitionOptions {
+  subject_reference_keys?: readonly string[]
+}
+
 export interface StoredEvent {
   event: AcceptedEvent
   proposal_digest: Digest

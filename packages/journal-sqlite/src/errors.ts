@@ -30,6 +30,7 @@ export type JournalErrorCode =
   | "INTERVENTION_INVALID"
   | "INTERVENTION_COLLISION"
   | "INTERVENTION_STATE_INVALID"
+  | "DEFINITION_INVALID"
 
 export class JournalError extends Error {
   override readonly name = "JournalError"

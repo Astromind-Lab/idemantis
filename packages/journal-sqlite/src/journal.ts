@@ -119,6 +119,8 @@ import type {
   StoredInterventionReceipt,
   StoredPreparedIntervention,
   StoredReceiptUpdate,
+  RegisterDefinitionOptions,
+  StoredDefinition,
   StoredEvent,
   StoredMission,
   SubmitInterventionResult,
@@ -1414,6 +1416,68 @@ export class SqliteJournal {
       .prepare("SELECT * FROM mission_runs ORDER BY updated_at DESC, run_id")
       .all()
       .map((raw) => this.storedMission(raw as Row))
+  }
+
+  registerDefinition(
+    definition: MissionRuntimeDefinition,
+    options: RegisterDefinitionOptions = {},
+  ): StoredDefinition {
+    this.#database.assertOpen()
+    const runtime = this.validDefinition(definition)
+    const manifest = runtime.manifest
+    const definitionDigest = runtime.definition_digest
+    const bindingDigest = runtime.execution_binding_digest
+    const keys = [...new Set(options.subject_reference_keys ?? [])]
+    if (keys.some((key) => typeof key !== "string" || key.length < 1 || key.length > 64)) {
+      throw new JournalError("DEFINITION_INVALID", "Subject reference keys are invalid")
+    }
+    const recordedAt = timestamp(this.#clock)
+    return this.#database.transaction(() => {
+      this.connection
+        .prepare(
+          `INSERT INTO mission_definitions(
+            definition_digest, definition_id, definition_version, execution_binding_digest,
+            manifest_json, subject_reference_keys_json, registered_at, updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(definition_digest) DO UPDATE SET
+            execution_binding_digest = excluded.execution_binding_digest,
+            subject_reference_keys_json = excluded.subject_reference_keys_json,
+            updated_at = excluded.updated_at`,
+        )
+        .run(
+          definitionDigest,
+          manifest.definition_id,
+          manifest.definition_version,
+          bindingDigest,
+          manifestJson(manifest),
+          JSON.stringify(keys),
+          recordedAt,
+          recordedAt,
+        )
+      const stored = this.getDefinition(definitionDigest)
+      if (!stored) {
+        throw new JournalError("CORRUPT_RECORD", "Registered definition could not be read back")
+      }
+      return stored
+    })
+  }
+
+  getDefinition(definitionDigest: string): StoredDefinition | undefined {
+    this.#database.assertOpen()
+    const row = this.connection
+      .prepare("SELECT * FROM mission_definitions WHERE definition_digest = ?")
+      .get(definitionDigest) as Row | undefined
+    return row ? this.storedDefinition(row) : undefined
+  }
+
+  listDefinitions(): StoredDefinition[] {
+    this.#database.assertOpen()
+    return this.connection
+      .prepare(
+        "SELECT * FROM mission_definitions ORDER BY definition_id, definition_version, definition_digest",
+      )
+      .all()
+      .map((raw) => this.storedDefinition(raw as Row))
   }
 
   missionListRevision(): number {
@@ -3779,6 +3843,39 @@ export class SqliteJournal {
         column(row, "execution_binding_digest"),
         "Execution binding digest",
       ),
+    }
+  }
+
+  private validDefinition(definition: MissionRuntimeDefinition): MissionRuntimeDefinition {
+    let runtime: MissionRuntimeDefinition
+    try {
+      runtime = {
+        manifest: parseManifest(manifestJson(definition.manifest)),
+        definition_digest: parseDigest(definition.definition_digest, "Definition digest"),
+        execution_binding_digest: parseDigest(
+          definition.execution_binding_digest,
+          "Execution binding digest",
+        ),
+      }
+    } catch {
+      throw new JournalError("DEFINITION_INVALID", "Mission definition is invalid")
+    }
+    if (sha256Digest(runtime.manifest as unknown as JsonObject) !== runtime.definition_digest) {
+      throw new JournalError("DEFINITION_INVALID", "Definition digest does not match its manifest")
+    }
+    return runtime
+  }
+
+  private storedDefinition(row: Row): StoredDefinition {
+    const keys = storedJson(text(row, "subject_reference_keys_json"), "Subject reference keys")
+    if (!Array.isArray(keys) || keys.some((key) => typeof key !== "string")) {
+      throw new JournalError("CORRUPT_RECORD", "Stored subject reference keys are invalid")
+    }
+    return {
+      runtime: this.runtimeFromRow(row),
+      subject_reference_keys: keys as string[],
+      registered_at: text(row, "registered_at"),
+      updated_at: text(row, "updated_at"),
     }
   }
 
