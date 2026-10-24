@@ -39,6 +39,20 @@ export class MissionRouter {
     return this.select(runId).executionStatus(runId)
   }
 
+  resume(): RunId[] {
+    const resumed: RunId[] = []
+    for (const mission of this.#journal.listMissions()) {
+      if (mission.state.terminal_outcome) {
+        continue
+      }
+      const executor = this.#executors.find((candidate) => candidate.accepts(mission.runtime))
+      if (executor?.start(mission.state.run_id).disposition === "started") {
+        resumed.push(mission.state.run_id)
+      }
+    }
+    return resumed.sort()
+  }
+
   private select(runId: RunId): RoutableMissionExecutor {
     const runtime = this.#journal.getMission(runId).runtime
     const executor = this.#executors.find((candidate) => candidate.accepts(runtime))

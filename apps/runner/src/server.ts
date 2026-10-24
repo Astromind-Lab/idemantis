@@ -394,6 +394,18 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
       throw new TransportError("INVALID_REQUEST", "Definition digest is required", 422)
     }
     const input = object(field(body, "input")) as JsonObject
+    const definition = options.store.definition(definitionDigest)
+    if (
+      definition &&
+      options.mission_executor?.accepts &&
+      !options.mission_executor.accepts(definition)
+    ) {
+      throw new TransportError(
+        "INVALID_REQUEST",
+        "No configured executor can run this definition",
+        422,
+      )
+    }
     const detail = options.store.admitMission({
       definition_digest: definitionDigest,
       input,

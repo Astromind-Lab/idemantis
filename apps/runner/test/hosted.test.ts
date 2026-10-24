@@ -26,7 +26,7 @@ import Type, { type TSchema } from "typebox"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createHttpAdapterHandler } from "@idemantis/adapter-http"
 import { AdapterHost, connectRemoteAdapters, type HostedAdapter } from "../src/adapters.js"
-import { adapterConnections } from "../src/cli.js"
+import { adapterConnections, leaseDuration } from "../src/cli.js"
 import { HostedMissionRunner } from "../src/hosted.js"
 import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 import { RunnerStore } from "../src/store.js"
@@ -522,6 +522,92 @@ describe("hosted mission runner", () => {
         .projection.terminal_outcome,
     ).toBe("completed")
     expect(issue).toHaveBeenCalledOnce()
+  })
+
+  it("keeps definitions and resumes unfinished missions after a restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-restart-"))
+    directories.push(directory)
+    const issue = vi.fn(async () => ({ result: "completed" as const, output: { delivered: true } }))
+    const operation = sendOperation(issue, vi.fn())
+    const options = {
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+      adapters: [mailer(operation)],
+    }
+    const mission = missionFor(operation)
+    const runtime = new AdapterHost({
+      source_id: "hosted.runner",
+      adapters: [mailer(operation)],
+    }).bind({ manifest: mission.manifest, definition_digest: mission.definitionDigest })
+    const client = async (local: StartedLocalRunner) => {
+      const session = await authenticate(local)
+      return {
+        post: (path: string, body: unknown) =>
+          fetch(`${local.origin}${path}`, {
+            method: "POST",
+            headers: { ...session, "content-type": "application/json" },
+            body: JSON.stringify(body),
+          }),
+        get: async (path: string) =>
+          (await fetch(`${local.origin}${path}`, { headers: { cookie: session.cookie } })).json(),
+      }
+    }
+
+    const first = await startLocalRunner(options)
+    const before = await client(first)
+    await before.post("/api/definitions", { runtime })
+    const admitted = await before.post("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-6", body: "Queued before restart" },
+    })
+    const runId = ((await admitted.json()) as { summary: { run_id: RunId } }).summary.run_id
+    await first.close()
+    expect(issue).not.toHaveBeenCalled()
+
+    const second = await startLocalRunner(options)
+    localRunners.push(second)
+    const after = await client(second)
+    expect(second.resumed).toEqual([runId])
+    await vi.waitFor(
+      async () =>
+        expect(
+          ((await after.get(`/api/missions/${runId}`)) as { projection: { status: string } })
+            .projection.status,
+        ).toBe("completed"),
+      { timeout: 2_000, interval: 20 },
+    )
+    const definitions = (await after.get("/api/definitions")) as {
+      items: { definition_digest: string }[]
+    }
+    const again = await after.post("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-7", body: "Admitted after restart" },
+    })
+    await second.close()
+    localRunners.splice(localRunners.indexOf(second), 1)
+
+    const withoutAdapters = await startLocalRunner({ ...options, adapters: [] })
+    localRunners.push(withoutAdapters)
+    const unbound = await (await client(withoutAdapters)).post("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-8", body: "No adapter is connected" },
+    })
+
+    expect(definitions.items.map((item) => item.definition_digest)).toContain(
+      runtime.definition_digest,
+    )
+    expect(again.status).toBe(201)
+    expect(unbound.status).toBe(422)
+    expect(withoutAdapters.resumed).toEqual([])
+    expect(issue).toHaveBeenCalledOnce()
+  })
+
+  it("parses the lease duration option", () => {
+    expect(leaseDuration(undefined)).toBeUndefined()
+    expect(leaseDuration("5000")).toBe(5_000)
+    expect(() => leaseDuration("999")).toThrow(TypeError)
+    expect(() => leaseDuration("5s")).toThrow(TypeError)
   })
 })
 

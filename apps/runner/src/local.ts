@@ -1,6 +1,7 @@
 import { chmodSync, lstatSync, mkdirSync } from "node:fs"
 import { createServer } from "node:net"
 import { join, resolve } from "node:path"
+import type { RunId } from "@idemantis/contracts"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import type { ReferenceDeliveryInput } from "@idemantis/simulator"
 import {
@@ -24,6 +25,8 @@ export interface LocalRunnerOptions {
   reference_transition_delay_ms?: number
   adapters?: readonly HostedAdapter[]
   remote_adapters?: readonly RemoteAdapterConnection[]
+  lease_duration_ms?: number
+  resume?: boolean
 }
 
 export interface StartedLocalRunner {
@@ -32,6 +35,7 @@ export interface StartedLocalRunner {
   journal_path: string
   definition_digest: string
   reference_input: ReferenceDeliveryInput
+  resumed: RunId[]
   close(): Promise<void>
 }
 
@@ -99,6 +103,9 @@ export async function startLocalRunner(
         ? new HostedMissionRunner({
             journal,
             host: new AdapterHost({ adapters, source_id: "hosted.runner" }),
+            ...(options.lease_duration_ms !== undefined
+              ? { lease_duration_ms: options.lease_duration_ms }
+              : {}),
           })
         : undefined
     const router = new MissionRouter(journal, hosted ? [runner, hosted] : [runner])
@@ -112,6 +119,7 @@ export async function startLocalRunner(
       mission_executor: router,
     })
     await app.listen({ host: "127.0.0.1", port })
+    const resumed = options.resume === false ? [] : router.resume()
     let closed = false
     return {
       origin,
@@ -119,6 +127,7 @@ export async function startLocalRunner(
       journal_path: journalPath,
       definition_digest: runner.runtime.definition_digest,
       reference_input: runner.defaultInput(),
+      resumed,
       close: async () => {
         if (closed) {
           return

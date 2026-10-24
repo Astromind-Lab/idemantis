@@ -373,6 +373,22 @@ CREATE INDEX intervention_receipt_updates_run_revision_idx
 ON intervention_receipt_updates(run_id, revision);
 `
 
+const definitionsSql = `
+CREATE TABLE mission_definitions (
+  definition_digest TEXT PRIMARY KEY,
+  definition_id TEXT NOT NULL,
+  definition_version TEXT NOT NULL,
+  execution_binding_digest TEXT NOT NULL,
+  manifest_json TEXT NOT NULL CHECK (json_valid(manifest_json)),
+  subject_reference_keys_json TEXT NOT NULL CHECK (json_valid(subject_reference_keys_json)),
+  registered_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+) STRICT;
+
+CREATE INDEX mission_definitions_id_version_idx
+ON mission_definitions(definition_id, definition_version);
+`
+
 function migration(version: number, name: string, sql: string): Migration {
   return {
     version,
@@ -388,4 +404,5 @@ export const migrations = [
   migration(3, "ownership_epochs", ownershipEpochsSql),
   migration(4, "edge_reconciliation", edgeReconciliationSql),
   migration(5, "interventions", interventionsSql),
+  migration(6, "mission_definitions", definitionsSql),
 ] as const

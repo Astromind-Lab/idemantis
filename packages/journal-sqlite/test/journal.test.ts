@@ -318,7 +318,7 @@ describe("SQLite journal", () => {
     const journal = open(path)
 
     expect(journal.storageInfo()).toEqual({
-      schema_version: 5,
+      schema_version: 6,
       journal_mode: "wal",
       foreign_keys: true,
     })
@@ -353,8 +353,48 @@ describe("SQLite journal", () => {
 
     const journal = open(path)
 
-    expect(journal.storageInfo().schema_version).toBe(5)
+    expect(journal.storageInfo().schema_version).toBe(6)
     expect(() => admitted(journal)).not.toThrow()
+  })
+
+  it("persists registered definitions across reopen", () => {
+    const path = journalPath()
+    const journal = open(path)
+
+    const stored = journal.registerDefinition(runtime, {
+      subject_reference_keys: ["vehicle", "vehicle", "route"],
+    })
+    expect(stored.runtime).toEqual(runtime)
+    expect(stored.subject_reference_keys).toEqual(["vehicle", "route"])
+    const rebound = journal.registerDefinition(
+      { ...runtime, execution_binding_digest: `sha256:${"c".repeat(64)}` },
+      { subject_reference_keys: ["vehicle"] },
+    )
+    expect(rebound.registered_at).toBe(stored.registered_at)
+    journal.close()
+
+    const reopened = open(path)
+    expect(reopened.listDefinitions()).toHaveLength(1)
+    expect(reopened.getDefinition(runtime.definition_digest)).toMatchObject({
+      runtime: { execution_binding_digest: `sha256:${"c".repeat(64)}` },
+      subject_reference_keys: ["vehicle"],
+    })
+    expect(reopened.getDefinition(`sha256:${"d".repeat(64)}`)).toBeUndefined()
+  })
+
+  it("rejects definitions whose digest does not match the manifest", () => {
+    const journal = open(journalPath())
+
+    expect(() =>
+      journal.registerDefinition({ ...runtime, definition_digest: `sha256:${"e".repeat(64)}` }),
+    ).toThrow(expect.objectContaining({ code: "DEFINITION_INVALID" }))
+    expect(() =>
+      journal.registerDefinition({
+        ...runtime,
+        manifest: { ...runtime.manifest, states: "invalid" } as never,
+      }),
+    ).toThrow(expect.objectContaining({ code: "DEFINITION_INVALID" }))
+    expect(journal.listDefinitions()).toEqual([])
   })
 
   it("commits admission, projection, effect, and outbox atomically", () => {
