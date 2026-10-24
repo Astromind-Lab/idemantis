@@ -28,7 +28,7 @@ import Schema from "typebox/schema"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createHttpAdapterHandler } from "@idemantis/adapter-http"
 import { AdapterHost, connectRemoteAdapters, type HostedAdapter } from "../src/adapters.js"
-import { adapterConnections, leaseDuration } from "../src/cli.js"
+import { adapterConnections, leaseDuration, rateLimitPerMinute } from "../src/cli.js"
 import { HostedMissionRunner } from "../src/hosted.js"
 import { ApiKeyStore } from "../src/keys.js"
 import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
@@ -604,6 +604,13 @@ describe("hosted mission runner", () => {
     expect(unbound.status).toBe(422)
     expect(withoutAdapters.resumed).toEqual([])
     expect(issue).toHaveBeenCalledOnce()
+  })
+
+  it("parses the rate limit option", () => {
+    expect(rateLimitPerMinute(undefined)).toBeUndefined()
+    expect(rateLimitPerMinute("6000")).toBe(6_000)
+    expect(() => rateLimitPerMinute("0")).toThrow(TypeError)
+    expect(() => rateLimitPerMinute("fast")).toThrow(TypeError)
   })
 
   it("parses the lease duration option", () => {
