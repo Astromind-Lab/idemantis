@@ -354,6 +354,18 @@ importers:
         specifier: 1.4.3
         version: 1.4.3
 
+  packages/transport:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
 packages:
   "@biomejs/biome@2.6.2":
     resolution:
