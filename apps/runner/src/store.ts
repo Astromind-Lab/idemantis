@@ -378,10 +378,7 @@ export class RunnerStore {
     )
   }
 
-  registerDefinition(
-    runtime: MissionRuntimeDefinition,
-    options: RegisterDefinitionOptions = {},
-  ): void {
+  assertDefinition(runtime: MissionRuntimeDefinition): void {
     if (
       !Schema.Check(MissionManifestSchema, runtime.manifest) ||
       !Schema.Check(DigestSchema, runtime.definition_digest) ||
@@ -398,6 +395,13 @@ export class RunnerStore {
         validateInterventionSchema(action.input_schema)
       }
     }
+  }
+
+  registerDefinition(
+    runtime: MissionRuntimeDefinition,
+    options: RegisterDefinitionOptions = {},
+  ): void {
+    this.assertDefinition(runtime)
     const keys = [...new Set(options.subject_reference_keys ?? [])]
     if (keys.length > 16 || keys.some((key) => key.length < 1 || key.length > 64)) {
       throw new TransportError("INVALID_REQUEST", "Subject reference keys are invalid", 422)

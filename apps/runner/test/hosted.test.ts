@@ -21,8 +21,9 @@ import {
 } from "@idemantis/sdk"
 import Type, { type TSchema } from "typebox"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { AdapterHost } from "../src/adapters.js"
+import { AdapterHost, type HostedAdapter } from "../src/adapters.js"
 import { HostedMissionRunner } from "../src/hosted.js"
+import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 import { RunnerStore } from "../src/store.js"
 
 const capabilities = {
@@ -118,23 +119,24 @@ const journals: SqliteJournal[] = []
 const runners: HostedMissionRunner[] = []
 const directories: string[] = []
 
+const localRunners: StartedLocalRunner[] = []
+
+function mailer(operation: AdapterOperation<unknown, unknown, unknown>): HostedAdapter {
+  return {
+    adapter: "mailer",
+    adapter_version: "1.0.0",
+    adapter_package_digest: `sha256:${"a".repeat(64)}`,
+    adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    operations: [operation],
+  }
+}
+
 function hosted(
   journal: SqliteJournal,
   operation: AdapterOperation<unknown, unknown, unknown>,
   leaseDurationMs = 30_000,
 ) {
-  const host = new AdapterHost({
-    source_id: "hosted.runner",
-    adapters: [
-      {
-        adapter: "mailer",
-        adapter_version: "1.0.0",
-        adapter_package_digest: `sha256:${"a".repeat(64)}`,
-        adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
-        operations: [operation],
-      },
-    ],
-  })
+  const host = new AdapterHost({ source_id: "hosted.runner", adapters: [mailer(operation)] })
   const runner = new HostedMissionRunner({ journal, host, lease_duration_ms: leaseDurationMs })
   runners.push(runner)
   const mission = missionFor(operation)
@@ -161,6 +163,9 @@ function journal(path = ":memory:"): SqliteJournal {
 }
 
 afterEach(async () => {
+  for (const local of localRunners.splice(0)) {
+    await local.close()
+  }
   for (const runner of runners.splice(0)) {
     await Promise.race([runner.close(), new Promise((resolve) => setTimeout(resolve, 50))])
   }
@@ -265,4 +270,72 @@ describe("hosted mission runner", () => {
     expect(reconcile).toHaveBeenCalledOnce()
     expect(restarted.store.effects(runId).items[0]).toMatchObject({ issue_count: 1 })
   })
+
+  it("registers, routes, and completes a hosted mission through the local runner", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-hosted-local-"))
+    directories.push(directory)
+    const issue = vi.fn(async () => ({ result: "completed" as const, output: { delivered: true } }))
+    const operation = sendOperation(issue, vi.fn())
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+      adapters: [mailer(operation)],
+    })
+    localRunners.push(local)
+    const session = await authenticate(local)
+    const mission = missionFor(operation)
+    const runtime = new AdapterHost({
+      source_id: "hosted.runner",
+      adapters: [mailer(operation)],
+    }).bind({ manifest: mission.manifest, definition_digest: mission.definitionDigest })
+    const post = (path: string, body?: unknown) =>
+      fetch(`${local.origin}${path}`, {
+        method: "POST",
+        headers: body === undefined ? session : { ...session, "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+
+    const unbound = await post("/api/definitions", {
+      runtime: { ...runtime, execution_binding_digest: `sha256:${"e".repeat(64)}` },
+    })
+    const registered = await post("/api/definitions", { runtime })
+    const admitted = await post("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-2", body: "Gate 4 opened" },
+    })
+    const runId = ((await admitted.json()) as { summary: { run_id: RunId } }).summary.run_id
+    const started = await post(`/api/missions/${runId}/start`)
+
+    expect(unbound.status).toBe(422)
+    expect(registered.status).toBe(200)
+    expect(started.status).toBe(202)
+    await vi.waitFor(
+      async () => {
+        const execution = await fetch(`${local.origin}/api/missions/${runId}/execution`, {
+          headers: { cookie: session.cookie },
+        })
+        expect(((await execution.json()) as { activity: string }).activity).toBe("terminal")
+      },
+      { timeout: 2_000, interval: 20 },
+    )
+    expect(issue).toHaveBeenCalledOnce()
+  })
 })
+
+async function authenticate(runner: StartedLocalRunner) {
+  const bootstrap = new URL(runner.bootstrap_url).hash.slice("#bootstrap=".length)
+  const response = await fetch(`${runner.origin}/api/session/bootstrap`, {
+    method: "POST",
+    headers: {
+      origin: runner.origin,
+      "x-idemantis-bootstrap": decodeURIComponent(bootstrap),
+    },
+  })
+  const cookie = response.headers.get("set-cookie")?.split(";")[0]
+  const csrf = ((await response.json()) as { csrf_token?: unknown }).csrf_token
+  if (!cookie || typeof csrf !== "string") {
+    throw new Error("Expected local runner authentication")
+  }
+  return { origin: runner.origin, cookie, "x-idemantis-csrf": csrf }
+}

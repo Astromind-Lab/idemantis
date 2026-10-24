@@ -275,6 +275,13 @@ export class ReferenceMissionRunner {
     }
   }
 
+  accepts(runtime: MissionRuntimeDefinition): boolean {
+    return (
+      runtime.definition_digest === this.#runtime.definition_digest &&
+      runtime.execution_binding_digest === this.#runtime.execution_binding_digest
+    )
+  }
+
   start(runId: RunId): MissionExecutionStart {
     return this.#jobs.start(runId)
   }
