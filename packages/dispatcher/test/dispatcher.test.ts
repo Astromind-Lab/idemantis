@@ -320,6 +320,7 @@ describe("command dispatcher", () => {
       lease_duration_ms: 60_000,
       clock: new VirtualClock("2026-01-01T00:00:02Z"),
       identities: identities(),
+      reconcile_retry: { attempts: 1, backoff_ms: 0 },
     })
 
     const issueOutcome = await dispatcher.dispatchNext(runId)
@@ -336,6 +337,41 @@ describe("command dispatcher", () => {
     expect(reconcile).toHaveBeenCalledOnce()
     expect(journal.getMission(runId).state.status).toBe("unresolved")
     expect(await dispatcher.dispatchNext(runId)).toEqual({ status: "idle" })
+  })
+
+  it("retries a reconciliation that fails in transit before deciding", async () => {
+    const journal = open()
+    const reconcile = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockResolvedValueOnce("confirmed_completed")
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: { issue: vi.fn(async () => "uncertain" as const), reconcile },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:00:02Z"),
+      identities: identities(),
+      reconcile_retry: { attempts: 3, backoff_ms: 1 },
+    })
+
+    await dispatcher.dispatchNext(runId)
+    const reconciled = await dispatcher.dispatchNext(runId)
+
+    expect(reconciled).toMatchObject({ status: "recorded", result: "confirmed_completed" })
+    expect(reconcile).toHaveBeenCalledTimes(3)
+    expect(journal.getMission(runId).state.terminal_outcome).toBe("completed")
+    expect(
+      () =>
+        new CommandDispatcher({
+          journal,
+          executor: { issue: vi.fn(), reconcile },
+          worker_id: "runner-1",
+          lease_duration_ms: 60_000,
+          reconcile_retry: { attempts: 0, backoff_ms: 1 },
+        }),
+    ).toThrow(RangeError)
   })
 
   it("records an interrupted dispatch as uncertain after its claim expires", async () => {

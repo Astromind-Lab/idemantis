@@ -77,10 +77,24 @@ export class CommandDispatcher {
   readonly #leaseDurationMs: number
   readonly #clock: Clock
   readonly #identities: IdentityFactory
+  readonly #reconcileAttempts: number
+  readonly #reconcileBackoffMs: number
 
   constructor(options: CommandDispatcherOptions) {
     if (!Number.isSafeInteger(options.lease_duration_ms) || options.lease_duration_ms < 1) {
       throw new RangeError("lease_duration_ms must be a positive safe integer")
+    }
+    this.#reconcileAttempts = options.reconcile_retry?.attempts ?? 4
+    this.#reconcileBackoffMs = options.reconcile_retry?.backoff_ms ?? 250
+    if (
+      !Number.isSafeInteger(this.#reconcileAttempts) ||
+      this.#reconcileAttempts < 1 ||
+      !Number.isSafeInteger(this.#reconcileBackoffMs) ||
+      this.#reconcileBackoffMs < 0
+    ) {
+      throw new RangeError(
+        "reconcile_retry needs a positive attempt count and a non-negative backoff",
+      )
     }
     this.#journal = options.journal
     this.#executor = options.executor
@@ -235,9 +249,7 @@ export class CommandDispatcher {
           : { result: await this.#executor.issue(command, attempt) }
       }
       if (claim.command.kind === "effect.reconcile") {
-        return this.#executor.invokeReconciliation
-          ? await this.#executor.invokeReconciliation(command, attempt)
-          : { result: await this.#executor.reconcile(command, attempt) }
+        return await this.reconcileWithRetry(command, attempt)
       }
       throw new TypeError(`Command ${claim.command.command_id} is not dispatchable`)
     } catch (error) {
@@ -246,6 +258,27 @@ export class CommandDispatcher {
         evidence: {
           executor_error: (error instanceof Error ? error.message : String(error)).slice(0, 512),
         },
+      }
+    }
+  }
+
+  private async reconcileWithRetry(
+    command: ClaimedCommand["command"],
+    attempt: ClaimedCommand["attempt"],
+  ): Promise<ExecutionReport<IssueResult | ReconciliationResult>> {
+    let backoff = this.#reconcileBackoffMs
+    for (let tried = 1; ; tried += 1) {
+      try {
+        return this.#executor.invokeReconciliation
+          ? await this.#executor.invokeReconciliation(command, attempt)
+          : { result: await this.#executor.reconcile(command, attempt) }
+      } catch (error) {
+        const remaining = Date.parse(attempt.claim_deadline) - this.#clock.now().getTime()
+        if (tried >= this.#reconcileAttempts || remaining <= backoff * 2) {
+          throw error
+        }
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, backoff))
+        backoff *= 2
       }
     }
   }
