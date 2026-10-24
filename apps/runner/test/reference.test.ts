@@ -5,6 +5,7 @@ import type { JsonObject, RunId } from "@idemantis/contracts"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import { afterEach, describe, expect, it } from "vitest"
 import { runCli } from "../src/cli.js"
+import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 import { ReferenceMissionRunner } from "../src/reference.js"
 import { createRunnerServer } from "../src/server.js"
 import { SessionAuthority } from "../src/session.js"
@@ -12,6 +13,7 @@ import { RunnerStore } from "../src/store.js"
 
 const journals: SqliteJournal[] = []
 const servers: Awaited<ReturnType<typeof createRunnerServer>>[] = []
+const localRunners: StartedLocalRunner[] = []
 const directories: string[] = []
 
 function setup() {
@@ -26,6 +28,9 @@ function setup() {
 }
 
 afterEach(async () => {
+  for (const runner of localRunners.splice(0)) {
+    await runner.close()
+  }
   for (const server of servers.splice(0)) {
     await server.close()
   }
@@ -240,4 +245,76 @@ describe("reference mission runner", () => {
     )
   })
 
+  it("serves and recovers a mission across local runner instances", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-local-runner-"))
+    directories.push(directory)
+    const first = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_maximum_steps: 2,
+    })
+    localRunners.push(first)
+    const firstSession = await authenticate(first)
+    const admitted = await fetch(`${first.origin}/api/missions`, {
+      method: "POST",
+      headers: { ...firstSession, "content-type": "application/json" },
+      body: JSON.stringify({
+        definition_digest: first.definition_digest,
+        input: first.reference_input,
+      }),
+    })
+    const admittedBody = (await admitted.json()) as { summary: { run_id: RunId } }
+    const runId = admittedBody.summary.run_id
+    const interrupted = await fetch(`${first.origin}/api/missions/${runId}/run`, {
+      method: "POST",
+      headers: firstSession,
+    })
+
+    expect(admitted.status).toBe(201)
+    expect(interrupted.status).toBe(500)
+    await first.close()
+
+    const second = await startLocalRunner({ port: 0, state_directory: directory })
+    localRunners.push(second)
+    const secondSession = await authenticate(second)
+    const recovered = await fetch(`${second.origin}/api/missions/${runId}/run`, {
+      method: "POST",
+      headers: secondSession,
+    })
+    const detail = (await recovered.json()) as {
+      projection: { status: string; terminal_outcome?: string }
+    }
+    const effects = await fetch(`${second.origin}/api/missions/${runId}/effects`, {
+      headers: { cookie: secondSession.cookie },
+    })
+
+    expect(recovered.status).toBe(200)
+    expect(detail.projection).toMatchObject({
+      status: "completed",
+      terminal_outcome: "completed",
+    })
+    expect(((await effects.json()) as { items: unknown[] }).items).toHaveLength(4)
+  })
 })
+
+async function authenticate(runner: StartedLocalRunner) {
+  const bootstrap = new URL(runner.bootstrap_url).hash.slice("#bootstrap=".length)
+  const response = await fetch(`${runner.origin}/api/session/bootstrap`, {
+    method: "POST",
+    headers: {
+      origin: runner.origin,
+      "x-idemantis-bootstrap": decodeURIComponent(bootstrap),
+    },
+  })
+  const cookie = response.headers.get("set-cookie")?.split(";")[0]
+  const session = (await response.json()) as { csrf_token?: unknown }
+  const csrf = session.csrf_token
+  if (!cookie || typeof csrf !== "string") {
+    throw new Error("Expected local runner authentication")
+  }
+  return {
+    origin: runner.origin,
+    cookie,
+    "x-idemantis-csrf": csrf,
+  }
+}
