@@ -12,6 +12,7 @@ import {
   executionBindingDigest,
   finalState,
   fromInput,
+  fromOutput,
   mapFields,
   noRetry,
   reconcileBeforeRetry,
@@ -485,5 +486,115 @@ describe("definition safety", () => {
     expect(defineMission(deliveryDefinition(states)).manifest).toMatchObject({
       states: { openAccess: { kind: "effect" } },
     })
+  })
+
+  it("captures an effect output only when a later step reads it", () => {
+    const chained = (dispatchInput: unknown) =>
+      defineMission({
+        id: "chained.delivery",
+        version: "1.0.0",
+        input: Type.Object({ destination: Type.String() }, { additionalProperties: false }),
+        initial: "reserveDestination",
+        states: {
+          reserveDestination: effectState({
+            operation: reserve,
+            effectSlot: "reservation",
+            input: mapFields({ destination: fromInput("destination") }),
+            retry: noRetry(),
+            onSettled: "dispatchVehicle",
+            onFailed: "failed",
+            onUncertain: "reconcileReservation",
+          }),
+          reconcileReservation: reconcileState({
+            effectState: "reserveDestination",
+            operation: reserve,
+            subject: fromInput("destination"),
+            onConfirmedCompleted: "dispatchVehicle",
+            onConfirmedNotApplied: "failed",
+            onConfirmedInProgress: "failed",
+            onConflictingState: "failed",
+            onUnknown: "failed",
+          }),
+          dispatchVehicle: effectState({
+            operation: dispatch,
+            effectSlot: "dispatch",
+            input: dispatchInput as never,
+            retry: noRetry(),
+            onSettled: "complete",
+            onFailed: "failed",
+            onUncertain: "failed",
+          }),
+          complete: finalState("completed"),
+          failed: finalState("failed"),
+        },
+      })
+
+    const compiled = chained(mapFields({ route: fromOutput("reserveDestination", "reservation") }))
+
+    const { reserveDestination, dispatchVehicle } = compiled.manifest.states
+    expect(reserveDestination).toMatchObject({ capture_output: true })
+    expect(dispatchVehicle).not.toHaveProperty("capture_output")
+    expect(Schema.Check(MissionManifestSchema, compiled.manifest)).toBe(true)
+    expect(
+      JSON.stringify(defineMission(deliveryDefinition(deliveryStates())).manifest),
+    ).not.toContain("capture_output")
+    expect(() => chained(mapFields({ route: fromOutput("complete") }))).toThrow(
+      expect.objectContaining({
+        issues: expect.arrayContaining([
+          expect.objectContaining({ code: "OUTPUT_SOURCE_INVALID" }),
+        ]),
+      }),
+    )
+    expect(() => chained(mapFields({ route: fromOutput("dispatchVehicle", "mission") }))).toThrow(
+      expect.objectContaining({
+        issues: expect.arrayContaining([
+          expect.objectContaining({ code: "OUTPUT_NOT_GUARANTEED" }),
+        ]),
+      }),
+    )
+    expect(() =>
+      chained({ kind: "output", state: "reserveDestination", path: [""] } as never),
+    ).toThrow(
+      expect.objectContaining({
+        issues: expect.arrayContaining([expect.objectContaining({ code: "INVALID_EXPRESSION" })]),
+      }),
+    )
+  })
+
+  it("rejects reading an output on a path that can skip its producer", () => {
+    expect(() =>
+      defineMission({
+        id: "skipping.delivery",
+        version: "1.0.0",
+        input: Type.Object({ destination: Type.String() }, { additionalProperties: false }),
+        initial: "reserveDestination",
+        states: {
+          reserveDestination: effectState({
+            operation: reserve,
+            effectSlot: "reservation",
+            input: mapFields({ destination: fromInput("destination") }),
+            retry: noRetry(),
+            onSettled: "dispatchVehicle",
+            onFailed: "failed",
+            onUncertain: "dispatchVehicle",
+          }),
+          dispatchVehicle: effectState({
+            operation: dispatch,
+            effectSlot: "dispatch",
+            input: mapFields({ route: fromOutput("reserveDestination", "reservation") }),
+            retry: noRetry(),
+            onSettled: "complete",
+            onFailed: "failed",
+            onUncertain: "failed",
+          }),
+          complete: finalState("completed"),
+          failed: finalState("failed"),
+        },
+      }),
+    ).toThrow(
+      expect.objectContaining({
+        issues: [expect.objectContaining({ code: "OUTPUT_NOT_GUARANTEED" })],
+      }),
+    )
   })
 })

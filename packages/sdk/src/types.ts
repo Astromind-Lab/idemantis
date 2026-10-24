@@ -18,6 +18,7 @@ export type ValueExpression =
   | { kind: "input"; path: string[] }
   | { kind: "literal"; value: JsonValue }
   | { kind: "object"; fields: Record<string, ValueExpression> }
+  | { kind: "output"; state: StateName; path: string[] }
 
 /** The versioned adapter capability contract imported by mission source. */
 export interface OperationDefinition {
@@ -170,6 +171,7 @@ export interface EffectStateManifest {
   on_settled: StateName
   on_failed: StateName
   on_uncertain: StateName
+  capture_output?: true
 }
 
 export interface ObservationWaitStateManifest {
@@ -271,6 +273,8 @@ export interface ExecutionBinding {
 
 export type MissionDefinitionIssueCode =
   | "INVALID_DEFINITION_ID"
+  | "OUTPUT_SOURCE_INVALID"
+  | "OUTPUT_NOT_GUARANTEED"
   | "INVALID_DEFINITION_VERSION"
   | "INVALID_INPUT_SCHEMA"
   | "INVALID_STATE_NAME"

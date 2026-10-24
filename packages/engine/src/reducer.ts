@@ -148,6 +148,7 @@ function operationInput(
   operationKey: string,
   expression: EffectStateManifest["input"],
   input: JsonObject,
+  outputs: Readonly<Record<string, JsonValue>> | undefined,
 ): JsonValue {
   const operation = Object.hasOwn(manifest.operations, operationKey)
     ? manifest.operations[operationKey]
@@ -157,12 +158,24 @@ function operationInput(
     fail("INVALID_DEFINITION", `Operation ${operationKey} does not exist`)
   }
 
-  const value = evaluateExpression(expression, input)
+  const value = evaluateExpression(expression, input, outputs)
   if (!Schema.Check(operation.input_schema as never, value)) {
     fail("INVALID_TRANSITION", `Input for operation ${operationKey} does not satisfy its schema`)
   }
 
   return value
+}
+
+function captureOutput(
+  state: MissionState,
+  effectState: EffectStateManifest,
+  stateName: string,
+  output: JsonValue | undefined,
+): void {
+  if (!effectState.capture_output || output === undefined) {
+    return
+  }
+  state.outputs = { ...(state.outputs ?? {}), [stateName]: structuredClone(output) }
 }
 
 function issueEffect(
@@ -180,6 +193,7 @@ function issueEffect(
     effectState.operation,
     effectState.input,
     state.input,
+    state.outputs,
   )
   const slot = `effect.${effect.effect_slot}.issue.${effect.issue_count}`
 
@@ -285,7 +299,7 @@ function enterState(
         createCommand(event, state, `state.${target}.reconcile`, "effect.reconcile", {
           effect_id: activeEffectId,
           operation: manifestState.operation,
-          subject: evaluateExpression(manifestState.subject, state.input),
+          subject: evaluateExpression(manifestState.subject, state.input, state.outputs),
         }),
       ]
     }
@@ -436,6 +450,7 @@ function reduceIssueResult(
     case "completed":
       effect.retry_timer_id = null
       effect.status = "settled"
+      captureOutput(state, effectState, effect.state_name, payload.output)
       if (effectState.on_settled === state.current_state) {
         return []
       }
@@ -464,6 +479,7 @@ function observationMatches(
   effect: EffectProjection | undefined,
   payload: ObservationRecordedPayload,
   input: JsonObject,
+  outputs: Readonly<Record<string, JsonValue>> | undefined,
 ): boolean {
   if (payload.observation_type !== waitState.observation_type) {
     return false
@@ -479,7 +495,7 @@ function observationMatches(
 
   return (
     canonicalJson(payload.subject) ===
-    canonicalJson(evaluateExpression(waitState.correlation.subject, input))
+    canonicalJson(evaluateExpression(waitState.correlation.subject, input, outputs))
   )
 }
 
@@ -527,7 +543,7 @@ function reduceObservation(
   const effect = effectId ? state.effects[effectId] : undefined
   const waitState = observationWaitForCurrentEffect(definition.manifest, state, effect)
 
-  if (!waitState || !observationMatches(waitState, effect, payload, state.input)) {
+  if (!waitState || !observationMatches(waitState, effect, payload, state.input, state.outputs)) {
     return []
   }
 
@@ -608,6 +624,7 @@ function reduceReconciliationResult(
     case "confirmed_completed":
       effect.retry_timer_id = null
       effect.status = "settled"
+      captureOutput(state, effectState, effect.state_name, payload.output)
       target = current.on_confirmed_completed
       break
     case "confirmed_not_applied":
