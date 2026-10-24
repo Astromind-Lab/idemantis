@@ -141,8 +141,15 @@ describe("idemantis MCP server", () => {
     const started = await call("start_mission", {
       definition_digest: fixture.digests.review,
       input: { ticket: "T-10" },
+      idempotency_key: "ticket-T-10",
+    })
+    const restarted = await call("start_mission", {
+      definition_digest: fixture.digests.review,
+      input: { ticket: "T-10" },
+      idempotency_key: "ticket-T-10",
     })
     const runId = (started.body as { run_id: string }).run_id
+    expect((restarted.body as { run_id: string }).run_id).toBe(runId)
     const waiting = await call("wait_for_mission", { run_id: runId, timeout_ms: 5_000 })
     const effectId = (waiting.body as { next: { effect_id: string } }).next.effect_id
     const observation = {

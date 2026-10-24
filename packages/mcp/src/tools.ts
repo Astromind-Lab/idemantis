@@ -129,15 +129,23 @@ export const tools: ToolDefinition[] = [
       properties: {
         definition_digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
         input: { type: "object", description: "Mission input matching the definition's schema" },
+        idempotency_key: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Stable key for this task so a retried call returns the same mission",
+        },
       },
       required: ["definition_digest", "input"],
       additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     run: async (client, input) => {
+      const key = optionalText(input, "idempotency_key")
       const admitted = await client.launch(
         text(input, "definition_digest"),
         objectValue(input, "input"),
+        key ? { client_request_id: clientRequestIdFor(`admission:${key}`) } : {},
       )
       return client.context(admitted.summary.run_id)
     },
