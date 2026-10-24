@@ -1,4 +1,6 @@
 import { mkdtempSync, rmSync } from "node:fs"
+import { createServer, type Server } from "node:http"
+import type { AddressInfo } from "node:net"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -21,7 +23,9 @@ import {
 } from "@idemantis/sdk"
 import Type, { type TSchema } from "typebox"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { AdapterHost, type HostedAdapter } from "../src/adapters.js"
+import { createHttpAdapterHandler } from "@idemantis/adapter-http"
+import { AdapterHost, connectRemoteAdapters, type HostedAdapter } from "../src/adapters.js"
+import { adapterConnections } from "../src/cli.js"
 import { HostedMissionRunner } from "../src/hosted.js"
 import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 import { RunnerStore } from "../src/store.js"
@@ -120,6 +124,7 @@ const runners: HostedMissionRunner[] = []
 const directories: string[] = []
 
 const localRunners: StartedLocalRunner[] = []
+const adapterServers: Server[] = []
 
 function mailer(operation: AdapterOperation<unknown, unknown, unknown>): HostedAdapter {
   return {
@@ -165,6 +170,10 @@ function journal(path = ":memory:"): SqliteJournal {
 afterEach(async () => {
   for (const local of localRunners.splice(0)) {
     await local.close()
+  }
+  for (const server of adapterServers.splice(0)) {
+    server.closeAllConnections()
+    await new Promise((resolve) => server.close(resolve))
   }
   for (const runner of runners.splice(0)) {
     await Promise.race([runner.close(), new Promise((resolve) => setTimeout(resolve, 50))])
@@ -320,6 +329,89 @@ describe("hosted mission runner", () => {
       { timeout: 2_000, interval: 20 },
     )
     expect(issue).toHaveBeenCalledOnce()
+  })
+
+  it("executes a mission through an adapter served over HTTP", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-remote-"))
+    directories.push(directory)
+    const issue = vi.fn(async () => ({ result: "completed" as const, output: { delivered: true } }))
+    const adapter = mailer(sendOperation(issue, vi.fn()))
+    const server = createServer(
+      createHttpAdapterHandler({
+        adapter: adapter.adapter,
+        adapter_version: adapter.adapter_version,
+        adapter_package_digest: adapter.adapter_package_digest,
+        operations: adapter.operations,
+        token: "mailer-secret",
+      }),
+    )
+    adapterServers.push(server)
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve))
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+    const connections = adapterConnections(
+      [`${adapter.adapter_instance_id}=${url}`],
+      "mailer-secret",
+    )
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+      remote_adapters: connections,
+    })
+    localRunners.push(local)
+    const session = await authenticate(local)
+    const remote = await connectRemoteAdapters(connections)
+    const mission = missionFor(
+      remote[0]?.operations[0] as AdapterOperation<unknown, unknown, unknown>,
+    )
+    const runtime = new AdapterHost({ source_id: "hosted.runner", adapters: remote }).bind({
+      manifest: mission.manifest,
+      definition_digest: mission.definitionDigest,
+    })
+    const post = (path: string, body?: unknown) =>
+      fetch(`${local.origin}${path}`, {
+        method: "POST",
+        headers: body === undefined ? session : { ...session, "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+
+    expect((await post("/api/definitions", { runtime })).status).toBe(200)
+    const admitted = await post("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-3", body: "Bay 2 released" },
+    })
+    const runId = ((await admitted.json()) as { summary: { run_id: RunId } }).summary.run_id
+    expect((await post(`/api/missions/${runId}/start`)).status).toBe(202)
+    await vi.waitFor(
+      async () => {
+        const execution = await fetch(`${local.origin}/api/missions/${runId}/execution`, {
+          headers: { cookie: session.cookie },
+        })
+        expect(((await execution.json()) as { activity: string }).activity).toBe("terminal")
+      },
+      { timeout: 2_000, interval: 20 },
+    )
+    expect(issue).toHaveBeenCalledOnce()
+    expect(runtime.execution_binding_digest).toBe(
+      new AdapterHost({ source_id: "hosted.runner", adapters: [adapter] }).bindingDigest({
+        manifest: mission.manifest,
+        definition_digest: mission.definitionDigest,
+      }),
+    )
+  })
+
+  it("parses remote adapter options and rejects malformed ones", () => {
+    expect(adapterConnections(["adp_01ARZ3NDEKTSV4RRFFQ69G5FAV=https://a.test/"], "t")).toEqual([
+      {
+        adapter_instance_id: "adp_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        url: "https://a.test/",
+        token: "t",
+      },
+    ])
+    expect(() => adapterConnections(["https://a.test/"], undefined)).toThrow(TypeError)
+    expect(() => adapterConnections(["adp_01ARZ3NDEKTSV4RRFFQ69G5FAV="], undefined)).toThrow(
+      TypeError,
+    )
   })
 })
 

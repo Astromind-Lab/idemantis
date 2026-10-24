@@ -7,9 +7,16 @@ import {
   createAdapterBinding,
   type RuntimeClock,
 } from "@idemantis/adapter-kit"
-import type { AdapterInstanceId, Digest, SourceId } from "@idemantis/contracts"
+import { connectHttpAdapter } from "@idemantis/adapter-http"
+import {
+  type AdapterInstanceId,
+  AdapterInstanceIdSchema,
+  type Digest,
+  type SourceId,
+} from "@idemantis/contracts"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
 import { ExecutionBindingError, executionBindingDigest } from "@idemantis/sdk"
+import Schema from "typebox/schema"
 
 export interface HostedAdapter {
   adapter: string
@@ -23,6 +30,35 @@ export interface AdapterHostOptions {
   adapters: readonly HostedAdapter[]
   source_id: SourceId
   clock?: RuntimeClock
+}
+
+export interface RemoteAdapterConnection {
+  url: string
+  adapter_instance_id: AdapterInstanceId
+  token?: string
+}
+
+export async function connectRemoteAdapters(
+  connections: readonly RemoteAdapterConnection[],
+): Promise<HostedAdapter[]> {
+  return Promise.all(
+    connections.map(async (connection) => {
+      if (!Schema.Check(AdapterInstanceIdSchema, connection.adapter_instance_id)) {
+        throw new TypeError(`Adapter instance ${connection.adapter_instance_id} is invalid`)
+      }
+      const remote = await connectHttpAdapter({
+        url: connection.url,
+        ...(connection.token ? { token: connection.token } : {}),
+      })
+      return {
+        adapter: remote.manifest.adapter,
+        adapter_version: remote.manifest.adapter_version,
+        adapter_package_digest: remote.manifest.adapter_package_digest as `sha256:${string}`,
+        adapter_instance_id: connection.adapter_instance_id,
+        operations: remote.operations,
+      }
+    }),
+  )
 }
 
 type DefinitionReference = Pick<MissionRuntimeDefinition, "manifest" | "definition_digest">
