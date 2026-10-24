@@ -444,6 +444,33 @@ describe("reference scenarios", () => {
     ])
   })
 
+  it("compiles the reference mission for runner-hosted execution", () => {
+    const kernel = new SimulationKernel({ seed: 88 })
+    const vehicle = new VehicleSimulator(kernel, { vehicle_id: "vehicle-7" })
+    const resource = new ResourceSimulator(kernel, { resource_id: "bay-3" })
+    const access = new AccessSimulator(kernel, { access_point_id: "bay-3" })
+    const mission = createReferenceDeliveryMission(
+      {
+        reserve: resource.reserve,
+        release: resource.release,
+        dispatch: vehicle.dispatch,
+        openAccess: access.open,
+      },
+      { vehicleExecution: "runner" },
+    )
+    const dispatchVehicle = Reflect.get(mission.manifest.states, "dispatch_vehicle")
+    const reconcileVehicle = Reflect.get(mission.manifest.states, "reconcile_vehicle")
+
+    expect(dispatchVehicle).toMatchObject({
+      kind: "effect",
+      execution: "runner",
+    })
+    expect(reconcileVehicle).toMatchObject({
+      kind: "reconcile",
+      execution: "runner",
+    })
+  })
+
   it("preserves scenario invariants across one hundred seeds", async () => {
     const scenarios: ReferenceScenario[] = [
       "happy_path",

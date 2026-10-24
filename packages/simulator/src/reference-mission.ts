@@ -39,6 +39,10 @@ export interface ReferenceDeliveryOperations {
   openAccess: AdapterOperation<unknown, unknown, unknown>
 }
 
+export interface ReferenceDeliveryMissionOptions {
+  vehicleExecution?: "runner" | "edge"
+}
+
 function missionOperation(
   operation: AdapterOperation<unknown, unknown, unknown>,
 ): OperationDefinition {
@@ -58,11 +62,13 @@ function missionOperation(
 
 export function createReferenceDeliveryMission(
   operations: ReferenceDeliveryOperations,
+  options: ReferenceDeliveryMissionOptions = {},
 ): CompiledMission<typeof ReferenceDeliveryInputSchema> {
   const reserve = missionOperation(operations.reserve)
   const release = missionOperation(operations.release)
   const dispatch = missionOperation(operations.dispatch)
   const openAccess = missionOperation(operations.openAccess)
+  const vehicleExecution = options.vehicleExecution ?? "edge"
 
   return defineMission({
     id: "reference.delivery",
@@ -111,9 +117,8 @@ export function createReferenceDeliveryMission(
           destination: fromInput("destination_id"),
         }),
         retry: safeRetry({ attempts: 2, backoffMs: 100 }),
-        execution: "edge",
-        automaticTakeover: true,
-        activeHandoff: true,
+        execution: vehicleExecution,
+        ...(vehicleExecution === "edge" ? { automaticTakeover: true, activeHandoff: true } : {}),
         cancellation: {
           onCancelled: "cancelled",
           onCompletionDuringCancel: "unresolved",
@@ -127,7 +132,7 @@ export function createReferenceDeliveryMission(
         effectState: "dispatch_vehicle",
         operation: dispatch,
         subject: mapFields({ vehicle_id: fromInput("vehicle_id") }),
-        execution: "edge",
+        execution: vehicleExecution,
         onConfirmedCompleted: "open_destination",
         onConfirmedNotApplied: "dispatch_vehicle",
         onConfirmedInProgress: "await_arrival",
