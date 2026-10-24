@@ -1,7 +1,9 @@
 import { resolve } from "node:path"
 import { pathToFileURL } from "node:url"
+import { parseArgs } from "node:util"
 import type { JsonObject } from "@idemantis/contracts"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
+import { startLocalRunner } from "./local.js"
 import { ReferenceMissionRunner } from "./reference.js"
 import { RunnerStore } from "./store.js"
 
@@ -68,12 +70,37 @@ export async function runCli(
   args: readonly string[],
   write: Writer = process.stdout.write.bind(process.stdout),
 ) {
-  if (args[0] !== "reference") {
-    write("Usage: idemantis-runner reference\n")
-    return 1
+  if (args[0] === "reference") {
+    write(`${JSON.stringify(await referenceProof(), null, 2)}\n`)
+    return 0
   }
-  write(`${JSON.stringify(await referenceProof(), null, 2)}\n`)
-  return 0
+  if (args[0] === "dev") {
+    const parsed = parseArgs({
+      args: [...args.slice(1)],
+      strict: true,
+      allowPositionals: false,
+      options: {
+        port: { type: "string" },
+        "state-dir": { type: "string" },
+      },
+    })
+    const port = parsed.values.port === undefined ? 4318 : Number(parsed.values.port)
+    const started = await startLocalRunner({
+      port,
+      ...(parsed.values["state-dir"] ? { state_directory: parsed.values["state-dir"] } : {}),
+    })
+    write(`Runner ready: ${started.origin}\n`)
+    write(`Operator bootstrap: ${started.bootstrap_url}\n`)
+    write(`Journal: ${started.journal_path}\n`)
+    await new Promise<void>((resolvePromise) => {
+      process.once("SIGINT", resolvePromise)
+      process.once("SIGTERM", resolvePromise)
+    })
+    await started.close()
+    return 0
+  }
+  write("Usage: idemantis-runner <reference|dev>\n")
+  return 1
 }
 
 const direct = process.argv[1]

@@ -18,6 +18,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "dev": "node dist/cli.js dev",
     "reference": "node dist/cli.js reference",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"

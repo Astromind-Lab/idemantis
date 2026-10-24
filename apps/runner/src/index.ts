@@ -1,5 +1,6 @@
 export * from "./cli.js"
 export * from "./execution.js"
+export * from "./local.js"
 export * from "./reference.js"
 export * from "./server.js"
 export * from "./session.js"
