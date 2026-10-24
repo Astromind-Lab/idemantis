@@ -34,6 +34,25 @@ export interface RegisteredDefinitionSummary {
   input_schema: JsonObject
 }
 
+export interface ConnectedOperation {
+  key: string
+  adapter: string
+  operation: string
+  effect_class: string
+  consequence: string
+  input_schema: JsonObject
+  output_schema: JsonObject
+  duplicate_safety: string
+  reconciliation: string
+}
+
+export interface RegisteredPlan {
+  definition_digest: string
+  definition_id: string
+  definition_version: string
+  states: string[]
+}
+
 export interface MissionListOptions {
   bucket?: "needs_attention" | "active" | "waiting" | "completed" | "all"
   query?: string
@@ -114,6 +133,17 @@ export class IdemantisClient {
         ...options,
       })
     ).registered
+  }
+
+  async operations(): Promise<ConnectedOperation[]> {
+    return (await this.request<{ items: ConnectedOperation[] }>("GET", "/api/operations")).items
+  }
+
+  async registerPlan(
+    plan: JsonObject,
+    options: { subject_reference_keys?: string[] } = {},
+  ): Promise<RegisteredPlan> {
+    return this.request("POST", "/api/plans", { plan, ...options })
   }
 
   async admit(definitionDigest: string, input: JsonObject): Promise<MissionDetail> {
