@@ -86,6 +86,34 @@ export interface ReconcileStateDefinition {
   onUnknown: StateName
 }
 
+export type InterventionControl = "text" | "textarea" | "select" | "checkbox" | "date-time"
+
+export interface InterventionPresentationHint {
+  path: string
+  control: InterventionControl
+  label?: string
+  help?: string
+  order?: number
+}
+
+export interface OperatorActionDefinition {
+  code: string
+  consequence: ConsequenceLevel
+  confirmationRequired: boolean
+  input: TSchema
+  presentationHints?: InterventionPresentationHint[]
+  evidenceRequired?: boolean
+  reasonRequired?: boolean
+  expectedOutcomeLabel: string
+  onAccepted: StateName
+}
+
+export interface OperatorWaitStateDefinition {
+  kind: "operator_wait"
+  reason: string
+  actions: OperatorActionDefinition[]
+}
+
 export interface FinalStateDefinition {
   kind: "final"
   outcome: FinalOutcome
@@ -95,6 +123,7 @@ export type StateDefinition =
   | EffectStateDefinition
   | ObservationWaitStateDefinition
   | ReconcileStateDefinition
+  | OperatorWaitStateDefinition
   | FinalStateDefinition
 
 /** The typed authoring input compiled into a callback-free manifest. */
@@ -165,6 +194,24 @@ export interface ReconcileStateManifest {
   on_unknown: StateName
 }
 
+export interface OperatorActionManifest {
+  action_code: string
+  consequence: ConsequenceLevel
+  confirmation_required: boolean
+  input_schema: JsonObject
+  presentation_hints: InterventionPresentationHint[]
+  evidence_required: boolean
+  reason_required: boolean
+  expected_outcome_label: string
+  on_accepted: StateName
+}
+
+export interface OperatorWaitStateManifest {
+  kind: "operator_wait"
+  reason: string
+  actions: OperatorActionManifest[]
+}
+
 export interface FinalStateManifest {
   kind: "final"
   outcome: FinalOutcome
@@ -174,11 +221,12 @@ export type StateManifest =
   | EffectStateManifest
   | ObservationWaitStateManifest
   | ReconcileStateManifest
+  | OperatorWaitStateManifest
   | FinalStateManifest
 
 export type MissionGraphNode =
   | { id: StateName; kind: "effect" | "reconcile"; operation: string }
-  | { id: StateName; kind: "observation_wait" }
+  | { id: StateName; kind: "observation_wait" | "operator_wait" }
   | { id: StateName; kind: "final"; outcome: FinalOutcome }
 
 export interface MissionGraphEdge {

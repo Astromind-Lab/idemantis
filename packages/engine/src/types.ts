@@ -2,6 +2,7 @@ import type {
   AttemptId,
   CommandId,
   CommandRecord,
+  ClientRequestId,
   Digest,
   EffectId,
   EffectStatus,
@@ -104,6 +105,7 @@ export type ReducerEventType =
   | "ownership.fence_activated"
   | "ownership.effect_cancelled"
   | "ownership.activated"
+  | "operator.intervention_submitted"
 
 export interface MissionAdmittedPayload {
   definition_digest: Digest
@@ -203,6 +205,15 @@ export interface OwnershipActivatedPayload {
   resume_commands: OwnershipResumeCommand[]
 }
 
+export interface OperatorInterventionSubmittedPayload {
+  client_request_id: ClientRequestId
+  expected_sequence: number
+  action_code: string
+  target: string
+  input: JsonObject
+  reason?: string
+}
+
 export type ReducerEvent =
   | { type: "mission.admitted"; payload: MissionAdmittedPayload }
   | { type: "effect.dispatch_started"; payload: EffectDispatchStartedPayload }
@@ -220,3 +231,7 @@ export type ReducerEvent =
   | { type: "ownership.fence_activated"; payload: OwnershipFenceActivatedPayload }
   | { type: "ownership.effect_cancelled"; payload: OwnershipEffectCancelledPayload }
   | { type: "ownership.activated"; payload: OwnershipActivatedPayload }
+  | {
+      type: "operator.intervention_submitted"
+      payload: OperatorInterventionSubmittedPayload
+    }

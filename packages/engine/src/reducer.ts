@@ -289,12 +289,45 @@ function enterState(
         }),
       ]
     }
+    case "operator_wait":
+      state.status = "paused"
+      state.active_effect_id = activeEffectId
+      return []
     case "final":
       state.status = manifestState.outcome
       state.active_effect_id = null
       state.terminal_outcome = manifestState.outcome
       return []
   }
+}
+
+function reduceOperatorIntervention(
+  definition: MissionRuntimeDefinition,
+  state: MissionState,
+  event: AcceptedEvent,
+  payload: Extract<
+    ReturnType<typeof parseReducerEvent>,
+    { type: "operator.intervention_submitted" }
+  >["payload"],
+): CommandRecord[] {
+  const current = stateManifest(definition.manifest, state.current_state)
+  if (
+    event.source.kind !== "operator" ||
+    payload.expected_sequence !== event.sequence - 1 ||
+    payload.target !== `mission:${state.run_id}` ||
+    current.kind !== "operator_wait"
+  ) {
+    fail("INVALID_TRANSITION", "Operator intervention is not valid for this mission state", event)
+  }
+  const action = current.actions.find((candidate) => candidate.action_code === payload.action_code)
+  if (
+    !action ||
+    !Schema.Check(action.input_schema as never, payload.input) ||
+    (action.reason_required && !payload.reason)
+  ) {
+    fail("INVALID_TRANSITION", "Operator intervention does not satisfy its action", event)
+  }
+  return enterState(definition, state, action.on_accepted, event, state.active_effect_id)
 }
 
 function finish(
@@ -838,6 +871,9 @@ export function reduceMission(
           : []
       break
     }
+    case "operator.intervention_submitted":
+      commands = reduceOperatorIntervention(definition, state, event, reducerEvent.payload)
+      break
   }
 
   return finish(state, commands, event)

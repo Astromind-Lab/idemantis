@@ -1,6 +1,7 @@
 import {
   AttemptIdSchema,
   CommandIdSchema,
+  ClientRequestIdSchema,
   DigestSchema,
   EffectIdSchema,
   FenceProofSchema,
@@ -10,6 +11,7 @@ import {
   JsonValueSchema,
   LeaseIdSchema,
   ObservationIdSchema,
+  OperationNameSchema,
   OwnershipHandoffBlockReasonSchema,
   OwnershipLeaseSchema,
   ReconciliationResultSchema,
@@ -149,6 +151,18 @@ export const OwnershipActivatedPayloadSchema = Type.Object(
   { additionalProperties: false },
 )
 
+export const OperatorInterventionSubmittedPayloadSchema = Type.Object(
+  {
+    client_request_id: ClientRequestIdSchema,
+    expected_sequence: Type.Integer({ minimum: 1 }),
+    action_code: OperationNameSchema,
+    target: Type.String({ minLength: 1, maxLength: 512 }),
+    input: JsonObjectSchema,
+    reason: Type.Optional(Type.String({ minLength: 1, maxLength: 4096 })),
+  },
+  { additionalProperties: false },
+)
+
 const validators = {
   "mission.admitted": Schema.Compile(MissionAdmittedPayloadSchema),
   "effect.dispatch_started": Schema.Compile(EffectDispatchStartedPayloadSchema),
@@ -163,6 +177,7 @@ const validators = {
   "ownership.fence_activated": Schema.Compile(OwnershipFenceActivatedPayloadSchema),
   "ownership.effect_cancelled": Schema.Compile(OwnershipEffectCancelledPayloadSchema),
   "ownership.activated": Schema.Compile(OwnershipActivatedPayloadSchema),
+  "operator.intervention_submitted": Schema.Compile(OperatorInterventionSubmittedPayloadSchema),
 } as const
 
 export function parseReducerEvent(event: AcceptedEvent): ReducerEvent {
