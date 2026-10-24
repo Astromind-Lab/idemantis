@@ -15,14 +15,9 @@ import {
   sha256Digest,
 } from "@idemantis/contracts"
 import {
-  defineMission,
   defineOperation,
-  effectState,
-  finalState,
   type OperationDefinition,
-  reconcileState,
-  safeRetry,
-  type StateDefinition,
+  sequentialMission,
   type ValueExpression,
 } from "@idemantis/sdk"
 import type { Static, TSchema } from "typebox"
@@ -106,8 +101,6 @@ const toolCapabilities = {
   compensation: false,
   observation_stream: false,
 } satisfies OperationCapabilities
-
-const reservedStates = new Set(["done", "failed", "unresolved"])
 
 export function defineTool<InputSchema extends TSchema, OutputSchema extends TSchema>(
   definition: ToolDefinition<InputSchema, OutputSchema>,
@@ -265,53 +258,16 @@ export function createToolAdapter(options: ToolAdapterOptions): ToolAdapter {
 }
 
 export function toolMission(options: ToolMissionOptions) {
-  if (options.steps.length === 0) {
-    throw new TypeError("A tool mission needs at least one step")
-  }
-  const names = new Set<string>()
-  const states: Record<string, StateDefinition> = {}
-  options.steps.forEach((step, index) => {
-    if (reservedStates.has(step.name) || names.has(step.name) || step.name.endsWith("_reconcile")) {
-      throw new TypeError(`Step name ${step.name} is reserved or repeated`)
-    }
-    names.add(step.name)
-    const operation = toolOperation(options.adapter, step.tool)
-    const next = options.steps[index + 1]?.name ?? "done"
-    const reconcile = `${step.name}_reconcile`
-    states[step.name] = effectState({
-      operation,
-      effectSlot: step.name,
-      input: step.input,
-      retry: safeRetry({
-        attempts: options.attempts ?? 3,
-        backoffMs: options.backoff_ms ?? 1_000,
-      }),
-      onSettled: next,
-      onFailed: "failed",
-      onUncertain: reconcile,
-    })
-    states[reconcile] = reconcileState({
-      effectState: step.name,
-      operation,
-      subject: { kind: "literal", value: step.name },
-      onConfirmedCompleted: next,
-      onConfirmedNotApplied: step.name,
-      onConfirmedInProgress: "unresolved",
-      onConflictingState: "unresolved",
-      onUnknown: "unresolved",
-    })
-  })
-  const first = options.steps[0]?.name as string
-  return defineMission({
+  return sequentialMission({
     id: options.id,
     version: options.version,
     input: options.input,
-    initial: first,
-    states: {
-      ...states,
-      done: finalState("completed"),
-      failed: finalState("failed"),
-      unresolved: finalState("unresolved"),
-    },
+    ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
+    ...(options.backoff_ms === undefined ? {} : { backoff_ms: options.backoff_ms }),
+    steps: options.steps.map((step) => ({
+      name: step.name,
+      operation: toolOperation(options.adapter, step.tool),
+      input: step.input,
+    })),
   })
 }

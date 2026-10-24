@@ -34,6 +34,25 @@ export interface RegisteredDefinitionSummary {
   input_schema: JsonObject
 }
 
+export interface ConnectedOperation {
+  key: string
+  adapter: string
+  operation: string
+  effect_class: string
+  consequence: string
+  input_schema: JsonObject
+  output_schema: JsonObject
+  duplicate_safety: string
+  reconciliation: string
+}
+
+export interface RegisteredPlan {
+  definition_digest: string
+  definition_id: string
+  definition_version: string
+  states: string[]
+}
+
 export interface MissionListOptions {
   bucket?: "needs_attention" | "active" | "waiting" | "completed" | "all"
   query?: string
@@ -116,16 +135,39 @@ export class IdemantisClient {
     ).registered
   }
 
-  async admit(definitionDigest: string, input: JsonObject): Promise<MissionDetail> {
-    return this.request("POST", "/api/missions", { definition_digest: definitionDigest, input })
+  async operations(): Promise<ConnectedOperation[]> {
+    return (await this.request<{ items: ConnectedOperation[] }>("GET", "/api/operations")).items
+  }
+
+  async registerPlan(
+    plan: JsonObject,
+    options: { subject_reference_keys?: string[] } = {},
+  ): Promise<RegisteredPlan> {
+    return this.request("POST", "/api/plans", { plan, ...options })
+  }
+
+  async admit(
+    definitionDigest: string,
+    input: JsonObject,
+    options: { client_request_id?: string } = {},
+  ): Promise<MissionDetail> {
+    return this.request("POST", "/api/missions", {
+      definition_digest: definitionDigest,
+      input,
+      ...options,
+    })
   }
 
   async start(runId: RunId): Promise<MissionExecutionStart> {
     return this.request("POST", `/api/missions/${this.id(runId)}/start`, {})
   }
 
-  async launch(definitionDigest: string, input: JsonObject): Promise<MissionDetail> {
-    const admitted = await this.admit(definitionDigest, input)
+  async launch(
+    definitionDigest: string,
+    input: JsonObject,
+    options: { client_request_id?: string } = {},
+  ): Promise<MissionDetail> {
+    const admitted = await this.admit(definitionDigest, input, options)
     await this.start(admitted.summary.run_id)
     return admitted
   }

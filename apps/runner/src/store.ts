@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto"
+import { createHash, randomBytes } from "node:crypto"
 import {
   DigestSchema,
   canonicalJson,
@@ -118,6 +118,24 @@ export interface AdmitMissionOptions {
   definition_digest: string
   input: JsonObject
   run_id?: RunId
+  client_request_id?: string
+  actor_id?: SourceId
+}
+
+const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+function admissionRunId(actorId: string, clientRequestId: string): RunId {
+  const digest = createHash("sha256").update(`admission:${actorId}:${clientRequestId}`).digest()
+  let value = 0n
+  for (const byte of digest.subarray(0, 17)) {
+    value = (value << 8n) | BigInt(byte)
+  }
+  let text = ""
+  for (let index = 0; index < 26; index += 1) {
+    text = crockford[Number(value & 31n)] + text
+    value >>= 5n
+  }
+  return `run_${text}` as RunId
 }
 
 function visible(value: JsonValue): ProtectedValue {
@@ -459,6 +477,13 @@ export class RunnerStore {
   }
 
   admitMission(options: AdmitMissionOptions): MissionDetail {
+    return this.admission(options).detail
+  }
+
+  admission(options: AdmitMissionOptions): {
+    detail: MissionDetail
+    disposition: "admitted" | "duplicate"
+  } {
     const registration = this.#journal.getDefinition(options.definition_digest)
     if (!registration) {
       throw new TransportError("INVALID_REQUEST", "Mission definition is not registered", 422)
@@ -470,21 +495,46 @@ export class RunnerStore {
         422,
       )
     }
-    const runId = options.run_id ?? (`run_${this.#id()}` as RunId)
-    this.#journal.admit(registration.runtime, {
-      event_id: `evt_${this.#id()}`,
-      run_id: runId,
-      type: "mission.admitted",
-      schema_version: 1,
-      source: { kind: "runner", source_id: "local-runner" },
-      ownership_epoch: 1,
-      payload: {
-        definition_digest: registration.runtime.definition_digest,
-        execution_binding_digest: registration.runtime.execution_binding_digest,
-        input: structuredClone(options.input),
-      },
-    })
-    return this.missionDetail(runId)
+    if (
+      options.client_request_id !== undefined &&
+      !/^[\x21-\x7e]{1,256}$/.test(options.client_request_id)
+    ) {
+      throw new TransportError("INVALID_REQUEST", "Client request ID is invalid", 422)
+    }
+    const runId =
+      options.run_id ??
+      (options.client_request_id
+        ? admissionRunId(options.actor_id ?? "local-operator", options.client_request_id)
+        : (`run_${this.#id()}` as RunId))
+    const prior = options.client_request_id ? this.priorAdmission(runId, options) : undefined
+    if (prior) {
+      return prior
+    }
+    try {
+      this.#journal.admit(registration.runtime, {
+        event_id: `evt_${this.#id()}`,
+        run_id: runId,
+        type: "mission.admitted",
+        schema_version: 1,
+        source: { kind: "runner", source_id: "local-runner" },
+        ownership_epoch: 1,
+        payload: {
+          definition_digest: registration.runtime.definition_digest,
+          execution_binding_digest: registration.runtime.execution_binding_digest,
+          input: structuredClone(options.input),
+        },
+      })
+    } catch (error) {
+      const raced =
+        error instanceof JournalError && error.code === "RUN_ALREADY_EXISTS"
+          ? this.priorAdmission(runId, options)
+          : undefined
+      if (raced) {
+        return raced
+      }
+      throw error
+    }
+    return { detail: this.missionDetail(runId), disposition: "admitted" }
   }
 
   recordObservation(
@@ -1257,6 +1307,33 @@ export class RunnerStore {
       }
     }
     throw new TransportError("RUNNER_UNAVAILABLE", "Mission list changed during read", 503)
+  }
+
+  private priorAdmission(
+    runId: RunId,
+    options: AdmitMissionOptions,
+  ): { detail: MissionDetail; disposition: "duplicate" } | undefined {
+    let first: StoredEvent | undefined
+    try {
+      first = this.#journal.listStoredEvents(runId)[0]
+    } catch (error) {
+      if (error instanceof JournalError && error.code === "RUN_NOT_FOUND") {
+        return undefined
+      }
+      throw error
+    }
+    const { definition_digest: digest, input } = first?.event.payload ?? {}
+    if (
+      digest !== options.definition_digest ||
+      canonicalJson((input ?? null) as JsonValue) !== canonicalJson(options.input)
+    ) {
+      throw new TransportError(
+        "CLIENT_REQUEST_ID_COLLISION",
+        "Client request ID is bound to a different mission",
+        409,
+      )
+    }
+    return { detail: this.missionDetail(runId), disposition: "duplicate" }
   }
 
   private nextStep(mission: StoredMission, deadline: string | undefined): MissionNextStep {

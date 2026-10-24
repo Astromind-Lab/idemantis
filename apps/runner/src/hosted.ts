@@ -1,3 +1,4 @@
+import type { AdapterOperationDescriptor } from "@idemantis/adapter-kit"
 import type { RunId, SourceId } from "@idemantis/contracts"
 import { type Clock, SystemClock } from "@idemantis/dispatcher"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
@@ -54,6 +55,14 @@ export class HostedMissionRunner {
 
   accepts(runtime: MissionRuntimeDefinition): boolean {
     return this.#host.accepts(runtime)
+  }
+
+  operations(): AdapterOperationDescriptor[] {
+    return this.#host.descriptors()
+  }
+
+  compilePlan(plan: unknown): MissionRuntimeDefinition {
+    return this.#host.compilePlan(plan)
   }
 
   start(runId: RunId): MissionExecutionStart {

@@ -6,3 +6,5 @@ coverage
 .env.local
 .env.*.local
 .DS_Store
+__pycache__
+*.egg-info

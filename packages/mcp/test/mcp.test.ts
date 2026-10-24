@@ -64,6 +64,8 @@ describe("idemantis MCP server", () => {
       (listed as { result: { tools: { name: string }[] } }).result.tools.map((tool) => tool.name),
     ).toEqual([
       "list_definitions",
+      "list_operations",
+      "define_plan",
       "start_mission",
       "get_mission_context",
       "list_missions",
@@ -88,6 +90,50 @@ describe("idemantis MCP server", () => {
     ).toMatchObject({ error: { code: -32602 } })
   })
 
+  it("lets an agent write its own plan from connected operations and run it", async () => {
+    const { fixture, call } = await server()
+
+    const operations = await call("list_operations", {})
+    const defined = await call("define_plan", {
+      plan: {
+        id: "agent.drafts",
+        version: "1.0.0",
+        input_schema: {
+          type: "object",
+          properties: { ticket: { type: "string" } },
+          required: ["ticket"],
+        },
+        steps: [
+          {
+            name: "draft",
+            operation: "writer.draft",
+            input: { kind: "object", fields: { ticket: { kind: "input", path: ["ticket"] } } },
+          },
+        ],
+      },
+    })
+    const started = await call("start_mission", {
+      definition_digest: (defined.body as { definition_digest: string }).definition_digest,
+      input: { ticket: "T-30" },
+    })
+    const finished = await call("wait_for_mission", {
+      run_id: (started.body as { run_id: string }).run_id,
+      timeout_ms: 5_000,
+    })
+    const broken = await call("define_plan", {
+      plan: { id: "agent.broken", version: "1.0.0", input_schema: {}, steps: [] },
+    })
+
+    expect(operations.body).toMatchObject({ items: [{ key: "writer.draft" }] })
+    expect(defined.error).toBe(false)
+    expect(finished.body).toMatchObject({
+      terminal_outcome: "completed",
+      effects: [{ output: { draft: "Draft for T-30" } }],
+    })
+    expect(broken.error).toBe(true)
+    expect(fixture.calls).toHaveLength(1)
+  })
+
   it("lets an agent run, observe, and resume a mission through tools", async () => {
     const { fixture, call } = await server()
 
@@ -95,8 +141,15 @@ describe("idemantis MCP server", () => {
     const started = await call("start_mission", {
       definition_digest: fixture.digests.review,
       input: { ticket: "T-10" },
+      idempotency_key: "ticket-T-10",
+    })
+    const restarted = await call("start_mission", {
+      definition_digest: fixture.digests.review,
+      input: { ticket: "T-10" },
+      idempotency_key: "ticket-T-10",
     })
     const runId = (started.body as { run_id: string }).run_id
+    expect((restarted.body as { run_id: string }).run_id).toBe(runId)
     const waiting = await call("wait_for_mission", { run_id: runId, timeout_ms: 5_000 })
     const effectId = (waiting.body as { next: { effect_id: string } }).next.effect_id
     const observation = {

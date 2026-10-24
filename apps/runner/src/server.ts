@@ -4,7 +4,9 @@ import helmet from "@fastify/helmet"
 import rateLimit from "@fastify/rate-limit"
 import type { ClientRequestId, EffectId, JsonObject, RunId, SourceId } from "@idemantis/contracts"
 import { ClientRequestIdSchema, EffectIdSchema, RunIdSchema } from "@idemantis/contracts"
+import type { AdapterOperationDescriptor } from "@idemantis/adapter-kit"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
+import { PlanError } from "@idemantis/sdk"
 import {
   ApiSchemaVersion,
   type DiscardInterventionRequest,
@@ -48,6 +50,8 @@ interface Access {
 
 export interface MissionExecutor {
   accepts?(runtime: MissionRuntimeDefinition): boolean
+  operations?(): AdapterOperationDescriptor[]
+  compilePlan?(plan: unknown): MissionRuntimeDefinition
   run(runId: RunId): Promise<void>
   start?(runId: RunId): MissionExecutionStart
   executionStatus?(runId: RunId): MissionExecutionStatus
@@ -451,8 +455,61 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     return { schema_version: ApiSchemaVersion, registered: runtime.definition_digest }
   })
 
+  app.get("/api/operations", async (request) => {
+    authenticated(request, access)
+    return {
+      schema_version: ApiSchemaVersion,
+      items: (options.mission_executor?.operations?.() ?? []).map((descriptor) => ({
+        key: descriptor.key,
+        adapter: descriptor.adapter,
+        operation: descriptor.operation,
+        effect_class: descriptor.effect_class,
+        consequence: descriptor.consequence,
+        input_schema: descriptor.input_schema,
+        output_schema: descriptor.output_schema,
+        duplicate_safety: descriptor.capabilities.duplicate_safety,
+        reconciliation: descriptor.capabilities.reconciliation,
+      })),
+    }
+  })
+
+  app.post("/api/plans", async (request, reply) => {
+    requireMutation(request, access, "define")
+    const body = object(request.body)
+    if (!options.mission_executor?.compilePlan) {
+      throw new TransportError("RUNNER_UNAVAILABLE", "Mission plans are not configured", 503)
+    }
+    let runtime: MissionRuntimeDefinition
+    try {
+      runtime = options.mission_executor.compilePlan(field(body, "plan"))
+    } catch (error) {
+      if (error instanceof PlanError) {
+        throw new TransportError("INVALID_REQUEST", error.message, 422)
+      }
+      throw error
+    }
+    const subjectKeys = field(body, "subject_reference_keys")
+    if (
+      subjectKeys !== undefined &&
+      (!Array.isArray(subjectKeys) || subjectKeys.some((value) => typeof value !== "string"))
+    ) {
+      throw new TransportError("INVALID_REQUEST", "Subject reference keys are invalid", 422)
+    }
+    options.store.registerDefinition(runtime, {
+      ...(subjectKeys ? { subject_reference_keys: subjectKeys as string[] } : {}),
+    })
+    reply.status(201)
+    return {
+      schema_version: ApiSchemaVersion,
+      definition_digest: runtime.definition_digest,
+      definition_id: runtime.manifest.definition_id,
+      definition_version: runtime.manifest.definition_version,
+      states: Object.keys(runtime.manifest.states).sort(),
+    }
+  })
+
   app.post("/api/missions", async (request, reply) => {
-    requireMutation(request, access)
+    const actorId = requireMutation(request, access)
     const body = object(request.body)
     const definitionDigest = field(body, "definition_digest")
     if (typeof definitionDigest !== "string") {
@@ -471,12 +528,18 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
         422,
       )
     }
-    const detail = options.store.admitMission({
+    const requestKey = field(body, "client_request_id") ?? header(request, "idempotency-key")
+    if (requestKey !== undefined && typeof requestKey !== "string") {
+      throw new TransportError("INVALID_REQUEST", "Client request ID is invalid", 422)
+    }
+    const admitted = options.store.admission({
       definition_digest: definitionDigest,
       input,
+      actor_id: actorId,
+      ...(requestKey ? { client_request_id: requestKey } : {}),
     })
-    reply.status(201)
-    return detail
+    reply.status(admitted.disposition === "admitted" ? 201 : 200)
+    return admitted.detail
   })
 
   app.post("/api/missions/:runId/run", async (request) => {

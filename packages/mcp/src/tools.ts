@@ -73,6 +73,53 @@ export const tools: ToolDefinition[] = [
     run: (client) => client.listDefinitions().then((items) => ({ items })),
   },
   {
+    name: "list_operations",
+    title: "List connected operations",
+    description:
+      "Lists the operations (tools) connected to this runner with their input and output schemas, and whether the runner can safely retry or reconcile them. Use these keys as steps in define_plan.",
+    inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    run: (client) => client.operations().then((items) => ({ items })),
+  },
+  {
+    name: "define_plan",
+    title: "Define a durable plan",
+    description:
+      'Turns a step-by-step plan into a registered durable mission. Each step names a connected operation and builds its input from the mission input ({"kind":"input","path":["field"]}), an earlier step\'s output ({"kind":"output","state":"step_name","path":["field"]}), literals ({"kind":"literal","value":...}) or objects ({"kind":"object","fields":{...}}). Returns the definition_digest for start_mission.',
+    inputSchema: {
+      type: "object",
+      properties: {
+        plan: {
+          type: "object",
+          properties: {
+            id: { type: "string", description: "Lowercase dotted id, for example agent.research" },
+            version: { type: "string", description: "Semantic version, for example 1.0.0" },
+            input_schema: { type: "object", description: "JSON schema for the mission input" },
+            steps: {
+              type: "array",
+              minItems: 1,
+              maxItems: 64,
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string" },
+                  operation: { type: "string" },
+                  input: { type: "object" },
+                },
+                required: ["name", "operation", "input"],
+              },
+            },
+          },
+          required: ["id", "version", "input_schema", "steps"],
+        },
+      },
+      required: ["plan"],
+      additionalProperties: false,
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true },
+    run: (client, input) => client.registerPlan(objectValue(input, "plan")),
+  },
+  {
     name: "start_mission",
     title: "Start a mission",
     description:
@@ -82,15 +129,23 @@ export const tools: ToolDefinition[] = [
       properties: {
         definition_digest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
         input: { type: "object", description: "Mission input matching the definition's schema" },
+        idempotency_key: {
+          type: "string",
+          minLength: 1,
+          maxLength: 512,
+          description: "Stable key for this task so a retried call returns the same mission",
+        },
       },
       required: ["definition_digest", "input"],
       additionalProperties: false,
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
     run: async (client, input) => {
+      const key = optionalText(input, "idempotency_key")
       const admitted = await client.launch(
         text(input, "definition_digest"),
         objectValue(input, "input"),
+        key ? { client_request_id: clientRequestIdFor(`admission:${key}`) } : {},
       )
       return client.context(admitted.summary.run_id)
     },

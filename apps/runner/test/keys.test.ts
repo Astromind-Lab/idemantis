@@ -122,6 +122,58 @@ describe("API keys", () => {
     expect(revoked.status).toBe(401)
   })
 
+  it("admits a mission once per client request even when an agent retries", async () => {
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory(),
+      reference_transition_delay_ms: 0,
+      resume: false,
+    })
+    runners.push(local)
+    const keys = store(local.access_path)
+    const first = keys.create("agent-one", ["view", "operate"]).token
+    const second = keys.create("agent-two", ["view", "operate"]).token
+    const admit = async (token: string, body: Record<string, unknown>, headers = {}) => {
+      const response = await fetch(`${local.origin}/api/missions`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+          ...headers,
+        },
+        body: JSON.stringify({
+          definition_digest: local.definition_digest,
+          input: local.reference_input,
+          ...body,
+        }),
+      })
+      return {
+        status: response.status,
+        run: ((await response.json()) as { summary?: { run_id: string } }).summary?.run_id,
+      }
+    }
+
+    const original = await admit(first, { client_request_id: "order-1001-attempt" })
+    const retried = await admit(first, { client_request_id: "order-1001-attempt" })
+    const viaHeader = await admit(first, {}, { "idempotency-key": "order-1001-attempt" })
+    const otherAgent = await admit(second, { client_request_id: "order-1001-attempt" })
+    const conflicting = await admit(first, {
+      client_request_id: "order-1001-attempt",
+      input: { ...local.reference_input, mission_id: "different-mission" },
+    })
+    const short = await admit(first, { client_request_id: "o-7" })
+    const malformed = await admit(first, { client_request_id: "has spaces" })
+
+    expect(original.status).toBe(201)
+    expect(retried).toEqual({ status: 200, run: original.run })
+    expect(viaHeader).toEqual({ status: 200, run: original.run })
+    expect(otherAgent.status).toBe(201)
+    expect(otherAgent.run).not.toBe(original.run)
+    expect(conflicting.status).toBe(409)
+    expect(short.status).toBe(201)
+    expect(malformed.status).toBe(422)
+  })
+
   it("creates, lists, and revokes keys from the command line", async () => {
     const state = directory()
     const output: string[] = []

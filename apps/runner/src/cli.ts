@@ -39,6 +39,17 @@ export function leaseDuration(value: string | undefined): number | undefined {
   return parsed
 }
 
+export function rateLimitPerMinute(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+  const parsed = Number(value)
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new TypeError("--rate-limit must be a positive integer of requests per minute")
+  }
+  return parsed
+}
+
 async function referenceProof(): Promise<JsonObject> {
   const journal = new SqliteJournal({ path: ":memory:" })
   try {
@@ -155,16 +166,19 @@ export async function runCli(
         "state-dir": { type: "string" },
         adapter: { type: "string", multiple: true },
         "lease-ms": { type: "string" },
+        "rate-limit": { type: "string" },
       },
     })
     const port = parsed.values.port === undefined ? 4318 : Number(parsed.values.port)
     const lease = leaseDuration(parsed.values["lease-ms"])
+    const rateLimit = rateLimitPerMinute(parsed.values["rate-limit"])
     const { IDEMANTIS_ADAPTER_TOKEN: adapterToken } = process.env
     const started = await startLocalRunner({
       port,
       ...(parsed.values["state-dir"] ? { state_directory: parsed.values["state-dir"] } : {}),
       remote_adapters: adapterConnections(parsed.values.adapter, adapterToken),
       ...(lease === undefined ? {} : { lease_duration_ms: lease }),
+      ...(rateLimit === undefined ? {} : { rate_limit_per_minute: rateLimit }),
     })
     write(`Runner ready: ${started.origin}\n`)
     write(`Operator bootstrap: ${started.bootstrap_url}\n`)
@@ -183,7 +197,7 @@ export async function runCli(
     [
       "Usage:",
       "  idemantis-runner reference",
-      "  idemantis-runner dev [--port <port>] [--state-dir <dir>] [--adapter <adapter-instance-id>=<url>] [--lease-ms <ms>]",
+      "  idemantis-runner dev [--port <port>] [--state-dir <dir>] [--adapter <adapter-instance-id>=<url>] [--lease-ms <ms>] [--rate-limit <per-minute>]",
       "  idemantis-runner keys create --name <name> [--scopes view,operate,define] [--state-dir <dir>]",
       "  idemantis-runner keys list [--state-dir <dir>]",
       "  idemantis-runner keys revoke --name <name> [--state-dir <dir>]",

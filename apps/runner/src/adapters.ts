@@ -1,5 +1,6 @@
 import {
   type AdapterBinding,
+  type AdapterOperationDescriptor,
   AdapterExecutor,
   type AdapterOperation,
   type AdapterRegistration,
@@ -15,7 +16,14 @@ import {
   type SourceId,
 } from "@idemantis/contracts"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
-import { ExecutionBindingError, executionBindingDigest } from "@idemantis/sdk"
+import {
+  defineOperation,
+  ExecutionBindingError,
+  executionBindingDigest,
+  type OperationDefinition,
+  planMission,
+} from "@idemantis/sdk"
+import type { TSchema } from "typebox"
 import Schema from "typebox/schema"
 
 export interface HostedAdapter {
@@ -66,6 +74,7 @@ type DefinitionReference = Pick<MissionRuntimeDefinition, "manifest" | "definiti
 export class AdapterHost {
   readonly executor: AdapterExecutor
   readonly #bindings = new Map<string, AdapterBinding>()
+  readonly #descriptors = new Map<string, AdapterOperationDescriptor>()
 
   constructor(options: AdapterHostOptions) {
     const registrations: AdapterRegistration[] = []
@@ -78,6 +87,7 @@ export class AdapterHost {
       })
       for (const operation of adapter.operations) {
         registrations.push({ adapter_instance_id: adapter.adapter_instance_id, operation })
+        this.#descriptors.set(operation.descriptor.key, structuredClone(operation.descriptor))
         this.#bindings.set(
           operation.descriptor.key,
           createAdapterBinding(bundle, adapter.adapter_instance_id, operation.descriptor.key),
@@ -94,6 +104,30 @@ export class AdapterHost {
 
   operations(): string[] {
     return [...this.#bindings.keys()].sort()
+  }
+
+  descriptors(): AdapterOperationDescriptor[] {
+    return [...this.#descriptors.values()]
+      .sort((left, right) => left.key.localeCompare(right.key))
+      .map((descriptor) => structuredClone(descriptor))
+  }
+
+  compilePlan(plan: unknown): MissionRuntimeDefinition {
+    const operations: OperationDefinition[] = this.descriptors().map((descriptor) =>
+      defineOperation({
+        key: descriptor.key,
+        adapter: descriptor.adapter,
+        operation: descriptor.operation,
+        schemaVersion: descriptor.operation_schema_version,
+        inputSchema: descriptor.input_schema as unknown as TSchema,
+        outputSchema: descriptor.output_schema as unknown as TSchema,
+        effectClass: descriptor.effect_class,
+        consequence: descriptor.consequence,
+        capabilities: descriptor.capabilities,
+      }),
+    )
+    const compiled = planMission(plan, operations)
+    return this.bind({ manifest: compiled.manifest, definition_digest: compiled.definitionDigest })
   }
 
   bindingDigest(definition: DefinitionReference): Digest {

@@ -1,3 +1,4 @@
+import type { AdapterOperationDescriptor } from "@idemantis/adapter-kit"
 import type { RunId } from "@idemantis/contracts"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
 import type { SqliteJournal } from "@idemantis/journal-sqlite"
@@ -9,6 +10,8 @@ import {
 
 export interface RoutableMissionExecutor {
   accepts(runtime: MissionRuntimeDefinition): boolean
+  operations?(): AdapterOperationDescriptor[]
+  compilePlan?(plan: unknown): MissionRuntimeDefinition
   run(runId: RunId): Promise<void>
   start(runId: RunId): MissionExecutionStart
   executionStatus(runId: RunId): MissionExecutionStatus
@@ -25,6 +28,22 @@ export class MissionRouter {
 
   accepts(runtime: MissionRuntimeDefinition): boolean {
     return this.#executors.some((executor) => executor.accepts(runtime))
+  }
+
+  operations(): AdapterOperationDescriptor[] {
+    return this.#executors.flatMap((executor) => executor.operations?.() ?? [])
+  }
+
+  compilePlan(plan: unknown): MissionRuntimeDefinition {
+    const executor = this.#executors.find((candidate) => candidate.compilePlan)
+    if (!executor?.compilePlan) {
+      throw new TransportError(
+        "RUNNER_UNAVAILABLE",
+        "No connected adapters can run mission plans",
+        503,
+      )
+    }
+    return executor.compilePlan(plan)
   }
 
   async run(runId: RunId): Promise<void> {
