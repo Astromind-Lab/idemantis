@@ -30,4 +30,7 @@ jobs:
       - run: pnpm run check
       - run: pnpm run proof:faults
       - run: pnpm run proof:agents
+      - run: python3 -m unittest discover -s sdks/python/tests
+        env:
+          PYTHONPATH: sdks/python/src
       - run: pnpm run security:audit
