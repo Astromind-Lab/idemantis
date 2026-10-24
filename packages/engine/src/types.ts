@@ -132,6 +132,9 @@ export interface EffectIssueResultPayload {
   command_id: CommandId
   effect_id: EffectId
   result: EffectIssueResult
+  output?: JsonValue
+  external_reference?: string
+  evidence?: JsonObject
 }
 
 export type EffectReconciliationResult =
@@ -146,6 +149,9 @@ export interface EffectReconciliationResultPayload {
   command_id: CommandId
   effect_id: EffectId
   result: EffectReconciliationResult
+  output?: JsonValue
+  external_reference?: string
+  evidence?: JsonObject
 }
 
 export interface ObservationRecordedPayload {
