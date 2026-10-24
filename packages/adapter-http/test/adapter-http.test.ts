@@ -147,6 +147,26 @@ describe("http adapter protocol", () => {
     })
   })
 
+  it("reports a refused connection as not sent and leaves reconciliation to retry", async () => {
+    const handler = createHttpAdapterHandler({
+      adapter: "tracker",
+      adapter_version: "2.1.0",
+      adapter_package_digest: `sha256:${"d".repeat(64)}`,
+      operations: [
+        ticketOperation(async () => ({ result: "completed", output: { ticket_url: "x" } })),
+      ],
+    })
+    const url = await listen(handler)
+    const [operation] = (await connectHttpAdapter({ url })).operations
+    const server = servers.pop()
+    await new Promise((resolvePromise) => server?.close(resolvePromise))
+
+    expect(
+      await operation?.issue(context(), { ticket: "OPS-9", summary: "Adapter restarting" }),
+    ).toMatchObject({ result: "not_sent" })
+    await expect(operation?.reconcile?.(context(), { ticket: "OPS-9" })).rejects.toThrow()
+  })
+
   it("fails the invocation when the adapter errors or answers outside its contract", async () => {
     const failing = createHttpAdapterHandler({
       adapter: "tracker",

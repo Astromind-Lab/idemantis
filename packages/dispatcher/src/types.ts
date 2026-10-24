@@ -103,6 +103,7 @@ export interface CommandDispatcherOptions {
   lease_duration_ms: number
   clock?: Clock
   identities?: IdentityFactory
+  reconcile_retry?: { attempts: number; backoff_ms: number }
 }
 
 export interface TimerDispatcherOptions {
@@ -129,7 +130,7 @@ export interface InterruptedDispatchRecovery {
   command: CommandRecord
   attempt: AttemptRecord
   result_recorded: AppendResult
-  result: Extract<IssueResult | ReconciliationResult, "uncertain" | "unknown">
+  result: IssueResult | ReconciliationResult
 }
 
 export interface TimerDispatchOutcome {

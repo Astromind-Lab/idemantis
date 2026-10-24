@@ -116,6 +116,32 @@ class ToolServerTest(unittest.TestCase):
             self.server.tool("crm.create", {}, {})
 
 
+class InflightReconcileTest(unittest.TestCase):
+    def test_reconcile_waits_for_the_running_call(self):
+        import threading
+        import time
+
+        ledger = ToolLedger()
+        server = ToolServer(adapter="py-tools", version="1.0.0", ledger=ledger)
+        gate = threading.Event()
+
+        @server.tool("crm.create", input_schema={"type": "object"}, output_schema={"type": "object"})
+        def slow(value, context):
+            gate.wait(5)
+            return {"ticket": "T-9"}
+
+        issued = []
+        worker = threading.Thread(target=lambda: issued.append(call(server, "issue")))
+        worker.start()
+        time.sleep(0.05)
+        threading.Timer(0.1, gate.set).start()
+        reconciled = call(server, "reconcile")
+        worker.join(5)
+        ledger.close()
+        self.assertEqual(reconciled[1], {"result": "confirmed_completed", "output": {"ticket": "T-9"}})
+        self.assertEqual(issued[0][1]["result"], "completed")
+
+
 class PlanBuilderTest(unittest.TestCase):
     def test_builds_the_plan_document_the_runner_accepts(self):
         document = plan(

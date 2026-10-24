@@ -140,7 +140,7 @@ function adapterOperation(
   adapter: string,
   tool: AnyTool,
   ledger: ToolLedger,
-  inflight: Set<string>,
+  inflight: Map<string, Promise<unknown>>,
 ): AdapterOperation<unknown, unknown, unknown> {
   const outputValid = Schema.Compile(tool.output)
   const timeout = tool.timeout_ms ?? 30_000
@@ -198,7 +198,13 @@ function adapterOperation(
       if (prior) {
         return { result: "uncertain", evidence: { reason: `prior call is ${prior.status}` } }
       }
-      inflight.add(context.effect_id)
+      let settle: (value?: unknown) => void = () => {}
+      inflight.set(
+        context.effect_id,
+        new Promise((resolvePromise) => {
+          settle = resolvePromise
+        }),
+      )
       try {
         const output = await tool.run(input as never, toolContext(context))
         if (!outputValid.Check(output)) {
@@ -220,9 +226,14 @@ function adapterOperation(
         return { result: "uncertain", evidence: { message: message(error) } }
       } finally {
         inflight.delete(context.effect_id)
+        settle()
       }
     },
     reconcile: async (context): Promise<ReconciliationResultEnvelope<JsonValue>> => {
+      const running = inflight.get(context.effect_id)
+      if (running) {
+        await Promise.race([running, aborted(context.signal)])
+      }
       const entry = ledger.get(context.effect_id)
       if (!entry || entry.status === "rejected") {
         return { result: "confirmed_not_applied" }
@@ -238,8 +249,18 @@ function adapterOperation(
   }) as unknown as AdapterOperation<unknown, unknown, unknown>
 }
 
+function aborted(signal: AbortSignal): Promise<void> {
+  return new Promise((resolvePromise) => {
+    if (signal.aborted) {
+      resolvePromise()
+      return
+    }
+    signal.addEventListener("abort", () => resolvePromise(), { once: true })
+  })
+}
+
 export function createToolAdapter(options: ToolAdapterOptions): ToolAdapter {
-  const inflight = new Set<string>()
+  const inflight = new Map<string, Promise<unknown>>()
   const operations = options.tools.map((tool) =>
     adapterOperation(options.adapter, tool, options.ledger, inflight),
   )

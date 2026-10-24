@@ -8,7 +8,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import unquote, urlparse
 
 PROTOCOL_VERSION = 1
@@ -77,6 +77,14 @@ class Tool:
             "observation_correlation_fields": [],
             "secret_requirements": [],
         }
+
+
+def _remaining(deadline: str) -> float:
+    try:
+        moment = datetime.fromisoformat(deadline.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    return max(0.0, min((moment - datetime.now(timezone.utc)).total_seconds(), 300.0))
 
 
 def _now() -> str:
@@ -166,7 +174,7 @@ class ToolServer:
     ledger: ToolLedger
     token: Optional[str] = None
     tools: Dict[str, Tool] = field(default_factory=dict)
-    _inflight: Set[str] = field(default_factory=set)
+    _inflight: Dict[str, threading.Event] = field(default_factory=dict)
     _inflight_lock: threading.Lock = field(default_factory=threading.Lock)
     _server: Optional[ThreadingHTTPServer] = None
 
@@ -226,8 +234,9 @@ class ToolServer:
             if prior["status"] == "rejected":
                 return {"result": "rejected", "evidence": {"message": prior["message"] or ""}}
             return {"result": "uncertain", "evidence": {"reason": f"prior call is {prior['status']}"}}
+        done = threading.Event()
         with self._inflight_lock:
-            self._inflight.add(context.effect_id)
+            self._inflight[context.effect_id] = done
         try:
             output = tool.run(value, context)
             self.ledger.finish(context.effect_id, "completed", output)
@@ -243,9 +252,14 @@ class ToolServer:
             return {"result": "uncertain", "evidence": {"message": str(error)[:1024]}}
         finally:
             with self._inflight_lock:
-                self._inflight.discard(context.effect_id)
+                self._inflight.pop(context.effect_id, None)
+            done.set()
 
     def reconcile(self, tool: Tool, context: ToolContext) -> Dict[str, Any]:
+        with self._inflight_lock:
+            running = self._inflight.get(context.effect_id)
+        if running is not None:
+            running.wait(_remaining(context.deadline))
         entry = self.ledger.get(context.effect_id)
         if entry is None or entry["status"] == "rejected":
             return {"result": "confirmed_not_applied"}

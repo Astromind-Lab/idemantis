@@ -88,7 +88,7 @@ export class RunnerExecution {
           current_sequence: mission.state.current_sequence,
         }
       }
-      const recovered = this.#commands.recoverInterrupted(runId)
+      const recovered = await this.#commands.recoverInterrupted(runId)
       if (recovered.length > 0) {
         dispatches += recovered.length
         continue

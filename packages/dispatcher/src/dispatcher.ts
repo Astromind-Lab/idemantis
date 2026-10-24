@@ -77,10 +77,24 @@ export class CommandDispatcher {
   readonly #leaseDurationMs: number
   readonly #clock: Clock
   readonly #identities: IdentityFactory
+  readonly #reconcileAttempts: number
+  readonly #reconcileBackoffMs: number
 
   constructor(options: CommandDispatcherOptions) {
     if (!Number.isSafeInteger(options.lease_duration_ms) || options.lease_duration_ms < 1) {
       throw new RangeError("lease_duration_ms must be a positive safe integer")
+    }
+    this.#reconcileAttempts = options.reconcile_retry?.attempts ?? 4
+    this.#reconcileBackoffMs = options.reconcile_retry?.backoff_ms ?? 250
+    if (
+      !Number.isSafeInteger(this.#reconcileAttempts) ||
+      this.#reconcileAttempts < 1 ||
+      !Number.isSafeInteger(this.#reconcileBackoffMs) ||
+      this.#reconcileBackoffMs < 0
+    ) {
+      throw new RangeError(
+        "reconcile_retry needs a positive attempt count and a non-negative backoff",
+      )
     }
     this.#journal = options.journal
     this.#executor = options.executor
@@ -156,7 +170,7 @@ export class CommandDispatcher {
     }
   }
 
-  recoverInterrupted(runId: RunId): InterruptedDispatchRecovery[] {
+  async recoverInterrupted(runId: RunId): Promise<InterruptedDispatchRecovery[]> {
     const now = this.#clock.now().getTime()
     const commands = new Map(
       this.#journal.listCommands(runId).map((command) => [command.command_id, command]),
@@ -177,7 +191,10 @@ export class CommandDispatcher {
         continue
       }
       const issue = command.kind === "effect.issue"
-      const result = issue ? "uncertain" : "unknown"
+      const report: ExecutionReport<IssueResult | ReconciliationResult> = issue
+        ? { result: "uncertain", evidence: { interrupted: "dispatch did not report a result" } }
+        : await this.reconcileAgain(command, attempt, now)
+      const { result } = report
       const resultRecorded = this.#journal.recordDispatchResult(
         this.event(
           { command, attempt },
@@ -187,6 +204,7 @@ export class CommandDispatcher {
             command_id: command.command_id,
             effect_id: attempt.effect_id,
             result,
+            ...reportDetails(report),
           },
           attempt.started_event_id,
         ),
@@ -202,6 +220,23 @@ export class CommandDispatcher {
     return recovered
   }
 
+  private async reconcileAgain(
+    command: ClaimedCommand["command"],
+    attempt: ClaimedCommand["attempt"],
+    now: number,
+  ): Promise<ExecutionReport<IssueResult | ReconciliationResult>> {
+    const deadline = new Date(now + this.#leaseDurationMs).toISOString()
+    const report = await this.execute({
+      command: { ...command, claim_deadline: deadline },
+      attempt: { ...attempt, claim_deadline: deadline },
+    })
+    const evidence =
+      report.evidence && typeof report.evidence === "object" && !Array.isArray(report.evidence)
+        ? report.evidence
+        : {}
+    return { ...report, evidence: { ...evidence, repeated_after_interruption: true } }
+  }
+
   private async execute(
     claim: ClaimedCommand,
   ): Promise<ExecutionReport<IssueResult | ReconciliationResult>> {
@@ -214,13 +249,37 @@ export class CommandDispatcher {
           : { result: await this.#executor.issue(command, attempt) }
       }
       if (claim.command.kind === "effect.reconcile") {
+        return await this.reconcileWithRetry(command, attempt)
+      }
+      throw new TypeError(`Command ${claim.command.command_id} is not dispatchable`)
+    } catch (error) {
+      return {
+        result: claim.command.kind === "effect.issue" ? "uncertain" : "unknown",
+        evidence: {
+          executor_error: (error instanceof Error ? error.message : String(error)).slice(0, 512),
+        },
+      }
+    }
+  }
+
+  private async reconcileWithRetry(
+    command: ClaimedCommand["command"],
+    attempt: ClaimedCommand["attempt"],
+  ): Promise<ExecutionReport<IssueResult | ReconciliationResult>> {
+    let backoff = this.#reconcileBackoffMs
+    for (let tried = 1; ; tried += 1) {
+      try {
         return this.#executor.invokeReconciliation
           ? await this.#executor.invokeReconciliation(command, attempt)
           : { result: await this.#executor.reconcile(command, attempt) }
+      } catch (error) {
+        const remaining = Date.parse(attempt.claim_deadline) - this.#clock.now().getTime()
+        if (tried >= this.#reconcileAttempts || remaining <= backoff * 2) {
+          throw error
+        }
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, backoff))
+        backoff *= 2
       }
-      throw new TypeError(`Command ${claim.command.command_id} is not dispatchable`)
-    } catch {
-      return { result: claim.command.kind === "effect.issue" ? "uncertain" : "unknown" }
     }
   }
 

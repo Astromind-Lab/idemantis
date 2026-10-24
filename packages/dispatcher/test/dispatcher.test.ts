@@ -320,6 +320,7 @@ describe("command dispatcher", () => {
       lease_duration_ms: 60_000,
       clock: new VirtualClock("2026-01-01T00:00:02Z"),
       identities: identities(),
+      reconcile_retry: { attempts: 1, backoff_ms: 0 },
     })
 
     const issueOutcome = await dispatcher.dispatchNext(runId)
@@ -327,9 +328,50 @@ describe("command dispatcher", () => {
 
     expect(issueOutcome).toMatchObject({ status: "recorded", result: "uncertain" })
     expect(reconciliationOutcome).toMatchObject({ status: "recorded", result: "unknown" })
+    expect(
+      journal
+        .listEvents(runId)
+        .filter((event) => event.type.endsWith("result_recorded"))
+        .map(({ payload: { evidence } }) => evidence),
+    ).toEqual([{ executor_error: "connection lost" }, { executor_error: "provider unavailable" }])
     expect(reconcile).toHaveBeenCalledOnce()
     expect(journal.getMission(runId).state.status).toBe("unresolved")
     expect(await dispatcher.dispatchNext(runId)).toEqual({ status: "idle" })
+  })
+
+  it("retries a reconciliation that fails in transit before deciding", async () => {
+    const journal = open()
+    const reconcile = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockRejectedValueOnce(new Error("fetch failed"))
+      .mockResolvedValueOnce("confirmed_completed")
+    const dispatcher = new CommandDispatcher({
+      journal,
+      executor: { issue: vi.fn(async () => "uncertain" as const), reconcile },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:00:02Z"),
+      identities: identities(),
+      reconcile_retry: { attempts: 3, backoff_ms: 1 },
+    })
+
+    await dispatcher.dispatchNext(runId)
+    const reconciled = await dispatcher.dispatchNext(runId)
+
+    expect(reconciled).toMatchObject({ status: "recorded", result: "confirmed_completed" })
+    expect(reconcile).toHaveBeenCalledTimes(3)
+    expect(journal.getMission(runId).state.terminal_outcome).toBe("completed")
+    expect(
+      () =>
+        new CommandDispatcher({
+          journal,
+          executor: { issue: vi.fn(), reconcile },
+          worker_id: "runner-1",
+          lease_duration_ms: 60_000,
+          reconcile_retry: { attempts: 0, backoff_ms: 1 },
+        }),
+    ).toThrow(RangeError)
   })
 
   it("records an interrupted dispatch as uncertain after its claim expires", async () => {
@@ -372,18 +414,34 @@ describe("command dispatcher", () => {
       identities: identities(),
     })
 
-    expect(restarted.recoverInterrupted(runId)).toEqual([])
-    expect(stranger.recoverInterrupted(runId)).toEqual([])
+    expect(await restarted.recoverInterrupted(runId)).toEqual([])
+    expect(await stranger.recoverInterrupted(runId)).toEqual([])
     clock.advanceTo("2026-01-01T00:01:02Z")
-    const recovered = restarted.recoverInterrupted(runId)
+    const recovered = await restarted.recoverInterrupted(runId)
 
     expect(recovered).toMatchObject([{ run_id: runId, result: "uncertain" }])
     expect(recovered[0]?.result_recorded.acceptance.event_id).toBe("evt_01ARZ3NDEKTSV4RRFFQ69G5FB0")
-    expect(restarted.recoverInterrupted(runId)).toEqual([])
+    expect(await restarted.recoverInterrupted(runId)).toEqual([])
     expect(journal.getMission(runId).state.current_state).toBe("reconcileVehicle")
-    expect(await restarted.dispatchNext(runId)).toMatchObject({
-      status: "recorded",
-      result: "confirmed_completed",
+
+    const hung = new CommandDispatcher({
+      journal,
+      executor: { issue: vi.fn(), reconcile: vi.fn(() => new Promise<never>(() => {})) },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: new FixedIdentities(
+        ["att_01ARZ3NDEKTSV4RRFFQ69G5FB1"],
+        ["evt_01ARZ3NDEKTSV4RRFFQ69G5FB3"],
+      ),
+    })
+    void hung.dispatchNext(runId)
+    clock.advanceTo("2026-01-01T00:02:03Z")
+    const reconciled = await restarted.recoverInterrupted(runId)
+
+    expect(reconciled).toMatchObject([{ run_id: runId, result: "confirmed_completed" }])
+    expect(journal.listEvents(runId).at(-1)?.payload).toMatchObject({
+      evidence: { repeated_after_interruption: true },
     })
     expect(issue).toHaveBeenCalledOnce()
     expect(reconcile).toHaveBeenCalledOnce()

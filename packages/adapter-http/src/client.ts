@@ -81,6 +81,18 @@ async function readJson(response: Response, limit: number, label: string): Promi
   }
 }
 
+function refused(error: unknown): boolean {
+  let current: unknown = error
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth += 1) {
+    const { code, cause } = current as { code?: unknown; cause?: unknown }
+    if (code === "ECONNREFUSED") {
+      return true
+    }
+    current = cause
+  }
+  return false
+}
+
 function invocationIdentity(context: AdapterInvocationContext) {
   const { signal: _signal, ...identity } = context
   return identity
@@ -170,14 +182,25 @@ export async function connectHttpAdapter(
       ...(descriptor.maximum_fence_activation_delay_ms === undefined
         ? {}
         : { maximumFenceActivationDelayMs: descriptor.maximum_fence_activation_delay_ms }),
-      issue: async (context, input) =>
-        (await send(
-          descriptor,
-          "issue",
-          { context: invocationIdentity(context), input: input as JsonValue },
-          context.signal,
-          context.effect_id,
-        )) as never,
+      issue: async (context, input) => {
+        try {
+          return (await send(
+            descriptor,
+            "issue",
+            { context: invocationIdentity(context), input: input as JsonValue },
+            context.signal,
+            context.effect_id,
+          )) as never
+        } catch (error) {
+          if (refused(error)) {
+            return {
+              result: "not_sent",
+              evidence: { reason: "adapter refused the connection before the request was sent" },
+            } as never
+          }
+          throw error
+        }
+      },
       ...(capabilities.reconciliation === "none"
         ? {}
         : {

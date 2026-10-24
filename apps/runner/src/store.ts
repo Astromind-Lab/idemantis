@@ -18,6 +18,7 @@ import {
 } from "@idemantis/engine"
 import {
   JournalError,
+  type MissionHead,
   type SqliteJournal,
   type StoredEvent,
   type StoredMission,
@@ -89,6 +90,8 @@ function effectPhase(status: string): MissionContextEffect["phase"] {
   }
   return "in_flight"
 }
+
+const summaryCacheLimit = 100_000
 
 const terminalStatuses = new Set(["completed", "cancelled", "compensated", "failed", "unresolved"])
 const effectIdField = "effect_id"
@@ -251,6 +254,12 @@ export class RunnerStore {
   readonly #clock: () => Date
   readonly #id: () => string
   readonly #interventionLifetimeMs: number
+  readonly #summaries = new Map<string, MissionSummary>()
+  readonly #summaryKeys = new Map<string, string>()
+  #operationsBatches: { revision: number; batches: Map<string, StreamEnvelope[]> } = {
+    revision: 0,
+    batches: new Map(),
+  }
 
   constructor(options: RunnerStoreOptions) {
     this.#journal = options.journal
@@ -339,7 +348,28 @@ export class RunnerStore {
   }
 
   operationsStreamBatch(afterRevision: number, limit = 1000): StreamEnvelope[] {
-    this.assertStreamPosition(afterRevision, this.listRevision, "Operations revision", 1)
+    const revision = this.listRevision
+    const key = `${afterRevision}:${limit}`
+    if (this.#operationsBatches.revision !== revision) {
+      this.#operationsBatches = { revision, batches: new Map() }
+    }
+    const cached = this.#operationsBatches.batches.get(key)
+    if (cached) {
+      return structuredClone(cached)
+    }
+    const batch = this.computeOperationsBatch(afterRevision, revision, limit)
+    if (this.#operationsBatches.batches.size < 1_000) {
+      this.#operationsBatches.batches.set(key, batch)
+    }
+    return structuredClone(batch)
+  }
+
+  private computeOperationsBatch(
+    afterRevision: number,
+    revision: number,
+    limit: number,
+  ): StreamEnvelope[] {
+    this.assertStreamPosition(afterRevision, revision, "Operations revision", 1)
     const changes = this.#journal.listMissionChanges(afterRevision, limit)
     const last = changes.at(-1)
     if (!last) {
@@ -628,8 +658,21 @@ export class RunnerStore {
       snapshot.revision,
       bindingQuery,
     )
+    const definitions = new Map(
+      this.#journal
+        .listDefinitions()
+        .map((definition) => [definition.runtime.definition_digest, definition]),
+    )
     const items = snapshot.missions
-      .map((mission) => this.summary(mission))
+      .map((head) => {
+        const registration = definitions.get(head.definition_digest)
+        return this.cachedSummary(
+          head.run_id,
+          `${head.run_id}:${head.current_sequence}:${head.state_digest}:${registration?.updated_at ?? ""}`,
+          () => this.#journal.getMission(head.run_id),
+          registration?.subject_reference_keys ?? [],
+        )
+      })
       .filter((summary) => bucket === "all" || summary.queue_bucket === bucket)
       .filter((summary) => this.matchesSearch(summary, search))
       .sort(compareMissionPriority)
@@ -1297,10 +1340,10 @@ export class RunnerStore {
     }
   }
 
-  private missionSnapshot(): { missions: StoredMission[]; revision: number } {
+  private missionSnapshot(): { missions: MissionHead[]; revision: number } {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       const before = this.#journal.missionListRevision()
-      const missions = this.#journal.listMissions()
+      const missions = this.#journal.listMissionHeads()
       const after = this.#journal.missionListRevision()
       if (before === after) {
         return { missions, revision: after }
@@ -1381,6 +1424,40 @@ export class RunnerStore {
 
   private summary(mission: StoredMission): MissionSummary {
     const runId = mission.state.run_id
+    const registration = this.#journal.getDefinition(mission.runtime.definition_digest)
+    return this.cachedSummary(
+      runId,
+      `${runId}:${mission.state.current_sequence}:${mission.state_digest}:${registration?.updated_at ?? ""}`,
+      () => mission,
+      registration?.subject_reference_keys ?? [],
+    )
+  }
+
+  private cachedSummary(
+    runId: RunId,
+    cacheKey: string,
+    load: () => StoredMission,
+    subjectKeys: readonly string[],
+  ): MissionSummary {
+    const cached = this.#summaries.get(cacheKey)
+    if (cached) {
+      return structuredClone(cached)
+    }
+    const computed = this.computeSummary(load(), subjectKeys)
+    this.#summaries.delete(this.#summaryKeys.get(runId) ?? "")
+    this.#summaryKeys.set(runId, cacheKey)
+    this.#summaries.set(cacheKey, computed)
+    if (this.#summaries.size > summaryCacheLimit) {
+      const oldest = this.#summaries.keys().next().value
+      if (oldest !== undefined) {
+        this.#summaries.delete(oldest)
+      }
+    }
+    return structuredClone(computed)
+  }
+
+  private computeSummary(mission: StoredMission, subjectKeys: readonly string[]): MissionSummary {
+    const runId = mission.state.run_id
     const effects = this.#journal.listEffects(runId)
     const ownership = this.#journal.getOwnership(runId)
     const records = this.#journal.listStoredEvents(runId)
@@ -1394,8 +1471,7 @@ export class RunnerStore {
         current?.kind === "operator_wait" ||
         mission.state.status === "waiting",
     })
-    const registration = this.#journal.getDefinition(mission.runtime.definition_digest)
-    const subjectReferences = (registration?.subject_reference_keys ?? []).flatMap((key) => {
+    const subjectReferences = subjectKeys.flatMap((key) => {
       const value = mission.state.input[key]
       return value === undefined ? [] : [{ kind: key, value: visible(value) }]
     })

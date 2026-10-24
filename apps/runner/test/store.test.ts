@@ -238,6 +238,29 @@ describe("runner store", () => {
     expect(replay.stored_digest).toBe(replay.rebuilt_digest)
   })
 
+  it("refreshes cached queue summaries when a mission or its definition changes", () => {
+    const runner = store()
+    admit(runner, runA, "shipment-a")
+    const before = runner.listMissions({ bucket: "all" }).items[0]
+
+    runner.recordObservation(
+      runA,
+      {
+        observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FC0",
+        observation_type: "delivery.noted",
+        payload: {},
+      },
+      "local-operator",
+    )
+    const advanced = runner.listMissions({ bucket: "all" }).items[0]
+    runner.registerDefinition(runtime, { subject_reference_keys: [] })
+    const rekeyed = runner.listMissions({ bucket: "all" }).items[0]
+
+    expect(before?.subject_references).toHaveLength(1)
+    expect(advanced?.current_sequence).toBe((before?.current_sequence ?? 0) + 1)
+    expect(rekeyed?.subject_references).toEqual([])
+  })
+
   it("binds pagination cursors to the queue revision and query", () => {
     const runner = store()
     admit(runner, runB, "shipment-b")

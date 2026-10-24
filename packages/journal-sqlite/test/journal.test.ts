@@ -382,6 +382,22 @@ describe("SQLite journal", () => {
     expect(reopened.getDefinition(`sha256:${"d".repeat(64)}`)).toBeUndefined()
   })
 
+  it("lists lightweight mission heads that track each change", () => {
+    const journal = open(journalPath())
+    admitted(journal)
+
+    const [head] = journal.listMissionHeads()
+    const mission = journal.getMission(runId)
+
+    expect(head).toEqual({
+      run_id: runId,
+      definition_digest: runtime.definition_digest,
+      current_sequence: mission.state.current_sequence,
+      state_digest: mission.state_digest,
+      updated_at: mission.updated_at,
+    })
+  })
+
   it("rejects definitions whose digest does not match the manifest", () => {
     const journal = open(journalPath())
 

@@ -77,6 +77,14 @@ export interface StoredMission {
   updated_at: string
 }
 
+export interface MissionHead {
+  run_id: RunId
+  definition_digest: Digest
+  current_sequence: number
+  state_digest: Digest
+  updated_at: string
+}
+
 export interface StoredDefinition {
   runtime: MissionRuntimeDefinition
   subject_reference_keys: string[]
