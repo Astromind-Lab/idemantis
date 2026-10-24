@@ -18,6 +18,7 @@ import {
 } from "@idemantis/transport"
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from "fastify"
 import Schema from "typebox/schema"
+import type { ApiKeyPrincipal, ApiKeyScope } from "./keys.js"
 import type { SessionAuthority } from "./session.js"
 import type { RunnerStore } from "./store.js"
 
@@ -28,9 +29,21 @@ export interface RunnerServerOptions {
   sessions: SessionAuthority
   exact_origin: string
   mission_executor?: MissionExecutor
+  api_keys?: ApiKeyAuthenticator
+  rate_limit_per_minute?: number
   secure_cookie?: boolean
   stream_poll_interval_ms?: number
   stream_heartbeat_interval_ms?: number
+}
+
+export interface ApiKeyAuthenticator {
+  authenticate(token: string): ApiKeyPrincipal
+}
+
+interface Access {
+  sessions: SessionAuthority
+  api_keys: ApiKeyAuthenticator | undefined
+  exact_origin: string
 }
 
 export interface MissionExecutor {
@@ -76,14 +89,49 @@ function assertOrigin(request: FastifyRequest, exactOrigin: string): void {
   }
 }
 
+function bearerToken(request: FastifyRequest): string | undefined {
+  const value = header(request, "authorization")
+  if (value === undefined) {
+    return undefined
+  }
+  const match = /^Bearer ([^\s]+)$/.exec(value)
+  if (!match?.[1]) {
+    throw new TransportError("SESSION_EXPIRED", "Authorization header is malformed", 401)
+  }
+  return match[1]
+}
+
+function keyPrincipal(
+  request: FastifyRequest,
+  access: Access,
+  scope: ApiKeyScope,
+): SourceId | undefined {
+  const token = bearerToken(request)
+  if (token === undefined) {
+    return undefined
+  }
+  if (!access.api_keys) {
+    throw new TransportError("SESSION_EXPIRED", "API keys are not enabled on this runner", 401)
+  }
+  const principal = access.api_keys.authenticate(token)
+  if (!principal.scopes.includes(scope)) {
+    throw new TransportError("ACTION_FORBIDDEN", `API key lacks the ${scope} scope`, 403)
+  }
+  return principal.actor_id
+}
+
 function requireMutation(
   request: FastifyRequest,
-  sessions: SessionAuthority,
-  exactOrigin: string,
+  access: Access,
+  scope: ApiKeyScope = "operate",
 ): SourceId {
-  assertOrigin(request, exactOrigin)
-  sessions.assertCsrf(cookieToken(request), header(request, "x-idemantis-csrf"))
-  return sessions.assertActive(cookieToken(request))
+  const keyed = keyPrincipal(request, access, scope)
+  if (keyed) {
+    return keyed
+  }
+  assertOrigin(request, access.exact_origin)
+  access.sessions.assertCsrf(cookieToken(request), header(request, "x-idemantis-csrf"))
+  return access.sessions.assertActive(cookieToken(request))
 }
 
 function apiError(request: FastifyRequest, error: TransportError) {
@@ -142,8 +190,8 @@ function clientRequestId(value: unknown): ClientRequestId {
   return value as ClientRequestId
 }
 
-function authenticated(request: FastifyRequest, sessions: SessionAuthority): SourceId {
-  return sessions.assertActive(cookieToken(request))
+function authenticated(request: FastifyRequest, access: Access): SourceId {
+  return keyPrincipal(request, access, "view") ?? access.sessions.assertActive(cookieToken(request))
 }
 
 function streamPosition(envelope: StreamEnvelope): number {
@@ -188,7 +236,7 @@ async function writeStream(reply: FastifyReply, envelope: StreamEnvelope): Promi
 async function runEventStream(options: {
   request: FastifyRequest
   reply: FastifyReply
-  sessions: SessionAuthority
+  access: Access
   initial_position: number
   poll_interval_ms: number
   heartbeat_interval_ms: number
@@ -203,7 +251,7 @@ async function runEventStream(options: {
   let heartbeatAt = 0
   try {
     while (!controller.signal.aborted) {
-      options.sessions.assertActive(cookieToken(options.request))
+      authenticated(options.request, options.access)
       const envelopes = options.read(position)
       if (envelopes.length > 0) {
         for (const envelope of envelopes) {
@@ -228,7 +276,7 @@ async function runEventStream(options: {
 function openEventStream(options: {
   request: FastifyRequest
   reply: FastifyReply
-  sessions: SessionAuthority
+  access: Access
   initial_position: number
   poll_interval_ms: number
   heartbeat_interval_ms: number
@@ -277,8 +325,25 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     throw new RangeError("Stream intervals must be positive safe integers")
   }
 
+  const access: Access = {
+    sessions: options.sessions,
+    api_keys: options.api_keys,
+    exact_origin: options.exact_origin,
+  }
+  const rateLimitPerMinute = options.rate_limit_per_minute ?? 240
+  if (!Number.isSafeInteger(rateLimitPerMinute) || rateLimitPerMinute < 1) {
+    throw new RangeError("rate_limit_per_minute must be a positive safe integer")
+  }
+
   await app.register(cookie)
-  await app.register(rateLimit, { max: 240, timeWindow: "1 minute" })
+  await app.register(rateLimit, {
+    max: rateLimitPerMinute,
+    timeWindow: "1 minute",
+    keyGenerator: (request) => {
+      const key = /^Bearer idm_([0-9A-Z]{26})_/.exec(header(request, "authorization") ?? "")
+      return key?.[1] ? `key:${key[1]}` : request.ip
+    },
+  })
   await app.register(helmet, {
     contentSecurityPolicy: {
       directives: {
@@ -350,19 +415,19 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   app.get("/api/session", async (request) => options.sessions.session(cookieToken(request)))
 
   app.delete("/api/session", async (request, reply) => {
-    requireMutation(request, options.sessions, options.exact_origin)
+    requireMutation(request, access)
     options.sessions.revoke(cookieToken(request))
     reply.clearCookie(sessionCookie, { path: "/" })
     return { schema_version: ApiSchemaVersion, ended: true }
   })
 
   app.get("/api/definitions", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     return { schema_version: ApiSchemaVersion, items: options.store.listDefinitions() }
   })
 
   app.post("/api/definitions", async (request) => {
-    requireMutation(request, options.sessions, options.exact_origin)
+    requireMutation(request, access, "define")
     const body = object(request.body)
     const runtime = object(field(body, "runtime")) as unknown as MissionRuntimeDefinition
     const subjectKeys = field(body, "subject_reference_keys")
@@ -387,7 +452,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions", async (request, reply) => {
-    requireMutation(request, options.sessions, options.exact_origin)
+    requireMutation(request, access)
     const body = object(request.body)
     const definitionDigest = field(body, "definition_digest")
     if (typeof definitionDigest !== "string") {
@@ -415,7 +480,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions/:runId/run", async (request) => {
-    requireMutation(request, options.sessions, options.exact_origin)
+    requireMutation(request, access)
     const params = object(request.params)
     const selectedRunId = runId(field(params, "runId"))
     options.store.missionDetail(selectedRunId)
@@ -427,7 +492,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions/:runId/start", async (request, reply) => {
-    requireMutation(request, options.sessions, options.exact_origin)
+    requireMutation(request, access)
     const params = object(request.params)
     const selectedRunId = runId(field(params, "runId"))
     options.store.missionDetail(selectedRunId)
@@ -444,7 +509,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions/:runId/observations", async (request, reply) => {
-    const sourceId = requireMutation(request, options.sessions, options.exact_origin)
+    const sourceId = requireMutation(request, access)
     const params = object(request.params)
     const selectedRunId = runId(field(params, "runId"))
     const receipt = options.store.recordObservation(
@@ -466,7 +531,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/execution", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     const selectedRunId = runId(field(params, "runId"))
     options.store.missionDetail(selectedRunId)
@@ -477,7 +542,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const query = object(request.query)
     const bucket = queryValue(field(query, "bucket"))
     const search = queryValue(field(query, "query"))
@@ -492,13 +557,13 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     return options.store.missionDetail(runId(field(params, "runId")))
   })
 
   app.get("/api/missions/:runId/timeline", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     const query = object(request.query)
     return options.store.timeline(
@@ -509,7 +574,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/effects", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     const query = object(request.query)
     return options.store.effects(
@@ -520,7 +585,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/effects/:effectId", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     return options.store.effectDetail(
       runId(field(params, "runId")),
@@ -529,14 +594,14 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/replay/:sequence", async (request) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     const sequence = Number(field(params, "sequence"))
     return options.store.replay(runId(field(params, "runId")), sequence)
   })
 
   app.post("/api/missions/:runId/interventions/prepare", async (request, reply) => {
-    const actorId = requireMutation(request, options.sessions, options.exact_origin)
+    const actorId = requireMutation(request, access)
     const params = object(request.params)
     const prepared = options.store.prepareIntervention(
       runId(field(params, "runId")),
@@ -548,7 +613,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions/:runId/interventions/submit", async (request) => {
-    const actorId = requireMutation(request, options.sessions, options.exact_origin)
+    const actorId = requireMutation(request, access)
     const params = object(request.params)
     return options.store.submitIntervention(
       runId(field(params, "runId")),
@@ -558,7 +623,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions/:runId/interventions/discard", async (request) => {
-    const actorId = requireMutation(request, options.sessions, options.exact_origin)
+    const actorId = requireMutation(request, access)
     const params = object(request.params)
     return options.store.discardIntervention(
       runId(field(params, "runId")),
@@ -568,7 +633,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/interventions", async (request) => {
-    const actorId = authenticated(request, options.sessions)
+    const actorId = authenticated(request, access)
     const params = object(request.params)
     const query = object(request.query)
     return options.store.interventionActivity(
@@ -580,7 +645,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/interventions/:clientRequestId", async (request) => {
-    const actorId = authenticated(request, options.sessions)
+    const actorId = authenticated(request, access)
     const params = object(request.params)
     return options.store.preparedInterventionById(
       runId(field(params, "runId")),
@@ -590,7 +655,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/interventions/:clientRequestId/receipt", async (request) => {
-    const actorId = authenticated(request, options.sessions)
+    const actorId = authenticated(request, access)
     const params = object(request.params)
     return options.store.interventionReceiptById(
       runId(field(params, "runId")),
@@ -600,7 +665,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/intervention-receipts", async (request) => {
-    const actorId = authenticated(request, options.sessions)
+    const actorId = authenticated(request, access)
     const params = object(request.params)
     const query = object(request.query)
     return options.store.interventionReceipts(
@@ -612,7 +677,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/streams/operations", async (request, reply) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const query = object(request.query)
     const headerCursor = header(request, "last-event-id")
     const queryCursor = queryValue(field(query, "cursor"))
@@ -622,7 +687,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     return openEventStream({
       request,
       reply,
-      sessions: options.sessions,
+      access,
       initial_position: position,
       poll_interval_ms: streamPollInterval,
       heartbeat_interval_ms: streamHeartbeatInterval,
@@ -632,7 +697,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/stream", async (request, reply) => {
-    authenticated(request, options.sessions)
+    authenticated(request, access)
     const params = object(request.params)
     const selectedRunId = runId(field(params, "runId"))
     const query = object(request.query)
@@ -644,7 +709,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     return openEventStream({
       request,
       reply,
-      sessions: options.sessions,
+      access,
       initial_position: position,
       poll_interval_ms: streamPollInterval,
       heartbeat_interval_ms: streamHeartbeatInterval,
@@ -654,7 +719,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.get("/api/missions/:runId/receipts/stream", async (request, reply) => {
-    const actorId = authenticated(request, options.sessions)
+    const actorId = authenticated(request, access)
     const params = object(request.params)
     const selectedRunId = runId(field(params, "runId"))
     const query = object(request.query)
@@ -666,7 +731,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     return openEventStream({
       request,
       reply,
-      sessions: options.sessions,
+      access,
       initial_position: position,
       poll_interval_ms: streamPollInterval,
       heartbeat_interval_ms: streamHeartbeatInterval,

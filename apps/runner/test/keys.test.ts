@@ -2,10 +2,13 @@ import { mkdtempSync, rmSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
+import { runCli } from "../src/cli.js"
 import { ApiKeyStore, parseScopes } from "../src/keys.js"
+import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 
 const directories: string[] = []
 const stores: ApiKeyStore[] = []
+const runners: StartedLocalRunner[] = []
 
 function directory(): string {
   const created = mkdtempSync(join(tmpdir(), "idemantis-keys-"))
@@ -19,7 +22,10 @@ function store(path: string): ApiKeyStore {
   return opened
 }
 
-afterEach(() => {
+afterEach(async () => {
+  for (const runner of runners.splice(0)) {
+    await runner.close()
+  }
   for (const opened of stores.splice(0)) {
     opened.close()
   }
@@ -62,5 +68,81 @@ describe("API keys", () => {
     expect(parseScopes(["define"])).toEqual(["define"])
     expect(() => parseScopes("")).toThrow(TypeError)
     expect(() => parseScopes("view,admin")).toThrow(TypeError)
+  })
+
+  it("lets a keyed client call the API without a browser session", async () => {
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory(),
+      reference_transition_delay_ms: 0,
+      resume: false,
+    })
+    runners.push(local)
+    const keys = store(local.access_path)
+    const operator = keys.create("operator-agent", ["view", "operate"]).token
+    const viewer = keys.create("viewer-agent", ["view"]).token
+    const call = (path: string, token: string | undefined, body?: unknown) =>
+      fetch(`${local.origin}${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers: {
+          ...(token ? { authorization: token.startsWith("idm_") ? `Bearer ${token}` : token } : {}),
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+
+    const listed = await call("/api/missions", operator)
+    const admitted = await call("/api/missions", operator, {
+      definition_digest: local.definition_digest,
+      input: local.reference_input,
+    })
+    const viewerAdmit = await call("/api/missions", viewer, {
+      definition_digest: local.definition_digest,
+      input: local.reference_input,
+    })
+    const viewerRead = await call("/api/definitions", viewer)
+    const defineDenied = await call("/api/definitions", operator, { runtime: {} })
+    const anonymous = await call("/api/missions", undefined)
+    const malformed = await call("/api/missions", "Bearer")
+    const forged = await call(
+      "/api/missions",
+      `${operator.slice(0, -1)}${operator.endsWith("x") ? "y" : "x"}`,
+    )
+    keys.revoke("operator-agent")
+    const revoked = await call("/api/missions", operator)
+
+    expect(listed.status).toBe(200)
+    expect(admitted.status).toBe(201)
+    expect(viewerAdmit.status).toBe(403)
+    expect(viewerRead.status).toBe(200)
+    expect(defineDenied.status).toBe(403)
+    expect(anonymous.status).toBe(401)
+    expect(malformed.status).toBe(401)
+    expect(forged.status).toBe(401)
+    expect(revoked.status).toBe(401)
+  })
+
+  it("creates, lists, and revokes keys from the command line", async () => {
+    const state = directory()
+    const output: string[] = []
+    const write = (value: string) => {
+      output.push(value)
+    }
+
+    expect(
+      await runCli(["keys", "create", "--name", "ci-agent", "--state-dir", state], write),
+    ).toBe(0)
+    const created = JSON.parse(output.pop() ?? "{}") as { token: string; scopes: string[] }
+    expect(await runCli(["keys", "list", "--state-dir", state], write)).toBe(0)
+    const listed = JSON.parse(output.pop() ?? "[]") as { name: string }[]
+    expect(
+      await runCli(["keys", "revoke", "--name", "ci-agent", "--state-dir", state], write),
+    ).toBe(0)
+
+    expect(created.scopes).toEqual(["view", "operate"])
+    expect(created.token).toMatch(/^idm_/)
+    expect(listed.map((key) => key.name)).toEqual(["ci-agent"])
+    expect(JSON.stringify(listed)).not.toContain(created.token)
+    await expect(runCli(["keys", "create", "--state-dir", state], write)).rejects.toThrow(TypeError)
   })
 })

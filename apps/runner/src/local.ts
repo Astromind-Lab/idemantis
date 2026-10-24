@@ -11,6 +11,7 @@ import {
   type RemoteAdapterConnection,
 } from "./adapters.js"
 import { HostedMissionRunner } from "./hosted.js"
+import { ApiKeyStore } from "./keys.js"
 import { ReferenceMissionRunner } from "./reference.js"
 import { MissionRouter } from "./router.js"
 import { createRunnerServer } from "./server.js"
@@ -27,19 +28,25 @@ export interface LocalRunnerOptions {
   remote_adapters?: readonly RemoteAdapterConnection[]
   lease_duration_ms?: number
   resume?: boolean
+  rate_limit_per_minute?: number
 }
 
 export interface StartedLocalRunner {
   origin: string
   bootstrap_url: string
   journal_path: string
+  access_path: string
   definition_digest: string
   reference_input: ReferenceDeliveryInput
   resumed: RunId[]
   close(): Promise<void>
 }
 
-function stateDirectory(path: string): string {
+export function accessPath(stateDirectory: string): string {
+  return join(stateDirectory, "access.sqlite")
+}
+
+export function stateDirectory(path: string): string {
   const directory = resolve(path)
   if (directory === resolve(".")) {
     throw new Error("Runner state path must not be the project directory")
@@ -84,7 +91,9 @@ export async function startLocalRunner(
   ]
   const directory = stateDirectory(options.state_directory ?? ".idemantis")
   const journalPath = join(directory, "runner.sqlite")
+  const keysPath = accessPath(directory)
   const journal = new SqliteJournal({ path: journalPath })
+  const keys = new ApiKeyStore({ path: keysPath })
   let app: Awaited<ReturnType<typeof createRunnerServer>> | undefined
   let hosted: HostedMissionRunner | undefined
   try {
@@ -117,6 +126,10 @@ export async function startLocalRunner(
       sessions,
       exact_origin: origin,
       mission_executor: router,
+      api_keys: keys,
+      ...(options.rate_limit_per_minute !== undefined
+        ? { rate_limit_per_minute: options.rate_limit_per_minute }
+        : {}),
     })
     await app.listen({ host: "127.0.0.1", port })
     const resumed = options.resume === false ? [] : router.resume()
@@ -125,6 +138,7 @@ export async function startLocalRunner(
       origin,
       bootstrap_url: `${origin}/#bootstrap=${encodeURIComponent(bootstrap)}`,
       journal_path: journalPath,
+      access_path: keysPath,
       definition_digest: runner.runtime.definition_digest,
       reference_input: runner.defaultInput(),
       resumed,
@@ -139,6 +153,7 @@ export async function startLocalRunner(
           await hosted?.close()
         } finally {
           journal.close()
+          keys.close()
         }
       },
     }
@@ -148,6 +163,7 @@ export async function startLocalRunner(
       await hosted?.close()
     } catch {}
     journal.close()
+    keys.close()
     throw error
   }
 }
