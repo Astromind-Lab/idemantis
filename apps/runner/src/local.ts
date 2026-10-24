@@ -25,6 +25,7 @@ export interface LocalRunnerOptions {
   reference_transition_delay_ms?: number
   adapters?: readonly HostedAdapter[]
   remote_adapters?: readonly RemoteAdapterConnection[]
+  lease_duration_ms?: number
   resume?: boolean
 }
 
@@ -102,6 +103,9 @@ export async function startLocalRunner(
         ? new HostedMissionRunner({
             journal,
             host: new AdapterHost({ adapters, source_id: "hosted.runner" }),
+            ...(options.lease_duration_ms !== undefined
+              ? { lease_duration_ms: options.lease_duration_ms }
+              : {}),
           })
         : undefined
     const router = new MissionRouter(journal, hosted ? [runner, hosted] : [runner])

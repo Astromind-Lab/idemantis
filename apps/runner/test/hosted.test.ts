@@ -26,7 +26,7 @@ import Type, { type TSchema } from "typebox"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createHttpAdapterHandler } from "@idemantis/adapter-http"
 import { AdapterHost, connectRemoteAdapters, type HostedAdapter } from "../src/adapters.js"
-import { adapterConnections } from "../src/cli.js"
+import { adapterConnections, leaseDuration } from "../src/cli.js"
 import { HostedMissionRunner } from "../src/hosted.js"
 import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 import { RunnerStore } from "../src/store.js"
@@ -601,6 +601,13 @@ describe("hosted mission runner", () => {
     expect(unbound.status).toBe(422)
     expect(withoutAdapters.resumed).toEqual([])
     expect(issue).toHaveBeenCalledOnce()
+  })
+
+  it("parses the lease duration option", () => {
+    expect(leaseDuration(undefined)).toBeUndefined()
+    expect(leaseDuration("5000")).toBe(5_000)
+    expect(() => leaseDuration("999")).toThrow(TypeError)
+    expect(() => leaseDuration("5s")).toThrow(TypeError)
   })
 })
 

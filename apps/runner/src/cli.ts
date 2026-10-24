@@ -27,6 +27,17 @@ export function adapterConnections(
   })
 }
 
+export function leaseDuration(value: string | undefined): number | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+  const parsed = Number(value)
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(parsed) || parsed < 1_000) {
+    throw new TypeError("--lease-ms must be an integer of at least 1000")
+  }
+  return parsed
+}
+
 async function referenceProof(): Promise<JsonObject> {
   const journal = new SqliteJournal({ path: ":memory:" })
   try {
@@ -101,14 +112,17 @@ export async function runCli(
         port: { type: "string" },
         "state-dir": { type: "string" },
         adapter: { type: "string", multiple: true },
+        "lease-ms": { type: "string" },
       },
     })
     const port = parsed.values.port === undefined ? 4318 : Number(parsed.values.port)
+    const lease = leaseDuration(parsed.values["lease-ms"])
     const { IDEMANTIS_ADAPTER_TOKEN: adapterToken } = process.env
     const started = await startLocalRunner({
       port,
       ...(parsed.values["state-dir"] ? { state_directory: parsed.values["state-dir"] } : {}),
       remote_adapters: adapterConnections(parsed.values.adapter, adapterToken),
+      ...(lease === undefined ? {} : { lease_duration_ms: lease }),
     })
     write(`Runner ready: ${started.origin}\n`)
     write(`Operator bootstrap: ${started.bootstrap_url}\n`)
@@ -123,7 +137,9 @@ export async function runCli(
     await started.close()
     return 0
   }
-  write("Usage: idemantis-runner <reference|dev [--adapter <adapter-instance-id>=<url>]>\n")
+  write(
+    "Usage: idemantis-runner <reference|dev [--adapter <adapter-instance-id>=<url>] [--lease-ms <ms>]>\n",
+  )
   return 1
 }
 
