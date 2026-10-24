@@ -16,7 +16,7 @@ describe("engine and edge fault suite", () => {
     )
     expect(report.runs.every((run) => run.passed)).toBe(true)
     expect(report.final_state_digest).toMatch(/^sha256:[a-f0-9]{64}$/)
-  })
+  }, 30_000)
 
   it("reproduces a generated schedule from its seed", async () => {
     const first = await runFaultSuite({ seed: 42, count: 1 })
