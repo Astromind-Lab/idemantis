@@ -65,11 +65,6 @@ const terminalStatuses = new Set(["completed", "cancelled", "compensated", "fail
 const effectIdField = "effect_id"
 const externalReferenceField = "external_reference"
 
-interface DefinitionRegistration {
-  runtime: MissionRuntimeDefinition
-  subject_reference_keys: string[]
-}
-
 export interface RegisteredDefinition {
   definition_id: string
   definition_version: string
@@ -209,7 +204,6 @@ export class RunnerStore {
   readonly #clock: () => Date
   readonly #id: () => string
   readonly #interventionLifetimeMs: number
-  readonly #definitions = new Map<string, DefinitionRegistration>()
 
   constructor(options: RunnerStoreOptions) {
     this.#journal = options.journal
@@ -409,14 +403,23 @@ export class RunnerStore {
     if (keys.length > 16 || keys.some((key) => key.length < 1 || key.length > 64)) {
       throw new TransportError("INVALID_REQUEST", "Subject reference keys are invalid", 422)
     }
-    this.#definitions.set(runtime.definition_digest, {
-      runtime: structuredClone(runtime),
-      subject_reference_keys: keys,
-    })
+    try {
+      this.#journal.registerDefinition(runtime, { subject_reference_keys: keys })
+    } catch (error) {
+      if (error instanceof JournalError && error.code === "DEFINITION_INVALID") {
+        throw new TransportError("INVALID_REQUEST", "Mission definition is invalid", 422)
+      }
+      throw error
+    }
+  }
+
+  definition(definitionDigest: string): MissionRuntimeDefinition | undefined {
+    return this.#journal.getDefinition(definitionDigest)?.runtime
   }
 
   listDefinitions(): RegisteredDefinition[] {
-    return [...this.#definitions.values()]
+    return this.#journal
+      .listDefinitions()
       .map(({ runtime }) => ({
         definition_id: runtime.manifest.definition_id,
         definition_version: runtime.manifest.definition_version,
@@ -427,7 +430,7 @@ export class RunnerStore {
   }
 
   admitMission(options: AdmitMissionOptions): MissionDetail {
-    const registration = this.#definitions.get(options.definition_digest)
+    const registration = this.#journal.getDefinition(options.definition_digest)
     if (!registration) {
       throw new TransportError("INVALID_REQUEST", "Mission definition is not registered", 422)
     }
@@ -1164,7 +1167,7 @@ export class RunnerStore {
         current?.kind === "operator_wait" ||
         mission.state.status === "waiting",
     })
-    const registration = this.#definitions.get(mission.runtime.definition_digest)
+    const registration = this.#journal.getDefinition(mission.runtime.definition_digest)
     const subjectReferences = (registration?.subject_reference_keys ?? []).flatMap((key) => {
       const value = mission.state.input[key]
       return value === undefined ? [] : [{ kind: key, value: visible(value) }]
