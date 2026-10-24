@@ -4,7 +4,8 @@ import { parseArgs } from "node:util"
 import type { AdapterInstanceId, JsonObject } from "@idemantis/contracts"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import type { RemoteAdapterConnection } from "./adapters.js"
-import { startLocalRunner } from "./local.js"
+import { ApiKeyStore, parseScopes } from "./keys.js"
+import { accessPath, startLocalRunner, stateDirectory } from "./local.js"
 import { ReferenceMissionRunner } from "./reference.js"
 import { RunnerStore } from "./store.js"
 
@@ -95,6 +96,44 @@ async function referenceProof(): Promise<JsonObject> {
   }
 }
 
+function keysCommand(args: readonly string[], write: Writer): number {
+  const parsed = parseArgs({
+    args: [...args.slice(1)],
+    strict: true,
+    allowPositionals: false,
+    options: {
+      name: { type: "string" },
+      scopes: { type: "string" },
+      "state-dir": { type: "string" },
+    },
+  })
+  const store = new ApiKeyStore({
+    path: accessPath(stateDirectory(parsed.values["state-dir"] ?? ".idemantis")),
+  })
+  try {
+    if (args[0] === "list") {
+      write(`${JSON.stringify(store.list(), null, 2)}\n`)
+      return 0
+    }
+    const { name } = parsed.values
+    if (!name) {
+      throw new TypeError(`keys ${args[0]} requires --name <name>`)
+    }
+    if (args[0] === "create") {
+      const created = store.create(name, parseScopes(parsed.values.scopes ?? "view,operate"))
+      write(`${JSON.stringify({ ...created.record, token: created.token }, null, 2)}\n`)
+      return 0
+    }
+    if (args[0] === "revoke") {
+      write(`${JSON.stringify(store.revoke(name), null, 2)}\n`)
+      return 0
+    }
+    throw new TypeError("keys requires create, list, or revoke")
+  } finally {
+    store.close()
+  }
+}
+
 export async function runCli(
   args: readonly string[],
   write: Writer = process.stdout.write.bind(process.stdout),
@@ -102,6 +141,9 @@ export async function runCli(
   if (args[0] === "reference") {
     write(`${JSON.stringify(await referenceProof(), null, 2)}\n`)
     return 0
+  }
+  if (args[0] === "keys") {
+    return keysCommand(args.slice(1), write)
   }
   if (args[0] === "dev") {
     const parsed = parseArgs({
@@ -138,7 +180,15 @@ export async function runCli(
     return 0
   }
   write(
-    "Usage: idemantis-runner <reference|dev [--adapter <adapter-instance-id>=<url>] [--lease-ms <ms>]>\n",
+    [
+      "Usage:",
+      "  idemantis-runner reference",
+      "  idemantis-runner dev [--port <port>] [--state-dir <dir>] [--adapter <adapter-instance-id>=<url>] [--lease-ms <ms>]",
+      "  idemantis-runner keys create --name <name> [--scopes view,operate,define] [--state-dir <dir>]",
+      "  idemantis-runner keys list [--state-dir <dir>]",
+      "  idemantis-runner keys revoke --name <name> [--state-dir <dir>]",
+      "",
+    ].join("\n"),
   )
   return 1
 }
