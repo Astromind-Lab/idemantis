@@ -33,6 +33,7 @@ export interface RunnerServerOptions {
 }
 
 export interface MissionExecutor {
+  accepts?(runtime: MissionRuntimeDefinition): boolean
   run(runId: RunId): Promise<void>
   start?(runId: RunId): MissionExecutionStart
   executionStatus?(runId: RunId): MissionExecutionStatus
@@ -369,6 +370,14 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
       (!Array.isArray(subjectKeys) || subjectKeys.some((value) => typeof value !== "string"))
     ) {
       throw new TransportError("INVALID_REQUEST", "Subject reference keys are invalid", 422)
+    }
+    options.store.assertDefinition(runtime)
+    if (options.mission_executor?.accepts && !options.mission_executor.accepts(runtime)) {
+      throw new TransportError(
+        "INVALID_REQUEST",
+        "No configured executor can bind this definition",
+        422,
+      )
     }
     options.store.registerDefinition(runtime, {
       ...(subjectKeys ? { subject_reference_keys: subjectKeys as string[] } : {}),

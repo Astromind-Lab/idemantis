@@ -109,6 +109,14 @@ export type DispatchOutcome =
       result: IssueResult | ReconciliationResult
     }
 
+export interface InterruptedDispatchRecovery {
+  run_id: RunId
+  command: CommandRecord
+  attempt: AttemptRecord
+  result_recorded: AppendResult
+  result: Extract<IssueResult | ReconciliationResult, "uncertain" | "unknown">
+}
+
 export interface TimerDispatchOutcome {
   fired_at: string
   results: TimerFireResult[]

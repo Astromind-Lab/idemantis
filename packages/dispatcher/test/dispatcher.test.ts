@@ -332,6 +332,64 @@ describe("command dispatcher", () => {
     expect(await dispatcher.dispatchNext(runId)).toEqual({ status: "idle" })
   })
 
+  it("records an interrupted dispatch as uncertain after its claim expires", async () => {
+    const journal = open()
+    const issue = vi.fn(() => new Promise<never>(() => {}))
+    const crashed = new CommandDispatcher({
+      journal,
+      executor: { issue, reconcile: vi.fn() },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:00:02Z"),
+      identities: identities(),
+    })
+    void crashed.dispatchNext(runId)
+    expect(journal.listAttempts(runId)[0]?.status).toBe("dispatch_started")
+
+    const clock = new VirtualClock("2026-01-01T00:00:30Z")
+    const reconcile = vi.fn(async () => "confirmed_completed" as const)
+    const restarted = new CommandDispatcher({
+      journal,
+      executor: { issue: vi.fn(), reconcile },
+      worker_id: "runner-1",
+      lease_duration_ms: 60_000,
+      clock,
+      identities: new FixedIdentities(
+        ["att_01ARZ3NDEKTSV4RRFFQ69G5FB0"],
+        [
+          "evt_01ARZ3NDEKTSV4RRFFQ69G5FB0",
+          "evt_01ARZ3NDEKTSV4RRFFQ69G5FB1",
+          "evt_01ARZ3NDEKTSV4RRFFQ69G5FB2",
+        ],
+      ),
+    })
+    const stranger = new CommandDispatcher({
+      journal,
+      executor: { issue: vi.fn(), reconcile: vi.fn() },
+      worker_id: "runner-2",
+      lease_duration_ms: 60_000,
+      clock: new VirtualClock("2026-01-01T00:05:00Z"),
+      identities: identities(),
+    })
+
+    expect(restarted.recoverInterrupted(runId)).toEqual([])
+    expect(stranger.recoverInterrupted(runId)).toEqual([])
+    clock.advanceTo("2026-01-01T00:01:02Z")
+    const recovered = restarted.recoverInterrupted(runId)
+
+    expect(recovered).toMatchObject([{ run_id: runId, result: "uncertain" }])
+    expect(recovered[0]?.result_recorded.acceptance.event_id).toBe("evt_01ARZ3NDEKTSV4RRFFQ69G5FB0")
+    expect(restarted.recoverInterrupted(runId)).toEqual([])
+    expect(journal.getMission(runId).state.current_state).toBe("reconcileVehicle")
+    expect(await restarted.dispatchNext(runId)).toMatchObject({
+      status: "recorded",
+      result: "confirmed_completed",
+    })
+    expect(issue).toHaveBeenCalledOnce()
+    expect(reconcile).toHaveBeenCalledOnce()
+    expect(journal.getMission(runId).state.terminal_outcome).toBe("completed")
+  })
+
   it("executes a validated adapter operation through the durable dispatcher", async () => {
     const journal = open()
     const clock = new VirtualClock("2026-01-01T00:00:02Z")

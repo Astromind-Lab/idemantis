@@ -3,7 +3,10 @@ import { createServer } from "node:net"
 import { join, resolve } from "node:path"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import type { ReferenceDeliveryInput } from "@idemantis/simulator"
+import { AdapterHost, type HostedAdapter } from "./adapters.js"
+import { HostedMissionRunner } from "./hosted.js"
 import { ReferenceMissionRunner } from "./reference.js"
+import { MissionRouter } from "./router.js"
 import { createRunnerServer } from "./server.js"
 import { SessionAuthority } from "./session.js"
 import { RunnerStore } from "./store.js"
@@ -14,6 +17,7 @@ export interface LocalRunnerOptions {
   reference_seed?: number
   reference_maximum_steps?: number
   reference_transition_delay_ms?: number
+  adapters?: readonly HostedAdapter[]
 }
 
 export interface StartedLocalRunner {
@@ -68,6 +72,7 @@ export async function startLocalRunner(
   const journalPath = join(directory, "runner.sqlite")
   const journal = new SqliteJournal({ path: journalPath })
   let app: Awaited<ReturnType<typeof createRunnerServer>> | undefined
+  let hosted: HostedMissionRunner | undefined
   try {
     const store = new RunnerStore({ journal })
     const runner = new ReferenceMissionRunner({
@@ -79,6 +84,13 @@ export async function startLocalRunner(
         : {}),
       transition_delay_ms: options.reference_transition_delay_ms ?? 350,
     })
+    hosted = options.adapters
+      ? new HostedMissionRunner({
+          journal,
+          host: new AdapterHost({ adapters: options.adapters, source_id: "hosted.runner" }),
+        })
+      : undefined
+    const router = new MissionRouter(journal, hosted ? [runner, hosted] : [runner])
     const sessions = new SessionAuthority()
     const bootstrap = sessions.issueBootstrap()
     const origin = `http://127.0.0.1:${port}`
@@ -86,7 +98,7 @@ export async function startLocalRunner(
       store,
       sessions,
       exact_origin: origin,
-      mission_executor: runner,
+      mission_executor: router,
     })
     await app.listen({ host: "127.0.0.1", port })
     let closed = false
@@ -104,6 +116,7 @@ export async function startLocalRunner(
         try {
           await app?.close()
           await runner.waitForExecutions()
+          await hosted?.close()
         } finally {
           journal.close()
         }
@@ -112,6 +125,7 @@ export async function startLocalRunner(
   } catch (error) {
     try {
       await app?.close()
+      await hosted?.close()
     } catch {}
     journal.close()
     throw error
