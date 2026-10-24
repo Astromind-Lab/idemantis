@@ -28,4 +28,6 @@ jobs:
       - run: corepack install --global pnpm@12.15.0
       - run: pnpm install --frozen-lockfile
       - run: pnpm run check
+      - run: pnpm run proof:faults
+      - run: pnpm run proof:agents
       - run: pnpm run security:audit
