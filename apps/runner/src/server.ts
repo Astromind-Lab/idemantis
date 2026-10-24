@@ -509,7 +509,7 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
   })
 
   app.post("/api/missions", async (request, reply) => {
-    requireMutation(request, access)
+    const actorId = requireMutation(request, access)
     const body = object(request.body)
     const definitionDigest = field(body, "definition_digest")
     if (typeof definitionDigest !== "string") {
@@ -528,12 +528,18 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
         422,
       )
     }
-    const detail = options.store.admitMission({
+    const requestKey = field(body, "client_request_id") ?? header(request, "idempotency-key")
+    if (requestKey !== undefined && typeof requestKey !== "string") {
+      throw new TransportError("INVALID_REQUEST", "Client request ID is invalid", 422)
+    }
+    const admitted = options.store.admission({
       definition_digest: definitionDigest,
       input,
+      actor_id: actorId,
+      ...(requestKey ? { client_request_id: requestKey } : {}),
     })
-    reply.status(201)
-    return detail
+    reply.status(admitted.disposition === "admitted" ? 201 : 200)
+    return admitted.detail
   })
 
   app.post("/api/missions/:runId/run", async (request) => {
