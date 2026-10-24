@@ -24,6 +24,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@idemantis/adapter-http": "workspace:*",
     "@idemantis/adapter-kit": "workspace:*",
     "@idemantis/contracts": "workspace:*",
     "@idemantis/dispatcher": "workspace:*",

@@ -3,7 +3,12 @@ import { createServer } from "node:net"
 import { join, resolve } from "node:path"
 import { SqliteJournal } from "@idemantis/journal-sqlite"
 import type { ReferenceDeliveryInput } from "@idemantis/simulator"
-import { AdapterHost, type HostedAdapter } from "./adapters.js"
+import {
+  AdapterHost,
+  connectRemoteAdapters,
+  type HostedAdapter,
+  type RemoteAdapterConnection,
+} from "./adapters.js"
 import { HostedMissionRunner } from "./hosted.js"
 import { ReferenceMissionRunner } from "./reference.js"
 import { MissionRouter } from "./router.js"
@@ -18,6 +23,7 @@ export interface LocalRunnerOptions {
   reference_maximum_steps?: number
   reference_transition_delay_ms?: number
   adapters?: readonly HostedAdapter[]
+  remote_adapters?: readonly RemoteAdapterConnection[]
 }
 
 export interface StartedLocalRunner {
@@ -68,6 +74,10 @@ export async function startLocalRunner(
     throw new RangeError("Runner port must be an integer from 0 through 65535")
   }
   const port = requestedPort === 0 ? await availablePort() : requestedPort
+  const adapters = [
+    ...(options.adapters ?? []),
+    ...(await connectRemoteAdapters(options.remote_adapters ?? [])),
+  ]
   const directory = stateDirectory(options.state_directory ?? ".idemantis")
   const journalPath = join(directory, "runner.sqlite")
   const journal = new SqliteJournal({ path: journalPath })
@@ -84,12 +94,13 @@ export async function startLocalRunner(
         : {}),
       transition_delay_ms: options.reference_transition_delay_ms ?? 350,
     })
-    hosted = options.adapters
-      ? new HostedMissionRunner({
-          journal,
-          host: new AdapterHost({ adapters: options.adapters, source_id: "hosted.runner" }),
-        })
-      : undefined
+    hosted =
+      adapters.length > 0
+        ? new HostedMissionRunner({
+            journal,
+            host: new AdapterHost({ adapters, source_id: "hosted.runner" }),
+          })
+        : undefined
     const router = new MissionRouter(journal, hosted ? [runner, hosted] : [runner])
     const sessions = new SessionAuthority()
     const bootstrap = sessions.issueBootstrap()

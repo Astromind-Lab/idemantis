@@ -11,6 +11,7 @@ import {
   JsonObjectSchema,
   JsonValueSchema,
   MissionStatusSchema,
+  ObservationIdSchema,
   OperationCapabilitiesSchema,
   RunIdSchema,
   SourceIdSchema,
@@ -385,6 +386,34 @@ export const MissionExecutionStartSchema = Type.Object(
   { additionalProperties: false },
 )
 
+export const RecordObservationRequestSchema = Type.Object(
+  {
+    observation_id: ObservationIdSchema,
+    observation_type: Type.String({
+      minLength: 3,
+      maxLength: 128,
+      pattern: "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
+    }),
+    payload: JsonObjectSchema,
+    effect_id: Type.Optional(EffectIdSchema),
+    subject: Type.Optional(JsonValueSchema),
+    observed_at: Type.Optional(TimestampSchema),
+  },
+  { additionalProperties: false },
+)
+
+export const ObservationReceiptSchema = Type.Object(
+  {
+    schema_version: Type.Literal(ApiSchemaVersion),
+    run_id: RunIdSchema,
+    observation_id: ObservationIdSchema,
+    event_id: EventIdSchema,
+    sequence: Type.Integer({ minimum: 1 }),
+    disposition: Type.Union([Type.Literal("recorded"), Type.Literal("duplicate")]),
+  },
+  { additionalProperties: false },
+)
+
 export const TimelineEntrySchema = Type.Object(
   {
     sequence: Type.Integer({ minimum: 1 }),
@@ -670,6 +699,8 @@ export type InterventionDescriptor = Type.Static<typeof InterventionDescriptorSc
 export type MissionDetail = Type.Static<typeof MissionDetailSchema>
 export type MissionExecutionActivity = Type.Static<typeof MissionExecutionActivitySchema>
 export type MissionExecutionStatus = Type.Static<typeof MissionExecutionStatusSchema>
+export type RecordObservationRequest = Type.Static<typeof RecordObservationRequestSchema>
+export type ObservationReceipt = Type.Static<typeof ObservationReceiptSchema>
 export type MissionExecutionStart = Type.Static<typeof MissionExecutionStartSchema>
 export type TimelineEntry = Type.Static<typeof TimelineEntrySchema>
 export type TimelinePage = Type.Static<typeof TimelinePageSchema>
