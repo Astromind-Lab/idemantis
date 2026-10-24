@@ -296,6 +296,7 @@ describe("SQLite journal", () => {
 
   it("commits admission, projection, effect, and outbox atomically", () => {
     const journal = open(journalPath())
+    expect(journal.missionListRevision()).toBe(1)
     const { result, effect } = admitted(journal)
     const stored = journal.getMission(runId)
 
@@ -305,7 +306,16 @@ describe("SQLite journal", () => {
     expect(stored.runtime).toEqual(runtime)
     expect(stored.state.status).toBe("running")
     expect(stored.state_digest).toBe(result.state_digest)
+    expect(journal.listMissions()).toEqual([stored])
+    expect(journal.missionListRevision()).toBe(2)
     expect(journal.listEvents(runId)).toHaveLength(1)
+    expect(journal.listStoredEvents(runId)).toEqual([
+      {
+        event: journal.listEvents(runId)[0],
+        proposal_digest: result.acceptance.proposal_digest,
+        state_digest: result.state_digest,
+      },
+    ])
     expect(journal.listCommands(runId)).toEqual([
       expect.objectContaining({
         command_id: result.command_ids[0],
