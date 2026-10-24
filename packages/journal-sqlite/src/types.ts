@@ -76,6 +76,12 @@ export interface StoredMission {
   updated_at: string
 }
 
+export interface StoredEvent {
+  event: AcceptedEvent
+  proposal_digest: Digest
+  state_digest: Digest
+}
+
 export interface MissionSnapshot {
   run_id: RunId
   sequence: number

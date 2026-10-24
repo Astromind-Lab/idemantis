@@ -220,6 +220,30 @@ importers:
         specifier: 5.0.5
         version: 5.0.5(@types/node@26.6.5)(vite@8.3.5(@types/node@26.6.5))
 
+  apps/runner:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      "@idemantis/engine":
+        specifier: workspace:*
+        version: link:../../packages/engine
+      "@idemantis/journal-sqlite":
+        specifier: workspace:*
+        version: link:../../packages/journal-sqlite
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../../packages/sdk
+      "@idemantis/transport":
+        specifier: workspace:*
+        version: link:../../packages/transport
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+      ulid:
+        specifier: 3.0.2
+        version: 3.0.2
+
   packages/adapter-kit:
     dependencies:
       "@idemantis/contracts":
@@ -344,6 +368,18 @@ importers:
       "@idemantis/adapter-kit":
         specifier: workspace:*
         version: link:../adapter-kit
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
+  packages/transport:
+    dependencies:
       "@idemantis/contracts":
         specifier: workspace:*
         version: link:../contracts
@@ -1141,6 +1177,13 @@ packages:
     engines: { node: ">=16.20.0" }
     hasBin: true
 
+  ulid@3.0.2:
+    resolution:
+      {
+        integrity: sha512-yu26mwteFYzBAot7KVMqFGCVpsF6g8wXfJzQUHvu1no3+rRRSFcSV2nKeYvNPLD2J4b08jYBDhHUjeH0ygIl9w==,
+      }
+    hasBin: true
+
   undici-types@8.9.0:
     resolution:
       {
@@ -1585,6 +1628,8 @@ snapshots:
       "@typescript/typescript-sunos-x64": 7.0.2
       "@typescript/typescript-win32-arm64": 7.0.2
       "@typescript/typescript-win32-x64": 7.0.2
+
+  ulid@3.0.2: {}
 
   undici-types@8.9.0: {}
 

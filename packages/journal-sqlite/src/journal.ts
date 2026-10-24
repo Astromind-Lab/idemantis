@@ -110,6 +110,7 @@ import type {
   QueuePendingInputOptions,
   ReplayVerification,
   StorageInfo,
+  StoredEvent,
   StoredMission,
   StoredOwnershipLease,
   TimerFireOptions,
@@ -1114,10 +1115,39 @@ export class SqliteJournal {
     return this.storedMission(row)
   }
 
+  listMissions(): StoredMission[] {
+    this.#database.assertOpen()
+    return this.connection
+      .prepare("SELECT * FROM mission_runs ORDER BY updated_at DESC, run_id")
+      .all()
+      .map((raw) => this.storedMission(raw as Row))
+  }
+
+  missionListRevision(): number {
+    this.#database.assertOpen()
+    const row = asRow(
+      this.connection
+        .prepare("SELECT COALESCE(MAX(rowid), 0) + 1 AS revision FROM mission_events")
+        .get(),
+      "mission list revision",
+    )
+    return integer(row, "revision")
+  }
+
   listEvents(runId: RunId): AcceptedEvent[] {
     this.#database.assertOpen()
     this.runRow(runId, true)
     return this.eventRows(runId, 0).map((row) => parseAcceptedEvent(text(row, "event_json")))
+  }
+
+  listStoredEvents(runId: RunId): StoredEvent[] {
+    this.#database.assertOpen()
+    this.runRow(runId, true)
+    return this.eventRows(runId, 0).map((row) => ({
+      event: parseAcceptedEvent(text(row, "event_json")),
+      proposal_digest: parseDigest(column(row, "proposal_digest"), "Event proposal digest"),
+      state_digest: parseDigest(column(row, "state_digest"), "Event state digest"),
+    }))
   }
 
   listCommands(runId: RunId): CommandRecord[] {
@@ -3197,7 +3227,7 @@ export class SqliteJournal {
   private eventRows(runId: RunId, afterSequence: number): Row[] {
     return this.connection
       .prepare(
-        `SELECT event_id, sequence, event_json, state_digest
+        `SELECT event_id, sequence, event_json, proposal_digest, state_digest
          FROM mission_events WHERE run_id = ? AND sequence > ? ORDER BY sequence`,
       )
       .all(runId, afterSequence) as Row[]
