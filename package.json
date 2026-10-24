@@ -10,6 +10,7 @@
   "scripts": {
     "build": "pnpm --recursive --if-present run build",
     "check": "pnpm run format:check && pnpm run lint && pnpm run build && pnpm run typecheck && pnpm run test",
+    "dev": "pnpm run build && pnpm --silent --filter @idemantis/runner run dev",
     "format": "biome format --write .",
     "format:check": "biome format .",
     "lint": "biome lint .",
