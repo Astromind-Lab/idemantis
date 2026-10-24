@@ -1,33 +1,38 @@
 import {
   AdapterExecutor,
-  buildCapabilityManifest,
-  createAdapterBinding,
   type AdapterOperation,
   type AdapterRegistration,
+  buildCapabilityManifest,
+  createAdapterBinding,
 } from "@idemantis/adapter-kit"
 import {
-  sha256Digest,
   type AdapterInstanceId,
+  type AttemptRecord,
+  type CommandRecord,
+  canonicalJson,
+  type JsonObject,
+  type JsonValue,
   type ObservationId,
   type RunId,
   type SourceId,
+  sha256Digest,
 } from "@idemantis/contracts"
-import { SecureIdentityFactory, SystemClock, type Clock } from "@idemantis/dispatcher"
+import { type Clock, SecureIdentityFactory, SystemClock } from "@idemantis/dispatcher"
 import type { MissionRuntimeDefinition } from "@idemantis/engine"
 import type { SqliteJournal } from "@idemantis/journal-sqlite"
 import { executionBindingDigest } from "@idemantis/sdk"
 import {
   AccessSimulator,
-  ReferenceDeliveryInputSchema,
-  ResourceSimulator,
-  SimulationKernel,
-  VehicleSimulator,
   createReferenceDeliveryMission,
   type FaultRule,
   type ReferenceDeliveryInput,
+  ReferenceDeliveryInputSchema,
+  ResourceSimulator,
   type SimulatedObservation,
+  SimulationKernel,
   type SimulationSnapshot,
   type TargetSnapshot,
+  VehicleSimulator,
 } from "@idemantis/simulator"
 import type { EffectPage, MissionDetail, TimelinePage } from "@idemantis/transport"
 import Schema from "typebox/schema"
@@ -51,7 +56,9 @@ interface ReferenceTargets {
 interface ReferenceSession {
   kernel: SimulationKernel
   targets: ReferenceTargets
+  executor: AdapterExecutor
   execution: RunnerExecution
+  clock: RecoveryClock
   recorded_observations: number
   handoff_recorded: boolean
 }
@@ -90,6 +97,50 @@ function sourceId(target: string): SourceId {
 
 function observationId(): ObservationId {
   return `obs_${ulid()}` as ObservationId
+}
+
+function jsonObject(value: unknown, label: string): JsonObject {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new TypeError(`${label} must be an object`)
+  }
+  return value as JsonObject
+}
+
+function stringField(value: JsonObject, key: string, label: string): string {
+  const selected = value[key]
+  if (typeof selected !== "string") {
+    throw new TypeError(`${label} must contain ${key}`)
+  }
+  return selected
+}
+
+function valueField(value: JsonObject, key: string): JsonValue | undefined {
+  return value[key]
+}
+
+function equivalent(left: JsonValue | undefined, right: JsonValue | undefined): boolean {
+  return canonicalJson(left ?? null) === canonicalJson(right ?? null)
+}
+
+class RecoveryClock implements Clock {
+  readonly #live: Clock
+  #replay: Date | undefined
+
+  constructor(live: Clock) {
+    this.#live = live
+  }
+
+  now(): Date {
+    return this.#replay ? new Date(this.#replay) : this.#live.now()
+  }
+
+  replay(at: string): void {
+    this.#replay = new Date(at)
+  }
+
+  resume(): void {
+    this.#replay = undefined
+  }
 }
 
 function targets(kernel: SimulationKernel, input: ReferenceDeliveryInput): ReferenceTargets {
@@ -197,19 +248,23 @@ export class ReferenceMissionRunner {
 
   async run(runId: RunId): Promise<void> {
     const stored = this.#journal.getMission(runId)
-    if (stored.state.terminal_outcome) {
-      return
-    }
     let session = this.#sessions.get(runId)
     if (!session) {
-      if (stored.state.current_sequence !== 1) {
-        throw new Error(`Reference simulator state is unavailable for mission ${runId}`)
-      }
       if (!Schema.Check(ReferenceDeliveryInputSchema, stored.state.input)) {
         throw new TypeError(`Mission ${runId} does not use the reference delivery input`)
       }
-      session = this.createSession(stored.state.input as ReferenceDeliveryInput)
+      session = this.createSession(
+        stored.state.input as ReferenceDeliveryInput,
+        this.admittedAt(runId),
+      )
+      if (stored.state.current_sequence > 1) {
+        await this.restoreSession(runId, session)
+      }
       this.#sessions.set(runId, session)
+    }
+    session.clock.resume()
+    if (stored.state.terminal_outcome) {
+      return
     }
     for (let step = 0; step < this.#maximumSteps; step += 1) {
       await session.execution.drain(runId, this.#maximumSteps)
@@ -250,32 +305,136 @@ export class ReferenceMissionRunner {
     }
   }
 
-  private createSession(input: ReferenceDeliveryInput): ReferenceSession {
+  private createSession(input: ReferenceDeliveryInput, startedAt: string): ReferenceSession {
     const kernel = new SimulationKernel({
       seed: this.#seed,
-      started_at: this.#clock.now().toISOString(),
+      started_at: startedAt,
       fault_schedule: this.#faultSchedule,
     })
     const selected = targets(kernel, input)
+    const clock = new RecoveryClock(this.#clock)
     const executor = new AdapterExecutor({
       registrations: selected.registrations,
       source_id: "reference.runner",
       location: "runner",
-      clock: this.#clock,
+      clock,
     })
     return {
       kernel,
       targets: selected,
+      executor,
       execution: new RunnerExecution({
         journal: this.#journal,
         executor,
         worker_id: "reference.runner",
         timer_source_id: "reference.timer",
         lease_duration_ms: 30_000,
-        clock: this.#clock,
+        clock,
       }),
+      clock,
       recorded_observations: 0,
       handoff_recorded: false,
+    }
+  }
+
+  private admittedAt(runId: RunId): string {
+    const admitted = this.#journal.listStoredEvents(runId)[0]?.event
+    if (admitted?.type !== "mission.admitted") {
+      throw new Error(`Mission ${runId} has no admission event`)
+    }
+    return admitted.recorded_at
+  }
+
+  private async restoreSession(runId: RunId, session: ReferenceSession): Promise<void> {
+    const commands = new Map(
+      this.#journal.listCommands(runId).map((command) => [command.command_id, command]),
+    )
+    const attempts = new Map(
+      this.#journal.listAttempts(runId).map((attempt) => [attempt.attempt_id, attempt]),
+    )
+    const events = this.#journal.listStoredEvents(runId).map((record) => record.event)
+    for (const event of events.slice(1)) {
+      if (
+        event.type === "effect.issue_result_recorded" ||
+        event.type === "effect.reconciliation_result_recorded"
+      ) {
+        await this.restoreEffectResult(
+          session,
+          event.payload,
+          event.recorded_at,
+          commands,
+          attempts,
+        )
+        continue
+      }
+      if (event.type === "observation.recorded") {
+        const source = event.source.source_id
+        if (source === "handoff.simulator") {
+          session.handoff_recorded = true
+          continue
+        }
+        await this.restoreObservation(session, event.payload, event.observed_at, source)
+      }
+    }
+    session.recorded_observations = session.kernel.observations().length
+    session.clock.resume()
+  }
+
+  private async restoreEffectResult(
+    session: ReferenceSession,
+    payload: JsonObject,
+    recordedAt: string,
+    commands: Map<string, CommandRecord>,
+    attempts: Map<string, AttemptRecord>,
+  ): Promise<void> {
+    const commandId = stringField(payload, "command_id", "Effect result")
+    const attemptId = stringField(payload, "attempt_id", "Effect result")
+    const expected = stringField(payload, "result", "Effect result")
+    const command = commands.get(commandId)
+    const attempt = attempts.get(attemptId)
+    if (!command || !attempt) {
+      throw new Error(`Reference recovery evidence is incomplete for command ${commandId}`)
+    }
+    session.clock.replay(recordedAt)
+    let actual: string
+    try {
+      actual =
+        command.kind === "effect.issue"
+          ? await session.executor.issue(command, attempt)
+          : await session.executor.reconcile(command, attempt)
+    } catch {
+      actual = command.kind === "effect.issue" ? "uncertain" : "unknown"
+    }
+    if (actual !== expected) {
+      throw new Error(
+        `Reference recovery diverged for command ${commandId}: expected ${expected}, received ${actual}`,
+      )
+    }
+  }
+
+  private async restoreObservation(
+    session: ReferenceSession,
+    payload: JsonObject,
+    observedAt: string | undefined,
+    recordedSource: SourceId,
+  ): Promise<void> {
+    const expectedType = stringField(payload, "observation_type", "Observation")
+    const expectedPayload = jsonObject(valueField(payload, "payload"), "Observation payload")
+    const priorCount = session.kernel.observations().length
+    let next = session.kernel.observations()[priorCount]
+    while (!next && (await session.kernel.runNext())) {
+      next = session.kernel.observations()[priorCount]
+    }
+    if (
+      !next ||
+      next.type !== expectedType ||
+      sourceId(next.target) !== recordedSource ||
+      next.effect_id !== valueField(payload, "effect_id") ||
+      next.subject_reference !== valueField(payload, "subject") ||
+      next.observed_at !== observedAt ||
+      !equivalent(next.payload, expectedPayload)
+    ) {
+      throw new Error(`Reference recovery diverged while restoring ${expectedType}`)
     }
   }
 
