@@ -20,6 +20,7 @@ import {
   mapFields,
   reconcileState,
   safeRetry,
+  waitForObservation,
 } from "@idemantis/sdk"
 import Type, { type TSchema } from "typebox"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -74,7 +75,10 @@ function sendOperation(issue: Issue, reconcile: Reconcile, adapter = "mailer") {
   }) as unknown as AdapterOperation<unknown, unknown, unknown>
 }
 
-function missionFor(operation: AdapterOperation<unknown, unknown, unknown>) {
+function missionFor(
+  operation: AdapterOperation<unknown, unknown, unknown>,
+  options: { awaitReceipt?: boolean } = {},
+) {
   const descriptor = operation.descriptor
   const send = defineOperation({
     key: descriptor.key,
@@ -98,7 +102,7 @@ function missionFor(operation: AdapterOperation<unknown, unknown, unknown>) {
         effectSlot: "notice",
         input: mapFields({ message_id: fromInput("message_id"), body: fromInput("body") }),
         retry: safeRetry({ attempts: 2, backoffMs: 40 }),
-        onSettled: "complete",
+        onSettled: options.awaitReceipt ? "await_receipt" : "complete",
         onFailed: "failed",
         onUncertain: "reconcile",
       }),
@@ -112,6 +116,17 @@ function missionFor(operation: AdapterOperation<unknown, unknown, unknown>) {
         onConflictingState: "unresolved",
         onUnknown: "unresolved",
       }),
+      ...(options.awaitReceipt
+        ? {
+            await_receipt: waitForObservation({
+              observationType: "mailer.read_receipt",
+              schemaVersion: 1,
+              correlation: { kind: "effect", effectState: "send" },
+              timeout: { afterMs: 60_000, onTimeout: "unresolved" },
+              onObserved: "complete",
+            }),
+          }
+        : {}),
       complete: finalState("completed"),
       failed: finalState("failed"),
       unresolved: finalState("unresolved"),
@@ -412,6 +427,101 @@ describe("hosted mission runner", () => {
     expect(() => adapterConnections(["adp_01ARZ3NDEKTSV4RRFFQ69G5FAV="], undefined)).toThrow(
       TypeError,
     )
+  })
+
+  it("advances a waiting mission from an external observation exactly once", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-observation-"))
+    directories.push(directory)
+    const issue = vi.fn(async () => ({ result: "completed" as const, output: { delivered: true } }))
+    const operation = sendOperation(issue, vi.fn())
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+      adapters: [mailer(operation)],
+    })
+    localRunners.push(local)
+    const session = await authenticate(local)
+    const mission = missionFor(operation, { awaitReceipt: true })
+    const runtime = new AdapterHost({
+      source_id: "hosted.runner",
+      adapters: [mailer(operation)],
+    }).bind({ manifest: mission.manifest, definition_digest: mission.definitionDigest })
+    const post = (path: string, body?: unknown) =>
+      fetch(`${local.origin}${path}`, {
+        method: "POST",
+        headers: body === undefined ? session : { ...session, "content-type": "application/json" },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+    const get = async (path: string) =>
+      (await fetch(`${local.origin}${path}`, { headers: { cookie: session.cookie } })).json()
+
+    await post("/api/definitions", { runtime })
+    const admitted = await post("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-4", body: "Pickup ready" },
+    })
+    const runId = ((await admitted.json()) as { summary: { run_id: RunId } }).summary.run_id
+    await post(`/api/missions/${runId}/start`)
+    await vi.waitFor(
+      async () =>
+        expect(
+          ((await get(`/api/missions/${runId}`)) as { projection: { current_state: string } })
+            .projection.current_state,
+        ).toBe("await_receipt"),
+      { timeout: 2_000, interval: 20 },
+    )
+    const effectId = (
+      (await get(`/api/missions/${runId}/effects`)) as {
+        items: { effect_id: string }[]
+      }
+    ).items[0]?.effect_id
+    const observation = {
+      observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      observation_type: "mailer.read_receipt",
+      effect_id: effectId,
+      payload: { reader: "dock-supervisor" },
+      observed_at: "2026-10-24T08:00:00.000Z",
+    }
+
+    const recorded = await post(`/api/missions/${runId}/observations`, observation)
+    const recordedReceipt = (await recorded.json()) as { event_id: string; sequence: number }
+    await vi.waitFor(
+      async () =>
+        expect(
+          ((await get(`/api/missions/${runId}/execution`)) as { activity: string }).activity,
+        ).toBe("terminal"),
+      { timeout: 2_000, interval: 20 },
+    )
+    const duplicate = await post(`/api/missions/${runId}/observations`, observation)
+    const conflicting = await post(`/api/missions/${runId}/observations`, {
+      ...observation,
+      payload: { reader: "someone-else" },
+    })
+    const late = await post(`/api/missions/${runId}/observations`, {
+      ...observation,
+      observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FAW",
+    })
+    const invalid = await post(`/api/missions/${runId}/observations`, {
+      ...observation,
+      observation_type: "Receipt",
+    })
+
+    expect(recorded.status).toBe(201)
+    expect(duplicate.status).toBe(200)
+    expect(await duplicate.json()).toMatchObject({
+      disposition: "duplicate",
+      event_id: recordedReceipt.event_id,
+      sequence: recordedReceipt.sequence,
+    })
+    expect(conflicting.status).toBe(409)
+    expect(late.status).toBe(409)
+    expect(invalid.status).toBe(422)
+    expect(
+      ((await get(`/api/missions/${runId}`)) as { projection: { terminal_outcome: string } })
+        .projection.terminal_outcome,
+    ).toBe("completed")
+    expect(issue).toHaveBeenCalledOnce()
   })
 })
 

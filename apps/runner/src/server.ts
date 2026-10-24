@@ -11,6 +11,7 @@ import {
   type MissionExecutionStart,
   type MissionExecutionStatus,
   type PrepareInterventionRequest,
+  type RecordObservationRequest,
   type StreamEnvelope,
   type SubmitInterventionRequest,
   TransportError,
@@ -428,6 +429,28 @@ export async function createRunnerServer(options: RunnerServerOptions): Promise<
     const started = options.mission_executor.start(selectedRunId)
     reply.status(started.disposition === "started" ? 202 : 200)
     return started
+  })
+
+  app.post("/api/missions/:runId/observations", async (request, reply) => {
+    const sourceId = requireMutation(request, options.sessions, options.exact_origin)
+    const params = object(request.params)
+    const selectedRunId = runId(field(params, "runId"))
+    const receipt = options.store.recordObservation(
+      selectedRunId,
+      object(request.body) as unknown as RecordObservationRequest,
+      sourceId,
+    )
+    if (receipt.disposition === "recorded" && options.mission_executor?.start) {
+      try {
+        options.mission_executor.start(selectedRunId)
+      } catch (error) {
+        if (!(error instanceof TransportError)) {
+          throw error
+        }
+      }
+    }
+    reply.status(receipt.disposition === "recorded" ? 201 : 200)
+    return receipt
   })
 
   app.get("/api/missions/:runId/execution", async (request) => {

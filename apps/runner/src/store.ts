@@ -38,12 +38,15 @@ import {
   MissionListQuerySchema,
   type MissionProjection,
   type MissionSummary,
+  type ObservationReceipt,
   type PrepareInterventionRequest,
   PrepareInterventionRequestSchema,
   type PreparedIntervention,
   type PreparedInterventionPage,
   type ProtectedValue,
   queueBucketFor,
+  type RecordObservationRequest,
+  RecordObservationRequestSchema,
   type ReplayResult,
   type StreamEnvelope,
   StreamSchemaVersion,
@@ -450,6 +453,81 @@ export class RunnerStore {
       },
     })
     return this.missionDetail(runId)
+  }
+
+  recordObservation(
+    runId: RunId,
+    request: RecordObservationRequest,
+    sourceId: SourceId,
+  ): ObservationReceipt {
+    if (!Schema.Check(RecordObservationRequestSchema, request)) {
+      throw new TransportError("INVALID_REQUEST", "Observation request is invalid", 422)
+    }
+    const mission = this.mission(runId)
+    const content = {
+      observation_type: request.observation_type,
+      payload: request.payload,
+      effect_id: request.effect_id ?? null,
+      subject: request.subject ?? null,
+      observed_at: request.observed_at ?? null,
+    }
+    const prior = this.#journal.listStoredEvents(runId).find(({ event }) => {
+      const { observation_id: observationId } = event.payload
+      return event.type === "observation.recorded" && observationId === request.observation_id
+    })
+    if (prior) {
+      const { observation_type, payload, effect_id, subject } = prior.event.payload
+      const recorded = {
+        observation_type,
+        payload,
+        effect_id: effect_id ?? null,
+        subject: subject ?? null,
+        observed_at: prior.event.observed_at ?? null,
+      }
+      if (canonicalJson(recorded as JsonObject) !== canonicalJson(content as JsonObject)) {
+        throw new TransportError(
+          "CLIENT_REQUEST_ID_COLLISION",
+          "Observation ID is bound to different observation content",
+          409,
+        )
+      }
+      return {
+        schema_version: ApiSchemaVersion,
+        run_id: runId,
+        observation_id: request.observation_id,
+        event_id: prior.event.event_id,
+        sequence: prior.event.sequence,
+        disposition: "duplicate",
+      }
+    }
+    if (mission.state.terminal_outcome) {
+      throw new TransportError("ACTION_FORBIDDEN", "Mission has already finished", 409)
+    }
+    const appended = this.#journal.append({
+      event_id: `evt_${this.#id()}`,
+      run_id: runId,
+      type: "observation.recorded",
+      schema_version: 1,
+      source: { kind: "system", source_id: sourceId },
+      ownership_epoch: mission.state.ownership_epoch,
+      ...(request.observed_at ? { observed_at: request.observed_at } : {}),
+      correlation_id: request.effect_id ?? runId,
+      payload: {
+        observation_id: request.observation_id,
+        observation_type: request.observation_type,
+        ...(request.effect_id ? { effect_id: request.effect_id } : {}),
+        ...(request.subject !== undefined ? { subject: structuredClone(request.subject) } : {}),
+        payload: structuredClone(request.payload),
+      },
+    })
+    return {
+      schema_version: ApiSchemaVersion,
+      run_id: runId,
+      observation_id: request.observation_id,
+      event_id: appended.acceptance.event_id,
+      sequence: appended.acceptance.sequence,
+      disposition: "recorded",
+    }
   }
 
   listMissions(query: MissionListQuery = {}): MissionListPage {
