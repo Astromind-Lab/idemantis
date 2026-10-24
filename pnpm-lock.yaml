@@ -293,6 +293,30 @@ importers:
         specifier: workspace:*
         version: link:../sdk
 
+  packages/benchmark:
+    dependencies:
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/dispatcher":
+        specifier: workspace:*
+        version: link:../dispatcher
+      "@idemantis/journal-sqlite":
+        specifier: workspace:*
+        version: link:../journal-sqlite
+      "@idemantis/runner":
+        specifier: workspace:*
+        version: link:../../apps/runner
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      "@idemantis/tools":
+        specifier: workspace:*
+        version: link:../tools
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
   packages/client:
     dependencies:
       "@idemantis/contracts":
