@@ -253,9 +253,13 @@ async function runEventStream(options: {
   options.reply.raw.once("close", close)
   let position = options.initial_position
   let heartbeatAt = 0
+  let verifiedAt = 0
   try {
     while (!controller.signal.aborted) {
-      authenticated(options.request, options.access)
+      if (Date.now() - verifiedAt >= 1_000) {
+        authenticated(options.request, options.access)
+        verifiedAt = Date.now()
+      }
       const envelopes = options.read(position)
       if (envelopes.length > 0) {
         for (const envelope of envelopes) {
