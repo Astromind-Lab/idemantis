@@ -14,6 +14,7 @@ import type {
   DispatchOutcome,
   EffectExecutor,
   IdentityFactory,
+  InterruptedDispatchRecovery,
   TimerDispatcherOptions,
   TimerDispatchOutcome,
 } from "./types.js"
@@ -101,6 +102,52 @@ export class CommandDispatcher {
       result_recorded: resultRecorded,
       result,
     }
+  }
+
+  recoverInterrupted(runId: RunId): InterruptedDispatchRecovery[] {
+    const now = this.#clock.now().getTime()
+    const commands = new Map(
+      this.#journal.listCommands(runId).map((command) => [command.command_id, command]),
+    )
+    const recovered: InterruptedDispatchRecovery[] = []
+    for (const attempt of this.#journal.listAttempts(runId)) {
+      const command = commands.get(attempt.command_id)
+      if (
+        !command ||
+        !attempt.started_event_id ||
+        attempt.status !== "dispatch_started" ||
+        attempt.claimed_by !== this.#workerId ||
+        command.status !== "claimed" ||
+        command.claimed_by !== this.#workerId ||
+        Date.parse(attempt.claim_deadline) > now ||
+        (command.kind !== "effect.issue" && command.kind !== "effect.reconcile")
+      ) {
+        continue
+      }
+      const issue = command.kind === "effect.issue"
+      const result = issue ? "uncertain" : "unknown"
+      const resultRecorded = this.#journal.recordDispatchResult(
+        this.event(
+          { command, attempt },
+          issue ? "effect.issue_result_recorded" : "effect.reconciliation_result_recorded",
+          {
+            attempt_id: attempt.attempt_id,
+            command_id: command.command_id,
+            effect_id: attempt.effect_id,
+            result,
+          },
+          attempt.started_event_id,
+        ),
+      )
+      recovered.push({
+        run_id: runId,
+        command,
+        attempt,
+        result_recorded: resultRecorded,
+        result,
+      })
+    }
+    return recovered
   }
 
   private async execute(claim: ClaimedCommand): Promise<IssueResult | ReconciliationResult> {
