@@ -464,6 +464,31 @@ importers:
         specifier: 1.4.3
         version: 1.4.3
 
+  packages/tools:
+    dependencies:
+      "@idemantis/adapter-http":
+        specifier: workspace:*
+        version: link:../adapter-http
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      "@idemantis/sdk":
+        specifier: workspace:*
+        version: link:../sdk
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+    devDependencies:
+      "@idemantis/journal-sqlite":
+        specifier: workspace:*
+        version: link:../journal-sqlite
+      "@idemantis/runner":
+        specifier: workspace:*
+        version: link:../../apps/runner
+
   packages/transport:
     dependencies:
       "@idemantis/contracts":
