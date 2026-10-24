@@ -119,6 +119,7 @@ import type {
   StoredInterventionReceipt,
   StoredPreparedIntervention,
   StoredReceiptUpdate,
+  MissionHead,
   RegisterDefinitionOptions,
   StoredDefinition,
   StoredEvent,
@@ -1478,6 +1479,26 @@ export class SqliteJournal {
       )
       .all()
       .map((raw) => this.storedDefinition(raw as Row))
+  }
+
+  listMissionHeads(): MissionHead[] {
+    this.#database.assertOpen()
+    return this.connection
+      .prepare(
+        `SELECT run_id, definition_digest, current_sequence, state_digest, updated_at
+         FROM mission_runs ORDER BY updated_at DESC, run_id`,
+      )
+      .all()
+      .map((raw) => {
+        const row = raw as Row
+        return {
+          run_id: text(row, "run_id") as RunId,
+          definition_digest: parseDigest(column(row, "definition_digest"), "Definition digest"),
+          current_sequence: integer(row, "current_sequence"),
+          state_digest: parseDigest(column(row, "state_digest"), "State digest"),
+          updated_at: text(row, "updated_at"),
+        }
+      })
   }
 
   missionListRevision(): number {
