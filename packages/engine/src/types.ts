@@ -54,6 +54,7 @@ export interface MissionState {
   terminal_outcome: FinalOutcome | null
   effects: Record<string, EffectProjection>
   observations: Record<string, true>
+  outputs?: Record<string, JsonValue>
 }
 
 export interface ReductionResult {

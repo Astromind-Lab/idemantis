@@ -85,20 +85,31 @@ function validateExpression(
         "INVALID_EXPRESSION",
         path,
         "Mission expressions must use the serializable expression builders",
-        "Use fromInput, literal, or mapFields",
+        "Use fromInput, fromOutput, literal, or mapFields",
       ),
     )
     return false
   }
 
   const expression = value as Record<string, unknown>
-  const { fields, kind, path: inputPath, value: literalValue } = expression
+  const { fields, kind, path: inputPath, value: literalValue, state: outputState } = expression
 
   if (
     kind === "input" &&
     hasOnlyKeys(expression, ["kind", "path"]) &&
     Array.isArray(inputPath) &&
     inputPath.length > 0 &&
+    inputPath.every((segment) => typeof segment === "string" && segment.length > 0)
+  ) {
+    return true
+  }
+
+  if (
+    kind === "output" &&
+    hasOnlyKeys(expression, ["kind", "state", "path"]) &&
+    typeof outputState === "string" &&
+    outputState.length > 0 &&
+    Array.isArray(inputPath) &&
     inputPath.every((segment) => typeof segment === "string" && segment.length > 0)
   ) {
     return true
@@ -574,6 +585,104 @@ function validateOperatorWait(
   }
 }
 
+function outputReferences(expression: unknown, references: Set<StateName>): void {
+  if (!expression || typeof expression !== "object" || Array.isArray(expression)) {
+    return
+  }
+  const { kind, state, fields } = expression as Record<string, unknown>
+  if (kind === "output" && typeof state === "string") {
+    references.add(state)
+  }
+  if (kind === "object" && fields && typeof fields === "object") {
+    for (const child of Object.values(fields)) {
+      outputReferences(child, references)
+    }
+  }
+}
+
+function stateOutputReferences(state: StateDefinition): Set<StateName> {
+  const references = new Set<StateName>()
+  if (state.kind === "effect") {
+    outputReferences(state.input, references)
+  } else if (state.kind === "reconcile") {
+    outputReferences(state.subject, references)
+  } else if (state.kind === "observation_wait" && state.correlation?.kind === "subject") {
+    outputReferences(state.correlation.subject, references)
+  }
+  return references
+}
+
+function capturedOutputs(definition: MissionDefinition): Set<StateName> {
+  const captured = new Set<StateName>()
+  for (const state of Object.values(definition.states)) {
+    for (const reference of stateOutputReferences(state)) {
+      captured.add(reference)
+    }
+  }
+  return captured
+}
+
+function reachableWithoutOutput(definition: MissionDefinition, source: StateName): Set<StateName> {
+  const reachable = new Set<StateName>()
+  const pending = [definition.initial]
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (current === undefined || reachable.has(current)) {
+      continue
+    }
+    reachable.add(current)
+    const state = definition.states[current]
+    if (!state) {
+      continue
+    }
+    for (const [field, target] of transitionTargets(state)) {
+      const producesOutput =
+        (current === source && field === "onSettled") ||
+        (state.kind === "reconcile" &&
+          state.effectState === source &&
+          field === "onConfirmedCompleted")
+      if (!producesOutput && Object.hasOwn(definition.states, target)) {
+        pending.push(target)
+      }
+    }
+  }
+  return reachable
+}
+
+function validateOutputReferences(
+  definition: MissionDefinition,
+  issues: MissionDefinitionIssue[],
+): void {
+  if (!Object.hasOwn(definition.states, definition.initial)) {
+    return
+  }
+  for (const [stateName, state] of Object.entries(definition.states)) {
+    for (const source of stateOutputReferences(state)) {
+      if (definition.states[source]?.kind !== "effect") {
+        issues.push(
+          issue(
+            "OUTPUT_SOURCE_INVALID",
+            `states.${stateName}`,
+            `State ${stateName} reads the output of ${source}, which is not an effect state`,
+            "Reference the output of a declared effect state",
+          ),
+        )
+        continue
+      }
+      if (reachableWithoutOutput(definition, source).has(stateName)) {
+        issues.push(
+          issue(
+            "OUTPUT_NOT_GUARANTEED",
+            `states.${stateName}`,
+            `State ${stateName} can be reached before ${source} produces an output`,
+            `Route every path into ${stateName} through ${source} completing`,
+          ),
+        )
+      }
+    }
+  }
+}
+
 function validateGraph(definition: MissionDefinition): MissionDefinitionIssue[] {
   const issues: MissionDefinitionIssue[] = []
   const stateNames = Object.keys(definition.states)
@@ -675,6 +784,8 @@ function validateGraph(definition: MissionDefinition): MissionDefinitionIssue[] 
       }
     }
   }
+
+  validateOutputReferences(definition, issues)
 
   if (Object.hasOwn(definition.states, definition.initial)) {
     const reachable = new Set<string>()
@@ -930,10 +1041,15 @@ function buildGraph(states: Record<StateName, StateDefinition>): MissionGraph {
 function buildManifest(definition: MissionDefinition): MissionManifest {
   const operations = new Map<string, OperationManifest>()
   const states: Record<string, StateManifest> = {}
+  const captured = capturedOutputs(definition)
 
   for (const stateName of Object.keys(definition.states).sort()) {
     const state = definition.states[stateName] as StateDefinition
-    states[stateName] = stateManifest(state)
+    const compiled = stateManifest(state)
+    states[stateName] =
+      compiled.kind === "effect" && captured.has(stateName)
+        ? { ...compiled, capture_output: true }
+        : compiled
 
     if (state.kind === "effect" || state.kind === "reconcile") {
       const manifest = operationManifest(state.operation)

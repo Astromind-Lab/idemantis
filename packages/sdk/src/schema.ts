@@ -42,6 +42,14 @@ export const ValueExpressionSchema = Type.Unsafe<ValueExpression>(
           },
           { additionalProperties: false },
         ),
+        Type.Object(
+          {
+            kind: Type.Literal("output"),
+            state: StateNameSchema,
+            path: Type.Array(Type.String({ minLength: 1 })),
+          },
+          { additionalProperties: false },
+        ),
       ]),
     },
     "ValueExpression",
@@ -107,6 +115,7 @@ const EffectStateManifestSchema = Type.Object(
       ),
     ),
     on_acknowledged: Type.Optional(StateNameSchema),
+    capture_output: Type.Optional(Type.Literal(true)),
     on_settled: StateNameSchema,
     on_failed: StateNameSchema,
     on_uncertain: StateNameSchema,

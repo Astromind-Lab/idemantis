@@ -31,6 +31,10 @@ export function mapFields(fields: Record<string, ValueExpression>): ValueExpress
   return { kind: "object", fields }
 }
 
+export function fromOutput(state: string, ...path: string[]): ValueExpression {
+  return { kind: "output", state, path }
+}
+
 /** Disables automatic retries for an effect. */
 export function noRetry(): RetryPolicy {
   return { kind: "none" }
