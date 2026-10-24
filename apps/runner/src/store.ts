@@ -869,7 +869,10 @@ export class RunnerStore {
       if (error instanceof TransportError) {
         throw error
       }
-      if (!(error instanceof JournalError) || error.code !== "INTERVENTION_INVALID") {
+      if (
+        !(error instanceof JournalError) ||
+        (error.code !== "INTERVENTION_INVALID" && error.code !== "INTERVENTION_NOT_FOUND")
+      ) {
         throw this.interventionError(error, runId)
       }
     }
@@ -1150,6 +1153,9 @@ export class RunnerStore {
     if (error instanceof JournalError) {
       if (error.code === "RUN_NOT_FOUND") {
         return new TransportError("RUN_NOT_FOUND", `Mission ${runId} does not exist`, 404)
+      }
+      if (error.code === "INTERVENTION_NOT_FOUND") {
+        return new TransportError("INVALID_REQUEST", "Intervention does not exist", 404)
       }
       if (error.code === "INTERVENTION_COLLISION" || error.code === "PENDING_INPUT_COLLISION") {
         return new TransportError(
