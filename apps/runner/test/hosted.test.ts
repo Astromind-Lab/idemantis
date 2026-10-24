@@ -22,12 +22,15 @@ import {
   safeRetry,
   waitForObservation,
 } from "@idemantis/sdk"
+import { type MissionContext, MissionContextSchema } from "@idemantis/transport"
 import Type, { type TSchema } from "typebox"
+import Schema from "typebox/schema"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createHttpAdapterHandler } from "@idemantis/adapter-http"
 import { AdapterHost, connectRemoteAdapters, type HostedAdapter } from "../src/adapters.js"
 import { adapterConnections, leaseDuration } from "../src/cli.js"
 import { HostedMissionRunner } from "../src/hosted.js"
+import { ApiKeyStore } from "../src/keys.js"
 import { type StartedLocalRunner, startLocalRunner } from "../src/local.js"
 import { RunnerStore } from "../src/store.js"
 
@@ -608,6 +611,100 @@ describe("hosted mission runner", () => {
     expect(leaseDuration("5000")).toBe(5_000)
     expect(() => leaseDuration("999")).toThrow(TypeError)
     expect(() => leaseDuration("5s")).toThrow(TypeError)
+  })
+
+  it("tells a returning agent what is done, what is pending, and who acts next", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "idemantis-context-"))
+    directories.push(directory)
+    const issue = vi.fn(async () => ({
+      result: "completed" as const,
+      output: { delivered: true },
+      external_reference: "smtp-7",
+    }))
+    const operation = sendOperation(issue, vi.fn())
+    const local = await startLocalRunner({
+      port: 0,
+      state_directory: directory,
+      reference_transition_delay_ms: 0,
+      adapters: [mailer(operation)],
+    })
+    localRunners.push(local)
+    const keys = new ApiKeyStore({ path: local.access_path })
+    const token = keys.create("resume-agent", ["view", "operate", "define"]).token
+    keys.close()
+    const call = async (path: string, body?: unknown) => {
+      const response = await fetch(`${local.origin}${path}`, {
+        method: body === undefined ? "GET" : "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          ...(body === undefined ? {} : { "content-type": "application/json" }),
+        },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      })
+      return { status: response.status, body: (await response.json()) as never }
+    }
+    const mission = missionFor(operation, { awaitReceipt: true })
+    const runtime = new AdapterHost({
+      source_id: "hosted.runner",
+      adapters: [mailer(operation)],
+    }).bind({ manifest: mission.manifest, definition_digest: mission.definitionDigest })
+
+    expect((await call("/api/definitions", { runtime })).status).toBe(200)
+    const admitted = await call("/api/missions", {
+      definition_digest: runtime.definition_digest,
+      input: { message_id: "msg-9", body: "Resume me" },
+    })
+    const runId = (admitted.body as { summary: { run_id: RunId } }).summary.run_id
+    const queued = await call(`/api/missions/${runId}/context`)
+    await call(`/api/missions/${runId}/start`, {})
+    await vi.waitFor(
+      async () =>
+        expect(
+          ((await call(`/api/missions/${runId}/context`)).body as { state_kind: string })
+            .state_kind,
+        ).toBe("observation_wait"),
+      { timeout: 2_000, interval: 20 },
+    )
+    const waiting = (await call(`/api/missions/${runId}/context`)).body as unknown as MissionContext
+    await call(`/api/missions/${runId}/observations`, {
+      observation_id: "obs_01ARZ3NDEKTSV4RRFFQ69G5FB0",
+      observation_type: "mailer.read_receipt",
+      effect_id: waiting.next.effect_id,
+      payload: { reader: "agent" },
+    })
+    await vi.waitFor(
+      async () =>
+        expect(
+          ((await call(`/api/missions/${runId}/context`)).body as { status: string }).status,
+        ).toBe("completed"),
+      { timeout: 2_000, interval: 20 },
+    )
+    const finished = (await call(`/api/missions/${runId}/context`))
+      .body as unknown as MissionContext
+
+    expect(Schema.Check(MissionContextSchema, queued.body)).toBe(true)
+    expect(queued.body).toMatchObject({ next: { actor: "runner", operation: "mailer.send" } })
+    expect(Schema.Check(MissionContextSchema, waiting)).toBe(true)
+    expect(waiting.effects).toEqual([
+      expect.objectContaining({
+        phase: "done",
+        output: { delivered: true },
+        external_reference: "smtp-7",
+      }),
+    ])
+    expect(waiting.next).toMatchObject({
+      actor: "observation",
+      observation_type: "mailer.read_receipt",
+      effect_id: waiting.effects[0]?.effect_id,
+      deadline: expect.any(String),
+    })
+    expect(Schema.Check(MissionContextSchema, finished)).toBe(true)
+    expect(finished).toMatchObject({
+      terminal_outcome: "completed",
+      next: { actor: "none" },
+      execution: { activity: "terminal" },
+    })
+    expect(issue).toHaveBeenCalledOnce()
   })
 })
 
