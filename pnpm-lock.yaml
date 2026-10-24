@@ -265,6 +265,18 @@ importers:
         specifier: 3.0.2
         version: 3.0.2
 
+  packages/adapter-http:
+    dependencies:
+      "@idemantis/adapter-kit":
+        specifier: workspace:*
+        version: link:../adapter-kit
+      "@idemantis/contracts":
+        specifier: workspace:*
+        version: link:../contracts
+      typebox:
+        specifier: 1.4.3
+        version: 1.4.3
+
   packages/adapter-kit:
     dependencies:
       "@idemantis/contracts":
