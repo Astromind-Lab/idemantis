@@ -19,6 +19,7 @@ import {
   MissionDetailSchema,
   MissionListPageSchema,
   ReplayResultSchema,
+  StreamEnvelopeSchema,
   TimelinePageSchema,
   TransportError,
   verifyGraphArtifact,
@@ -190,6 +191,7 @@ describe("runner store", () => {
     expect(detail.summary.state_entered_at).toBe(admittedDetail.summary.state_entered_at)
     expect(detail.summary.updated_at).not.toBe(admittedDetail.summary.updated_at)
     expect(queue.items).toHaveLength(1)
+    expect(queue.total_count).toBe(1)
     expect(queue.items[0]?.subject_references).toEqual([
       {
         kind: "shipment",
@@ -231,6 +233,56 @@ describe("runner store", () => {
     admit(runner, runC, "shipment-c")
     expect(() => runner.listMissions({ bucket: "active", limit: 1, cursor })).toThrowError(
       expect.objectContaining({ code: "CURSOR_INVALID" }),
+    )
+  })
+
+  it("projects resumable mission and operations streams from durable history", () => {
+    const runner = store()
+    const operationsPosition = runner.operationsStreamPosition(1)
+    admit(runner, runA, "shipment-a")
+
+    const missionPosition = runner.missionStreamPosition(runA, 0)
+    const mission = runner.missionStreamBatch(runA, missionPosition)
+    expect(mission).toHaveLength(1)
+    expect(mission.every((envelope) => Schema.Check(StreamEnvelopeSchema, envelope))).toBe(true)
+    expect(mission[0]).toMatchObject({
+      kind: "mission",
+      body: { run_id: runA, sequence: 1 },
+    })
+
+    const missionCursor = mission[0]?.resume_cursor
+    if (!missionCursor) {
+      throw new Error("Expected a mission resume cursor")
+    }
+    expect(runner.missionStreamPosition(runA, undefined, missionCursor)).toBe(1)
+    expect(runner.missionStreamBatch(runA, 1)).toEqual([])
+
+    const operations = runner.operationsStreamBatch(operationsPosition)
+    expect(operations).toHaveLength(1)
+    expect(operations.every((envelope) => Schema.Check(StreamEnvelopeSchema, envelope))).toBe(true)
+    expect(operations[0]).toMatchObject({
+      kind: "operations",
+      body: { list_revision: 2, changed_run_ids: [runA] },
+    })
+
+    expect(() => runner.operationsStreamPosition(undefined, missionCursor)).toThrowError(
+      expect.objectContaining({ code: "CURSOR_INVALID" }),
+    )
+  })
+
+  it("expires stream cursors instead of replaying an unbounded resume window", () => {
+    let now = new Date("2026-10-24T08:00:00.000Z")
+    const runner = new RunnerStore({
+      journal: openJournal(),
+      cursor_secret: new Uint8Array(32).fill(9),
+      cursor_lifetime_ms: 10,
+      clock: () => now,
+    })
+    const cursor = runner.operationsStreamHeartbeat(1).resume_cursor
+    now = new Date("2026-10-24T08:00:00.011Z")
+
+    expect(() => runner.operationsStreamPosition(undefined, cursor)).toThrowError(
+      expect.objectContaining({ code: "CURSOR_EXPIRED" }),
     )
   })
 

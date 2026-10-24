@@ -308,6 +308,8 @@ describe("SQLite journal", () => {
     expect(stored.state_digest).toBe(result.state_digest)
     expect(journal.listMissions()).toEqual([stored])
     expect(journal.missionListRevision()).toBe(2)
+    expect(journal.listMissionChanges(1)).toEqual([{ revision: 2, run_id: runId }])
+    expect(journal.listMissionChanges(2)).toEqual([])
     expect(journal.listEvents(runId)).toHaveLength(1)
     expect(journal.listStoredEvents(runId)).toEqual([
       {
@@ -316,6 +318,8 @@ describe("SQLite journal", () => {
         state_digest: result.state_digest,
       },
     ])
+    expect(journal.listStoredEventsAfter(runId, 0)).toEqual(journal.listStoredEvents(runId))
+    expect(journal.listStoredEventsAfter(runId, 1)).toEqual([])
     expect(journal.listCommands(runId)).toEqual([
       expect.objectContaining({
         command_id: result.command_ids[0],

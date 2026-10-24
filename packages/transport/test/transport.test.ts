@@ -139,6 +139,7 @@ describe("transport contracts", () => {
       list_revision: 1,
       filter: "active",
       query: "",
+      total_count: 1,
       items: [
         {
           schema_version: 1,

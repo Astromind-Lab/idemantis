@@ -82,6 +82,11 @@ export interface StoredEvent {
   state_digest: Digest
 }
 
+export interface MissionListChange {
+  revision: number
+  run_id: RunId
+}
+
 export interface MissionSnapshot {
   run_id: RunId
   sequence: number

@@ -33,6 +33,8 @@ import {
   type ProtectedValue,
   queueBucketFor,
   type ReplayResult,
+  type StreamEnvelope,
+  StreamSchemaVersion,
   type TimelineEntry,
   type TimelinePage,
   TransportError,
@@ -49,9 +51,17 @@ interface DefinitionRegistration {
   subject_reference_keys: string[]
 }
 
+export interface RegisteredDefinition {
+  definition_id: string
+  definition_version: string
+  definition_digest: string
+  input_schema: JsonObject
+}
+
 export interface RunnerStoreOptions {
   journal: SqliteJournal
   cursor_secret?: Uint8Array
+  cursor_lifetime_ms?: number
   clock?: () => Date
   id?: () => string
 }
@@ -161,6 +171,10 @@ function pagePosition(
   return codec.decode(cursor, { namespace, revision, query }).position
 }
 
+function streamEventId(value: JsonObject): string {
+  return sha256Digest(value)
+}
+
 export class RunnerStore {
   readonly #journal: SqliteJournal
   readonly #cursor: CursorCodec
@@ -174,12 +188,99 @@ export class RunnerStore {
     this.#id = options.id ?? ulid
     this.#cursor = new CursorCodec({
       secret: options.cursor_secret ?? randomBytes(32),
+      ...(options.cursor_lifetime_ms !== undefined
+        ? { lifetime_ms: options.cursor_lifetime_ms }
+        : {}),
       clock: this.#clock,
     })
   }
 
   get listRevision(): number {
     return this.#journal.missionListRevision()
+  }
+
+  missionStreamPosition(runId: RunId, afterSequence: number | undefined, cursor?: string): number {
+    const current = this.mission(runId).state.current_sequence
+    return this.streamPosition(
+      `mission:${runId}`,
+      { run_id: runId },
+      current,
+      afterSequence,
+      cursor,
+      "Mission sequence",
+    )
+  }
+
+  operationsStreamPosition(afterRevision: number | undefined, cursor?: string): number {
+    return this.streamPosition(
+      "operations",
+      {},
+      this.listRevision,
+      afterRevision,
+      cursor,
+      "Operations revision",
+      1,
+    )
+  }
+
+  missionStreamBatch(runId: RunId, afterSequence: number, limit = 100): StreamEnvelope[] {
+    const current = this.mission(runId).state.current_sequence
+    this.assertStreamPosition(afterSequence, current, "Mission sequence")
+    return this.#journal.listStoredEventsAfter(runId, afterSequence, limit).map((record) => {
+      const body = {
+        run_id: runId,
+        sequence: record.event.sequence,
+        event_id: record.event.event_id,
+        event_digest: record.proposal_digest,
+      }
+      return {
+        stream_event_id: streamEventId({ kind: "mission", ...body }),
+        schema_version: StreamSchemaVersion,
+        resume_cursor: this.streamCursor(
+          `mission:${runId}`,
+          { run_id: runId },
+          record.event.sequence,
+        ),
+        kind: "mission" as const,
+        body,
+      }
+    })
+  }
+
+  operationsStreamBatch(afterRevision: number, limit = 1000): StreamEnvelope[] {
+    this.assertStreamPosition(afterRevision, this.listRevision, "Operations revision", 1)
+    const changes = this.#journal.listMissionChanges(afterRevision, limit)
+    const last = changes.at(-1)
+    if (!last) {
+      return []
+    }
+    const body = {
+      list_revision: last.revision,
+      changed_run_ids: [...new Set(changes.map((change) => change.run_id))],
+    }
+    return [
+      {
+        stream_event_id: streamEventId({ kind: "operations", ...body }),
+        schema_version: StreamSchemaVersion,
+        resume_cursor: this.streamCursor("operations", {}, last.revision),
+        kind: "operations",
+        body,
+      },
+    ]
+  }
+
+  missionStreamHeartbeat(runId: RunId, sequence: number): StreamEnvelope {
+    this.assertStreamPosition(
+      sequence,
+      this.mission(runId).state.current_sequence,
+      "Mission sequence",
+    )
+    return this.heartbeat(`mission:${runId}`, { run_id: runId }, sequence)
+  }
+
+  operationsStreamHeartbeat(revision: number): StreamEnvelope {
+    this.assertStreamPosition(revision, this.listRevision, "Operations revision", 1)
+    return this.heartbeat("operations", {}, revision)
   }
 
   registerDefinition(
@@ -202,6 +303,17 @@ export class RunnerStore {
       runtime: structuredClone(runtime),
       subject_reference_keys: keys,
     })
+  }
+
+  listDefinitions(): RegisteredDefinition[] {
+    return [...this.#definitions.values()]
+      .map(({ runtime }) => ({
+        definition_id: runtime.manifest.definition_id,
+        definition_version: runtime.manifest.definition_version,
+        definition_digest: runtime.definition_digest,
+        input_schema: structuredClone(runtime.manifest.input_schema as JsonObject),
+      }))
+      .sort((left, right) => left.definition_id.localeCompare(right.definition_id))
   }
 
   admitMission(options: AdmitMissionOptions): MissionDetail {
@@ -261,6 +373,7 @@ export class RunnerStore {
       list_revision: snapshot.revision,
       filter: bucket,
       query: search,
+      total_count: items.length,
       items: selected,
       ...(nextPosition < items.length
         ? {
@@ -435,6 +548,57 @@ export class RunnerStore {
       verification: storedDigest === rebuilt.state_digest ? "match" : "diverged",
       events_reduced: selected.length,
       graph: graphArtifact(mission.runtime.manifest, mission.runtime.definition_digest),
+    }
+  }
+
+  private streamPosition(
+    namespace: string,
+    query: JsonObject,
+    current: number,
+    initial: number | undefined,
+    cursor: string | undefined,
+    label: string,
+    minimum = 0,
+  ): number {
+    if ((initial === undefined) === (cursor === undefined)) {
+      throw new TransportError(
+        "INVALID_REQUEST",
+        "Provide exactly one initial position or resume cursor",
+        422,
+      )
+    }
+    const position = cursor
+      ? this.#cursor.decode(cursor, { namespace: `stream:${namespace}`, revision: 1, query })
+          .position
+      : initial
+    if (position === undefined) {
+      throw new TransportError("INVALID_REQUEST", `${label} is required`, 422)
+    }
+    this.assertStreamPosition(position, current, label, minimum)
+    return position
+  }
+
+  private assertStreamPosition(
+    position: number,
+    current: number,
+    label: string,
+    minimum = 0,
+  ): void {
+    if (!Number.isSafeInteger(position) || position < minimum || position > current) {
+      throw new TransportError("CURSOR_INVALID", `${label} is outside available history`, 400)
+    }
+  }
+
+  private streamCursor(namespace: string, query: JsonObject, position: number): string {
+    return this.#cursor.encode({ namespace: `stream:${namespace}`, revision: 1, query }, position)
+  }
+
+  private heartbeat(namespace: string, query: JsonObject, position: number): StreamEnvelope {
+    return {
+      stream_event_id: streamEventId({ kind: "heartbeat", namespace, position }),
+      schema_version: StreamSchemaVersion,
+      resume_cursor: this.streamCursor(namespace, query, position),
+      kind: "heartbeat",
     }
   }
 
