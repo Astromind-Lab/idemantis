@@ -9,7 +9,6 @@ It works with any agent: over MCP, from TypeScript or Python, or over plain HTTP
 ## Why
 
 Agents retry tools after timeouts without knowing whether the first call landed, so customers get two emails or two charges. Durable-execution engines and framework checkpointers make code resume after a crash, but a step that applied its effect and crashed before saving runs again. Idemantis treats that gap as the product:
-
 - each operation declares its duplicate safety and how it can be reconciled,
 - the runner commits `dispatch_started` before every call, so "may have happened" is an explicit state,
 - a tool ledger makes plain functions safely retryable and recovers lost responses through a lookup,
@@ -19,11 +18,11 @@ Agents retry tools after timeouts without knowing whether the first call landed,
 
 `packages/benchmark` runs the same three-step task (`create_ticket`, `charge_card`, `send_receipt`) for three agents against a seeded external world with transient failures, lost responses, and process crashes.
 
-| Agent | Completed | Duplicate side effects |
-| --- | --- | --- |
-| Naive retry loop | 97.8% | 292 |
-| Checkpoint after each step | 97.8% | 209 |
-| Idemantis | 99.2% | 0 |
+| Agent                      | Completed | Duplicate side effects |
+| -------------------------- | --------- | ---------------------- |
+| Naive retry loop           | 97.8%     | 292                    |
+| Checkpoint after each step | 97.8%     | 209                    |
+| Idemantis                  | 99.2%     | 0                      |
 
 Default fault rates (10% transient failures, 8% lost responses, 4% crashes), 500 tasks, seed 1: `node packages/benchmark/dist/cli.js --tasks 500 --seed 1`. With 30% lost responses and 10% crashes over 300 tasks, the naive agent completes 75% with 764 duplicates and Idemantis completes 99% with none: `node packages/benchmark/dist/cli.js --tasks 300 --seed 1 --lost 0.3 --crash 0.1`. CI runs `pnpm run proof:agents`, which fails if Idemantis records any duplicate.
 
@@ -170,8 +169,15 @@ await serveTools(
   { port: 4400, token: "tool-secret" },
 )
 
-const client = new IdemantisClient({ url: "http://127.0.0.1:4318", api_key: process.env.IDEMANTIS_API_KEY ?? "" })
-const mission = await client.launch(digest, { subject: "Printer offline" }, { client_request_id: "ticket-1042" })
+const client = new IdemantisClient({
+  url: "http://127.0.0.1:4318",
+  api_key: process.env.IDEMANTIS_API_KEY ?? "",
+})
+const mission = await client.launch(
+  digest,
+  { subject: "Printer offline" },
+  { client_request_id: "ticket-1042" },
+)
 const context = await client.waitFor(mission.summary.run_id)
 ```
 
@@ -183,37 +189,37 @@ For full control, author missions with `defineMission` from `@idemantis/sdk`: ef
 
 All endpoints accept `Authorization: Bearer <key>`.
 
-| Method and path | Purpose |
-| --- | --- |
-| `GET /api/operations` | Connected operations and their capabilities |
-| `POST /api/plans` | Compile and register a JSON plan (`define` scope) |
-| `POST /api/definitions` | Register a compiled definition (`define` scope) |
-| `POST /api/missions` | Admit a mission; `client_request_id` makes it idempotent |
-| `POST /api/missions/:runId/start` | Start execution |
-| `GET /api/missions/:runId/context` | Resume context: done, uncertain, next actor |
-| `POST /api/missions/:runId/observations` | Record an outside observation, idempotent per ID |
-| `GET /api/missions`, `/api/missions/:runId`, `/timeline`, `/effects` | Read models |
-| `POST /api/missions/:runId/interventions/prepare`, `/submit` | Answer an operator decision |
-| `GET /api/streams/operations`, `/api/missions/:runId/stream` | Server-sent events |
+| Method and path                                                      | Purpose                                                  |
+| -------------------------------------------------------------------- | -------------------------------------------------------- |
+| `GET /api/operations`                                                | Connected operations and their capabilities              |
+| `POST /api/plans`                                                    | Compile and register a JSON plan (`define` scope)        |
+| `POST /api/definitions`                                              | Register a compiled definition (`define` scope)          |
+| `POST /api/missions`                                                 | Admit a mission; `client_request_id` makes it idempotent |
+| `POST /api/missions/:runId/start`                                    | Start execution                                          |
+| `GET /api/missions/:runId/context`                                   | Resume context: done, uncertain, next actor              |
+| `POST /api/missions/:runId/observations`                             | Record an outside observation, idempotent per ID         |
+| `GET /api/missions`, `/api/missions/:runId`, `/timeline`, `/effects` | Read models                                              |
+| `POST /api/missions/:runId/interventions/prepare`, `/submit`         | Answer an operator decision                              |
+| `GET /api/streams/operations`, `/api/missions/:runId/stream`         | Server-sent events                                       |
 
 Tools speak the HTTP adapter protocol: `GET /manifest` and `POST /operations/<key>/issue` or `/reconcile`, with the effect ID in the `idempotency-key` header.
 
 ## Repository
 
-| Path | Contents |
-| --- | --- |
-| `apps/runner` | Runner API, CLI, hosted execution, API keys |
-| `packages/sdk` | Mission DSL, compiler, plans |
-| `packages/engine` | Pure reducer and replay |
-| `packages/journal-sqlite` | Append-only SQLite journal |
-| `packages/dispatcher` | Command dispatch, timers, crash recovery |
+| Path                                            | Contents                                     |
+| ----------------------------------------------- | -------------------------------------------- |
+| `apps/runner`                                   | Runner API, CLI, hosted execution, API keys  |
+| `packages/sdk`                                  | Mission DSL, compiler, plans                 |
+| `packages/engine`                               | Pure reducer and replay                      |
+| `packages/journal-sqlite`                       | Append-only SQLite journal                   |
+| `packages/dispatcher`                           | Command dispatch, timers, crash recovery     |
 | `packages/adapter-kit`, `packages/adapter-http` | Operation contract and HTTP adapter protocol |
-| `packages/tools` | Exactly-once tool ledger and tool server |
-| `packages/client` | TypeScript API client |
-| `packages/mcp` | MCP server |
-| `packages/benchmark` | Agent reliability benchmark |
-| `packages/fault-suite` | Seeded fault and invariant proofs |
-| `sdks/python` | Python client, plan builders, tool server |
+| `packages/tools`                                | Exactly-once tool ledger and tool server     |
+| `packages/client`                               | TypeScript API client                        |
+| `packages/mcp`                                  | MCP server                                   |
+| `packages/benchmark`                            | Agent reliability benchmark                  |
+| `packages/fault-suite`                          | Seeded fault and invariant proofs            |
+| `sdks/python`                                   | Python client, plan builders, tool server    |
 
 ## Development
 
