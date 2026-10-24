@@ -18,14 +18,18 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
+    "reference": "node dist/cli.js reference",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@idemantis/adapter-kit": "workspace:*",
     "@idemantis/contracts": "workspace:*",
+    "@idemantis/dispatcher": "workspace:*",
     "@idemantis/engine": "workspace:*",
     "@idemantis/journal-sqlite": "workspace:*",
     "@idemantis/sdk": "workspace:*",
+    "@idemantis/simulator": "workspace:*",
     "@idemantis/transport": "workspace:*",
     "@fastify/cookie": "11.1.3",
     "@fastify/helmet": "13.2.0",
