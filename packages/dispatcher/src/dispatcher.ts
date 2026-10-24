@@ -219,8 +219,13 @@ export class CommandDispatcher {
           : { result: await this.#executor.reconcile(command, attempt) }
       }
       throw new TypeError(`Command ${claim.command.command_id} is not dispatchable`)
-    } catch {
-      return { result: claim.command.kind === "effect.issue" ? "uncertain" : "unknown" }
+    } catch (error) {
+      return {
+        result: claim.command.kind === "effect.issue" ? "uncertain" : "unknown",
+        evidence: {
+          executor_error: (error instanceof Error ? error.message : String(error)).slice(0, 512),
+        },
+      }
     }
   }
 

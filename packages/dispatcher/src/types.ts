@@ -129,7 +129,7 @@ export interface InterruptedDispatchRecovery {
   command: CommandRecord
   attempt: AttemptRecord
   result_recorded: AppendResult
-  result: Extract<IssueResult | ReconciliationResult, "uncertain" | "unknown">
+  result: IssueResult | ReconciliationResult
 }
 
 export interface TimerDispatchOutcome {

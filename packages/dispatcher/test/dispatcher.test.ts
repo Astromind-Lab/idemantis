@@ -327,6 +327,12 @@ describe("command dispatcher", () => {
 
     expect(issueOutcome).toMatchObject({ status: "recorded", result: "uncertain" })
     expect(reconciliationOutcome).toMatchObject({ status: "recorded", result: "unknown" })
+    expect(
+      journal
+        .listEvents(runId)
+        .filter((event) => event.type.endsWith("result_recorded"))
+        .map(({ payload: { evidence } }) => evidence),
+    ).toEqual([{ executor_error: "connection lost" }, { executor_error: "provider unavailable" }])
     expect(reconcile).toHaveBeenCalledOnce()
     expect(journal.getMission(runId).state.status).toBe("unresolved")
     expect(await dispatcher.dispatchNext(runId)).toEqual({ status: "idle" })
